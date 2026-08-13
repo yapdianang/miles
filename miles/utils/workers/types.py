@@ -1,5 +1,7 @@
 from enum import Enum
 
+from miles.utils.pydantic_utils import FrozenStrictBaseModel
+
 
 class ClusterBackend(Enum):
     RAY = "ray"
@@ -9,6 +11,27 @@ class ClusterBackend(Enum):
 class WorkerCommBackend(Enum):
     RAY = "ray"
     RPC = "rpc"
+
+
+class DeployComponent(Enum):
+    ALL = "all"
+    PRIMARY = "primary"
+    TRAINER = "trainer"
+
+    def selects(self, component: "DeployComponent") -> bool:
+        assert component is not DeployComponent.ALL, "`all` is a selector over components, never a component itself"
+        return self is DeployComponent.ALL or self is component
+
+    def deploys_orchestration_script(self) -> bool:
+        return self.selects(DeployComponent.PRIMARY)
+
+    def is_split(self) -> bool:
+        return self is not DeployComponent.ALL
+
+
+class DeploymentIdentity(FrozenStrictBaseModel):
+    run_uuid: str
+    deploy_component: str
 
 
 _SUPPORTED_WORKER_COMM_BACKENDS = {

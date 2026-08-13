@@ -69,6 +69,13 @@ class TestKubernetesBackendCapability:
         with pytest.raises(AssertionError, match="not a static pool of this run"):
             capability.static_worker_provider(pool_id="session-server")
 
+    def test_it_tells_a_component_which_static_pools_this_release_installed(self) -> None:
+        """A split run deploys only part of its pools, so a component has to ask before addressing one."""
+        capability = _kubernetes_capability()
+
+        assert capability.deploys_static_pool(pool_id="inference-router-0")
+        assert not capability.deploys_static_pool(pool_id="inference-controller")
+
 
 class TestRayBackendCapability:
     def test_is_built_from_the_worker_manager_alone(self) -> None:

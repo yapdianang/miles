@@ -6,6 +6,7 @@ from tests.fast.fixtures.megatron_config_fixtures import encode_megatron_config
 
 from miles.ray import placement_group as placement_group_module
 from miles.ray.placement_group import _get_placement_group_layout
+from miles.utils.workers.types import DeploymentIdentity
 
 
 def _layout_args(**overrides):
@@ -24,6 +25,7 @@ def _layout_args(**overrides):
         "critic_save": None,
         "critic_lr": None,
         "critic_lr_warmup_iters": None,
+        "deploy_component": "all",
     }
     values.update(overrides)
     return Namespace(**values)
@@ -40,8 +42,9 @@ def test_shared_ppo_counts_actor_bundles_once(colocate, expected):
     assert _get_placement_group_layout(_layout_args(colocate=colocate)) == expected
 
 
-def test_debug_train_only_counts_actor_bundles_once():
-    assert _get_placement_group_layout(_layout_args(debug_train_only=True)) == (2, 0)
+def test_debug_train_only_counts_actor_bundles_once_and_leaves_the_rollout_entry_empty():
+    """No engine is deployed, so every bundle belongs to the trainer and the rollout slice starts past the end."""
+    assert _get_placement_group_layout(_layout_args(debug_train_only=True)) == (2, 2)
 
 
 def test_external_rollout_only_reserves_no_local_bundles():
@@ -72,8 +75,8 @@ class TestPlacementGroupLayout:
         assert num_gpus - rollout_offset == 4
 
     def test_the_policy_count_multiplies_the_debug_and_external_layouts_too(self):
-        """These branches compute their own totals, so each one has to multiply on its own."""
-        assert _get_placement_group_layout(_multi_policy_layout_args(3, debug_train_only=True)) == (6, 0)
+        """The flags that zero the rollout side must not also drop the policies out of the trainer side."""
+        assert _get_placement_group_layout(_multi_policy_layout_args(3, debug_train_only=True)) == (6, 6)
         assert _get_placement_group_layout(_multi_policy_layout_args(3, rollout_external=True)) == (6, 6)
 
     def test_only_the_actors_are_counted_as_policies(self):
@@ -81,6 +84,29 @@ class TestPlacementGroupLayout:
         args = _layout_args(megatron_config=encode_megatron_config("a"), use_critic=True)
 
         assert _get_placement_group_layout(args) == (6, 2)
+
+
+class TestTheLayoutOfASplitDeployment:
+    def test_a_trainer_deployment_bundles_the_trainer_gpus_and_leaves_the_rollout_entry_empty(self):
+        """This release installs no engine, so a rollout slice over its bundles would hand them out twice."""
+        assert _get_placement_group_layout(_layout_args(deploy_component="trainer")) == (2, 2)
+
+    def test_a_primary_deployment_bundles_the_engine_gpus_alone(self):
+        """The trainer serves out of its own release's group, so reserving its gpus here strands them."""
+        assert _get_placement_group_layout(_layout_args(deploy_component="primary")) == (4, 0)
+
+    def test_a_primary_deployment_counts_the_eval_engines_too(self):
+        """--eval-num-gpus buys engines that live in this release, so its group has to hold them."""
+        assert _get_placement_group_layout(_layout_args(deploy_component="primary", eval_num_gpus=3)) == (7, 0)
+
+    @pytest.mark.parametrize("overrides", [{"debug_train_only": True}, {"rollout_external": True}])
+    def test_a_primary_deployment_without_local_engines_bundles_nothing(self, overrides):
+        """Neither flag leaves an engine inside ray, and an empty group is what asks the cluster for nothing."""
+        assert _get_placement_group_layout(_layout_args(deploy_component="primary", **overrides)) == (0, 0)
+
+    def test_a_trainer_deployment_of_a_rollout_only_run_bundles_nothing(self):
+        """--debug-rollout-only trains nothing, so this release has no rank to place."""
+        assert _get_placement_group_layout(_layout_args(deploy_component="trainer", debug_rollout_only=True)) == (0, 0)
 
 
 class _RecordingRolloutExecutor:
@@ -120,7 +146,7 @@ def _patch_train_controller_handles(monkeypatch, *, restored: dict[str, list[int
     monkeypatch.setattr(
         placement_group_module,
         "create_trainer_controller_handle",
-        lambda *, capability, trainer_id: _Handle(trainer_id),
+        lambda args, *, capability, trainer_id: _Handle(trainer_id),
     )
     return handles
 
@@ -149,6 +175,7 @@ def _training_models_args(**overrides):
         "critic_save": "/ckpt/run_critic",
         "critic_lr": 2e-6,
         "critic_lr_warmup_iters": 3,
+        "trainer_controller_addrs": None,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -282,3 +309,72 @@ async def test_train_parallel_config_comes_from_the_actor_not_the_critic(monkeyp
     )
 
     assert rollout_executor.train_parallel_config == {"dp_size": 2}
+
+
+class _IdentifyingHandle:
+    def __init__(self, *, trainer_id: str, run_uuid: str, deploy_component: str, calls: list[tuple[str, str]]) -> None:
+        self.trainer_id = trainer_id
+        self.identity = DeploymentIdentity(run_uuid=run_uuid, deploy_component=deploy_component)
+        self.calls = calls
+
+    async def get_deployment_identity(self) -> DeploymentIdentity:
+        self.calls.append((self.trainer_id, "get_deployment_identity"))
+        return self.identity
+
+    async def init(self, args) -> list[int]:
+        self.calls.append((self.trainer_id, "init"))
+        return [0]
+
+
+def _split_run_args(**overrides):
+    return _training_models_args(
+        megatron_config=None,
+        run_uuid="0" * 16,
+        trainer_controller_addrs=["actor=10.0.0.1:8000", "critic=10.0.0.2:8000"],
+        **overrides,
+    )
+
+
+def _patch_identifying_handles(monkeypatch, *, identities: dict[str, tuple[str, str]]) -> list[tuple[str, str]]:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(placement_group_module, "get_backend_capability", lambda args: FakeBackendCapability())
+    monkeypatch.setattr(placement_group_module, "wait_static_addrs_ready", lambda addrs: None)
+    monkeypatch.setattr(
+        placement_group_module,
+        "create_trainer_controller_handle",
+        lambda args, *, capability, trainer_id: _IdentifyingHandle(
+            trainer_id=trainer_id,
+            run_uuid=identities[trainer_id][0],
+            deploy_component=identities[trainer_id][1],
+            calls=calls,
+        ),
+    )
+    return calls
+
+
+class TestEveryAddressedTrainerIsCheckedBeforeAnyInitRuns:
+    async def test_a_second_controller_of_another_run_is_caught_before_the_first_is_inited(self, monkeypatch):
+        """init runs once per deployment, so an init before the check leaves a trainer nothing can re-init."""
+        calls = _patch_identifying_handles(
+            monkeypatch, identities={"actor": ("0" * 16, "trainer"), "critic": ("f" * 16, "trainer")}
+        )
+
+        with pytest.raises(AssertionError, match="drives run"):
+            await placement_group_module.create_training_models(
+                _split_run_args(), rollout_executor=_RecordingRolloutExecutor()
+            )
+
+        assert sorted(calls) == [("actor", "get_deployment_identity"), ("critic", "get_deployment_identity")]
+
+    async def test_a_deployment_that_carries_an_orchestration_script_of_its_own_is_refused(self, monkeypatch):
+        """Its own script drives that trainer too, so both runs would train one model from two rollout streams."""
+        calls = _patch_identifying_handles(
+            monkeypatch, identities={"actor": ("0" * 16, "all"), "critic": ("0" * 16, "trainer")}
+        )
+
+        with pytest.raises(AssertionError, match="nothing but the trainer"):
+            await placement_group_module.create_training_models(
+                _split_run_args(), rollout_executor=_RecordingRolloutExecutor()
+            )
+
+        assert ("actor", "init") not in calls

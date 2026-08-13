@@ -33,6 +33,7 @@ from miles.utils.test_utils.ft_test_actions import FTTestActionControllerExecuto
 from miles.utils.tracking_utils.structured_log import log_structured
 from miles.utils.workers.cell_operations.base import BaseCellOperations
 from miles.utils.workers.rpc.common.wire_types import Pickled
+from miles.utils.workers.types import DeploymentIdentity
 from miles.utils.workers.worker_handle import BaseWorkerHandle
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
 from miles.utils.workers.worker_provider.utils import apply_cell_observation
@@ -54,6 +55,7 @@ class TrainerController(NodeProbeMixin):
     def __init__(
         self,
         *,
+        launch_args,
         cell_provider: BaseWorkerProvider,
         cell_operations: BaseCellOperations,
         inference_controller: BaseWorkerHandle | None,
@@ -62,6 +64,7 @@ class TrainerController(NodeProbeMixin):
         with_ref: bool,
         with_opd_teacher: bool = False,
     ) -> None:
+        self._launch_args = launch_args
         self._inference_controller = inference_controller
         self._trainer_id = trainer_id
         self._role = role
@@ -364,13 +367,15 @@ class TrainerController(NodeProbeMixin):
         # TODO: allow using all cells to update weights (instead of first alive cell)
         # Fetch the updatable engines once (like V1 RayActorGroup) so all
         # ranks observe a consistent engine set.
-        info = await self._inference_controller.start_update_weights(model_id=self.args.trainer_model_id)
+        info = await self._addressed_inference_controller.start_update_weights(model_id=self.args.trainer_model_id)
         # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
         weight_versions = await retry(
             lambda _: self._execute_first_alive("update_weights", info=info),
             max_attempts=_RETRY_MAX_ATTEMPTS,
         )
-        await self._inference_controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+        await self._addressed_inference_controller.end_update_weights(
+            snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes
+        )
 
         await self._maybe_log_inference_engine_weight_checksums(rollout_id=rollout_id)
 
@@ -382,13 +387,27 @@ class TrainerController(NodeProbeMixin):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
-        check_weights_result = await self._inference_controller.check_weights(
+        check_weights_result = await self._addressed_inference_controller.check_weights(
             action="checksum", model_id=self.args.trainer_model_id
         )
         engine_checksums = flatten_inference_engine_checksums(check_weights_result)
         get_event_logger().log(
             InferenceEngineWeightChecksumEvent,
             dict(rollout_id=rollout_id, engine_checksums=engine_checksums),
+        )
+
+    @property
+    def _addressed_inference_controller(self) -> BaseWorkerHandle:
+        assert self._inference_controller is not None, (
+            f"trainer {self._trainer_id} of role {self._role} was built without a handle on the run's inference "
+            f"controller, so it cannot reach the engines this run serves: a critic never updates their weights, and "
+            f"a {self._launch_args.deploy_component} deployment installs no inference controller of its own"
+        )
+        return self._inference_controller
+
+    async def get_deployment_identity(self) -> DeploymentIdentity:
+        return DeploymentIdentity(
+            run_uuid=self._launch_args.run_uuid, deploy_component=self._launch_args.deploy_component
         )
 
     async def onload(self) -> None:

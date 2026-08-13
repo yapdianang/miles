@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 from tests.fast.ray.train import conftest as train_conftest
+from tests.fast.ray.train.conftest import make_launch_args
 
 from miles.ray.specs.train import compute_trainer_pool_id
 from miles.ray.train.group import TrainerController
@@ -38,6 +39,9 @@ class _RecordingWorkerProvider(RayWorkerProvider):
 
 def _make_args(*, num_cells: int) -> SimpleNamespace:
     return SimpleNamespace(
+        deploy_component="all",
+        trainer_controller_addrs=["10.0.0.1:8000"],
+        api_server_port=1234,
         indep_dp=True,
         enable_witness=False,
         witness_buffer_size=100,
@@ -71,6 +75,7 @@ async def _create_controller(*, num_cells: int) -> TrainerController:
     train_conftest.fake_worker_manager.num_cells = num_cells
     controller = TrainerController(
         _make_args(num_cells=num_cells),
+        launch_args=make_launch_args(),
         trainer_id="actor",
         role="actor",
         with_ref=False,

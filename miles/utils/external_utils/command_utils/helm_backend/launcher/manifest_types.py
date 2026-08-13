@@ -54,11 +54,17 @@ class ManifestObject(FrozenOpenBaseModel):
     def body(self) -> dict[str, Any]:
         return self.model_dump(exclude_unset=True)
 
-    def containers_named(self, container: str) -> list[Container]:
-        if self.kind != "StatefulSet" or self.spec is None or self.spec.template is None:
+    @property
+    def containers(self) -> list[Container]:
+        if self.spec is None or self.spec.template is None:
             return []
         pod = self.spec.template.spec
-        return [described for described in (pod.containers if pod is not None else []) if described.name == container]
+        return list(pod.containers) if pod is not None else []
+
+    def containers_named(self, container: str) -> list[Container]:
+        if self.kind != "StatefulSet":
+            return []
+        return [described for described in self.containers if described.name == container]
 
 
 class Manifest(FrozenStrictBaseModel):

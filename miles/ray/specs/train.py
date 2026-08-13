@@ -8,13 +8,17 @@ from miles.backends.megatron_utils.megatron_config import (
     compute_trainer_args,
     resolve_megatron_config,
 )
-from miles.ray.specs.inference import create_inference_controller_handle
+from miles.ray.specs.inference import INFERENCE_CONTROLLER_POOL_ID, create_inference_controller_handle
+from miles.ray.specs.static_addrs import trainer_controller_url
 from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from miles.utils.environ import default_fp8_block_scaling_fp32_scales
 from miles.utils.megatron_args_utils import compute_megatron_world_size_except_dp
 from miles.utils.workers.backend_capability.base import BackendCapability
 from miles.utils.workers.naming import compute_cell_id, compute_worker_name
+from miles.utils.workers.types import DeployComponent
 from miles.utils.workers.worker_handle import BaseWorkerHandle
+from miles.utils.workers.worker_provider.base import BaseWorkerProvider
+from miles.utils.workers.worker_provider.static import StaticWorkerProvider
 from miles.utils.workers.worker_spec import (
     MASTER_PORT_NAME,
     PortInfo,
@@ -43,6 +47,7 @@ def specs_trainer_controller(args) -> list[ServeWorkerSpec]:
         trainer_args = compute_trainer_args(args, config)
         specs.append(
             _compute_spec_trainer_controller(
+                args,
                 config=config,
                 with_ref=(config.role != CRITIC_ROLE) and (trainer_args.kl_coef != 0 or trainer_args.use_kl_loss),
                 with_opd_teacher=(config.role != CRITIC_ROLE)
@@ -57,10 +62,21 @@ def compute_trainer_configs(args) -> list[MegatronTrainerConfig]:
     return resolve_megatron_config(args).trainers
 
 
-def create_trainer_controller_handle(*, capability: BackendCapability, trainer_id: str) -> BaseWorkerHandle:
-    worker_name = trainer_controller_worker_name(trainer_id)
-    provider = capability.static_worker_provider(pool_id=compute_trainer_controller_pool_id(trainer_id))
-    return provider.get_handle(worker_name)
+def compute_trainer_ids(args) -> list[str]:
+    return [config.trainer_id for config in compute_trainer_configs(args)]
+
+
+def create_trainer_controller_handle(args, *, capability: BackendCapability, trainer_id: str) -> BaseWorkerHandle:
+    provider = compute_trainer_controller_provider(args, capability=capability, trainer_id=trainer_id)
+    return provider.get_handle(trainer_controller_worker_name(trainer_id))
+
+
+def compute_trainer_controller_provider(args, *, capability: BackendCapability, trainer_id: str) -> BaseWorkerProvider:
+    pool_id = compute_trainer_controller_pool_id(trainer_id)
+    if args.trainer_controller_addrs is None:
+        return capability.static_worker_provider(pool_id=pool_id)
+    url = trainer_controller_url(args, trainer_id=trainer_id, trainer_ids=compute_trainer_ids(args))
+    return StaticWorkerProvider.of_rpc_urls(pool_id=pool_id, urls=[url], worker_class=TRAINER_CONTROLLER_WORKER_CLASS)
 
 
 def compute_trainer_controller_pool_id(trainer_id: str) -> str:
@@ -76,6 +92,7 @@ def trainer_controller_cell_id(trainer_id: str) -> str:
 
 
 def _compute_spec_trainer_controller(
+    args,
     *,
     config: MegatronTrainerConfig,
     with_ref: bool,
@@ -84,6 +101,7 @@ def _compute_spec_trainer_controller(
     trainer_id = config.trainer_id
     return ServeWorkerSpec(
         name=compute_trainer_controller_pool_id(trainer_id),
+        deploy_component=DeployComponent.TRAINER,
         port_infos=[],
         env_var=lambda _ctx: {},
         scheduling=SchedulingSpec(
@@ -94,6 +112,7 @@ def _compute_spec_trainer_controller(
         ),
         worker_class=TRAINER_CONTROLLER_WORKER_CLASS,
         ctor_kwargs=lambda ctx: dict(
+            launch_args=args,
             trainer_id=trainer_id,
             role=config.role,
             with_ref=with_ref,
@@ -101,10 +120,16 @@ def _compute_spec_trainer_controller(
             cell_provider=ctx.capability.dynamic_worker_provider(pool_ids=[compute_trainer_pool_id(trainer_id)]),
             cell_operations=ctx.capability.cell_operations(),
             inference_controller=(
-                None if config.role == CRITIC_ROLE else create_inference_controller_handle(capability=ctx.capability)
+                create_inference_controller_handle(capability=ctx.capability)
+                if _drives_inference_controller(config, capability=ctx.capability)
+                else None
             ),
         ),
     )
+
+
+def _drives_inference_controller(config: MegatronTrainerConfig, *, capability: BackendCapability) -> bool:
+    return config.role != CRITIC_ROLE and capability.deploys_static_pool(pool_id=INFERENCE_CONTROLLER_POOL_ID)
 
 
 def specs_trainer(args) -> list[ServeWorkerSpec]:
@@ -162,6 +187,7 @@ def _compute_spec_trainer(
     return ServeWorkerSpec(
         name=compute_trainer_pool_id(trainer_id),
         category=POOL_CATEGORY_TRAINER_ENGINE,
+        deploy_component=DeployComponent.TRAINER,
         port_infos=[PortInfo(name=MASTER_PORT_NAME, static_port=9000, mode="master", allow_dynamic=True)],
         env_var=lambda ctx: compute_trainer_env_vars(args, ctx),
         scheduling=SchedulingSpec(

@@ -6,7 +6,7 @@ import pytest
 from miles.utils.external_utils.command_utils.common import chart_dir
 from miles.utils.external_utils.command_utils.helm_backend.launcher import command_wrapper, entrypoint
 from miles.utils.external_utils.command_utils.helm_backend.launcher.command_wrapper import Helm, Kubectl
-from miles.utils.external_utils.command_utils.helm_backend.naming import RunNames
+from miles.utils.external_utils.command_utils.helm_backend.naming import RUN_ID_MAX_LENGTH, RunNames
 from miles.utils.workers.worker_provider.kubernetes.helm import naming
 from miles.utils.workers.worker_provider.kubernetes.helm.env import INSTANCE_LABEL
 
@@ -184,7 +184,7 @@ class TestChartDir:
         assert chart_dir(repo_base_dir="/repo").as_posix() == "/repo/charts/miles-run"
 
 
-LONGEST_RUN_ID = "a" * 40
+LONGEST_RUN_ID = "a" * RUN_ID_MAX_LENGTH
 
 
 class TestReleaseName:

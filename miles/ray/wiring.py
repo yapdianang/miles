@@ -1,10 +1,25 @@
 from __future__ import annotations
 
+from functools import partial
+
+from miles.ray.specs.addressing import describe_how_the_run_reaches_this_deployment
 from miles.ray.specs.entrypoint import compute_specs
+from miles.utils.arguments import parse_args
 from miles.utils.workers.backend_capability import factory
 from miles.utils.workers.backend_capability.base import BackendCapability
+from miles.utils.workers.deployment_entrypoint import DeploymentWiring
 from miles.utils.workers.ray_worker_manager import RayWorkerManager
+from miles.utils.workers.serving.utils import override_argv
 from miles.utils.workers.types import ClusterBackend, WorkerCommBackend
+
+
+def compute_deployment_wiring(argv: list[str]) -> DeploymentWiring:
+    with override_argv(argv):
+        args = parse_args()
+    return DeploymentWiring(
+        launch_worker_manager=partial(launch_worker_manager, args),
+        describe_reachability=partial(describe_how_the_run_reaches_this_deployment, args),
+    )
 
 
 def launch_worker_manager(args):

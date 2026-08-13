@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import socket
 from typing import NamedTuple
@@ -14,10 +15,19 @@ from miles.ray.specs.inference import (
     create_inference_controller_handle,
 )
 from miles.ray.specs.rollout import create_rollout_executor_handle
-from miles.ray.specs.train import ACTOR_ROLE, CRITIC_ROLE, compute_trainer_configs, create_trainer_controller_handle
+from miles.ray.specs.static_addrs import assert_deployment_is_this_runs_trainer, static_trainer_controller_addrs
+from miles.ray.specs.train import (
+    ACTOR_ROLE,
+    CRITIC_ROLE,
+    compute_trainer_configs,
+    compute_trainer_ids,
+    create_trainer_controller_handle,
+)
 from miles.ray.wiring import get_backend_capability
 from miles.utils.ft_utils.api_server.server import start_api_server
+from miles.utils.workers.types import DeployComponent
 from miles.utils.workers.worker_handle import BaseWorkerHandle
+from miles.utils.workers.worker_provider.static import wait_static_addrs_ready
 
 logger = logging.getLogger(__name__)
 
@@ -97,20 +107,22 @@ def _create_placement_group(num_gpus) -> PlacementGroupInfo:
 
 
 def _get_placement_group_layout(args) -> tuple[int, int]:
+    selector = DeployComponent(args.deploy_component)
     num_policies = len([config for config in compute_trainer_configs(args) if config.role == ACTOR_ROLE])
-    actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node * num_policies
+    trainer_num_gpus = (
+        args.actor_num_nodes * args.actor_num_gpus_per_node * num_policies
+        if selector.selects(DeployComponent.TRAINER) and not args.debug_rollout_only
+        else 0
+    )
+    rollout_num_gpus = (
+        args.rollout_num_gpus + args.eval_num_gpus
+        if selector.selects(DeployComponent.PRIMARY) and not args.debug_train_only and not args.rollout_external
+        else 0
+    )
 
-    if args.debug_train_only:
-        return actor_num_gpus, 0
-    if args.rollout_external:
-        if args.debug_rollout_only:
-            return 0, 0
-        return actor_num_gpus, actor_num_gpus
-    if args.debug_rollout_only:
-        return args.rollout_num_gpus, 0
-    if args.colocate:
-        return max(actor_num_gpus, args.rollout_num_gpus), 0
-    return actor_num_gpus + args.rollout_num_gpus + args.eval_num_gpus, actor_num_gpus
+    if args.colocate and trainer_num_gpus and rollout_num_gpus:
+        return max(trainer_num_gpus, rollout_num_gpus), 0
+    return trainer_num_gpus + rollout_num_gpus, trainer_num_gpus
 
 
 def create_placement_groups(args) -> dict[str, PlacementGroupInfo]:
@@ -139,7 +151,7 @@ class TrainerInfo(NamedTuple):
 
 # TODO: move (when reorganizing files)
 async def create_training_model(args, *, trainer_id: str) -> TrainerInfo:
-    handle = create_trainer_controller_handle(capability=get_backend_capability(args), trainer_id=trainer_id)
+    handle = create_trainer_controller_handle(args, capability=get_backend_capability(args), trainer_id=trainer_id)
     restored_rollout_ids = await handle.init(args)
     assert len(set(restored_rollout_ids)) == 1, f"trainer {trainer_id!r} restored {restored_rollout_ids}"
     start_rollout_id = x if (x := args.start_rollout_id) is not None else restored_rollout_ids[0]
@@ -150,6 +162,8 @@ async def create_training_model(args, *, trainer_id: str) -> TrainerInfo:
 async def create_training_models(
     args, rollout_executor: BaseWorkerHandle
 ) -> tuple[BaseWorkerHandle, BaseWorkerHandle | None]:
+    await assert_deployed_trainers_are_this_runs(args)
+
     trainer_configs = compute_trainer_configs(args)
     [actor_config] = [config for config in trainer_configs if config.role == ACTOR_ROLE]
     actor_info = await create_training_model(
@@ -179,6 +193,27 @@ async def create_training_models(
     await rollout_executor.load(args.start_rollout_id - 1)
 
     return actor_info.handle, critic_info.handle if critic_info is not None else None
+
+
+# TODO: move (when reorganizing files)
+async def assert_deployed_trainers_are_this_runs(args) -> None:
+    """Wait for every independently deployed trainer controller, and refuse one that another run deployed."""
+    if args.trainer_controller_addrs is None:
+        return
+
+    trainer_ids = compute_trainer_ids(args)
+    addrs = static_trainer_controller_addrs(args, trainer_ids=trainer_ids)
+    logger.info(f"Waiting for the independently deployed trainer controllers at {addrs}")
+    await asyncio.to_thread(wait_static_addrs_ready, addrs)
+
+    capability = get_backend_capability(args)
+    handles = [
+        create_trainer_controller_handle(args, capability=capability, trainer_id=trainer_id)
+        for trainer_id in trainer_ids
+    ]
+    identities = await asyncio.gather(*[handle.get_deployment_identity() for handle in handles])
+    for identity in identities:
+        assert_deployment_is_this_runs_trainer(identity, args=args)
 
 
 # TODO: move (when reorganizing files)

@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Awaitable, Callable
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +21,11 @@ from miles.utils.workers.worker_provider.ray import RayWorkerProvider
 fake_worker_manager: FakeWorkerManager | None = None
 
 FAKE_STORE_ADDR = "10.0.0.7:29500"
+
+
+def make_launch_args(**overrides: Any) -> SimpleNamespace:
+    defaults: dict[str, Any] = dict(deploy_component="trainer", trainer_controller_addrs=None, api_server_port=0)
+    return SimpleNamespace(**{**defaults, **overrides})
 
 
 @pytest.fixture(autouse=True)

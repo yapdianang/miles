@@ -11,6 +11,8 @@ from miles.backends.megatron_utils.megatron_config import resolve_args_checkpoin
 from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
+from miles.ray.specs.static_addrs import trainer_controller_url
+from miles.ray.specs.train import compute_trainer_ids
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
 from miles.utils.env_report.launcher_report import LAUNCHER_REPORT_ENV_VAR
@@ -26,7 +28,9 @@ from miles.utils.megatron_args_utils import compute_megatron_world_size_except_d
 from miles.utils.object_store import ObjectStoreBackend
 from miles.utils.run_uuid import RUN_UUID_LENGTH, generate_run_uuid, validate_run_uuid
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
-from miles.utils.workers.types import ClusterBackend, WorkerCommBackend, resolve_worker_comm_backend
+from miles.utils.workers.types import ClusterBackend, DeployComponent, WorkerCommBackend, resolve_worker_comm_backend
+from miles.utils.workers.worker_provider.static import parse_host_and_port
+from miles.utils.workers.worker_spec import RPC_PORT_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +143,30 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "How the driver calls its workers: `ray` sends actor calls, `rpc` calls the http server "
                     "every worker serves. Unset picks the default of the cluster backend, today `ray` under "
                     "`--cluster-backend ray` and `rpc` under `--cluster-backend kubernetes`."
+                ),
+            )
+            parser.add_argument(
+                "--deploy-component",
+                type=str,
+                default=DeployComponent.ALL.value,
+                choices=tuple(component.value for component in DeployComponent),
+                help=(
+                    "Which part of the run this launch deploys: `all` deploys every worker, `trainer` the trainer "
+                    "controllers and their megatron ranks, and `primary` everything else (orchestration script, "
+                    "rollout executor, session servers, inference controller, routers and engines). Deploying a "
+                    "subset takes one launch per subset, and the launch that carries the orchestration script "
+                    "reaches the trainer through the addresses it is given."
+                ),
+            )
+            parser.add_argument(
+                "--trainer-controller-addrs",
+                type=str,
+                default=None,
+                nargs="+",
+                help=(
+                    "Address of an independently deployed trainer controller, as host:port or http://host:port, "
+                    "prefixed as <trainer_id>=<address> when the run drives more than one trainer. Required when "
+                    "this launch carries the orchestration script but not the trainer."
                 ),
             )
             parser.add_argument("--actor-num-nodes", type=int, default=1, help="Number of nodes for training actor")
@@ -2895,6 +2923,82 @@ def _compute_custom_inference_engine_provider_path(args: argparse.Namespace) -> 
     return _BACKEND_ENGINE_PROVIDER_PATH
 
 
+_MOONCAKE_MASTER_ADDRESS_KEY = "master_server_address"
+
+
+def _validate_deploy_component(args: argparse.Namespace) -> None:
+    component = DeployComponent(args.deploy_component)
+
+    assert not (component.selects(DeployComponent.TRAINER) and args.trainer_controller_addrs is not None), (
+        f"--trainer-controller-addrs describes the trainer side that some other launch deploys, but "
+        f"--deploy-component {component.value} deploys it here, so this launch reaches it by the names of its "
+        f"own release"
+    )
+
+    if not component.is_split():
+        return
+
+    cluster_backend = ClusterBackend(args.cluster_backend)
+    assert cluster_backend is ClusterBackend.KUBERNETES or (
+        cluster_backend is ClusterBackend.RAY and WorkerCommBackend(args.worker_comm_backend) is WorkerCommBackend.RPC
+    ), (
+        f"--deploy-component {component.value} installs one part of the run as a deployment of its own, and the "
+        f"other part reaches it over the network: the {ClusterBackend.KUBERNETES.value} backend gives every "
+        f"deployment a lifecycle and an address of its own, while under --cluster-backend "
+        f"{ClusterBackend.RAY.value} it takes --worker-comm-backend {WorkerCommBackend.RPC.value}, because a "
+        f"{WorkerCommBackend.RAY.value} worker is an actor handle no other launch holds and carries no "
+        f"{RPC_PORT_NAME}, and it takes a ray cluster per deployment, because two launches against one cluster tear "
+        f"each other's processes down; got --cluster-backend {args.cluster_backend} --worker-comm-backend "
+        f"{args.worker_comm_backend}"
+    )
+
+    assert not args.colocate, (
+        "--colocate places trainers and engines on the same gpus, so they are one deployment unit and cannot be "
+        "installed by separate launches"
+    )
+
+    _validate_shared_object_store(args, component=component)
+
+    if not component.deploys_orchestration_script():
+        return
+
+    assert args.trainer_controller_addrs is not None, (
+        f"--deploy-component {component.value} carries the orchestration script but not the trainer, so every "
+        f"trainer controller has to be named by --trainer-controller-addrs"
+    )
+    _validate_trainer_controller_addrs(args)
+    assert not args.api_server_port, (
+        f"the api server, and the mini ft controller polling it, answer for the cells of their own deployment, so "
+        f"under --deploy-component {component.value} they would report every trainer cell of the run as missing "
+        f"rather than say why; pass --api-server-port 0"
+    )
+
+
+def _validate_trainer_controller_addrs(args: argparse.Namespace) -> None:
+    trainer_ids = compute_trainer_ids(args)
+    for trainer_id in trainer_ids:
+        parse_host_and_port(trainer_controller_url(args, trainer_id=trainer_id, trainer_ids=trainer_ids))
+
+
+def _validate_shared_object_store(args: argparse.Namespace, *, component: DeployComponent) -> None:
+    assert ObjectStoreBackend(args.object_store_backend) == ObjectStoreBackend.MOONCAKE, (
+        f"the deployments of one run exchange rollout and training data through the object store, and a "
+        f"{args.object_store_backend} reference is only redeemable inside the deployment that created it, so "
+        f"--deploy-component {component.value} needs --object-store-backend {ObjectStoreBackend.MOONCAKE.value}"
+    )
+
+    if component.deploys_orchestration_script():
+        return
+
+    address = (args.mooncake_store_init_kwargs or {}).get(_MOONCAKE_MASTER_ADDRESS_KEY)
+    assert isinstance(address, str) and ":" in address, (
+        f"--deploy-component {component.value} shares the object store of the deployment that carries the "
+        f"orchestration script, and it runs no master of its own, so that master's address has to be named by "
+        f'--mooncake-store-init-kwargs \'{{"{_MOONCAKE_MASTER_ADDRESS_KEY}": "<host>:<port>"}}\' '
+        f"(got {address!r})"
+    )
+
+
 _FT_DEFAULT_COMPONENTS: list[str] = ["rollout"]
 
 
@@ -3637,6 +3741,8 @@ def miles_validate_args(args):
 
     if args.mini_ft_controller_enable and args.api_server_port == 0:
         raise ValueError("--mini-ft-controller-enable requires --api-server-port to be set (non-zero)")
+
+    _validate_deploy_component(args)
 
 
 def validate_skip_actor_forward_only(args) -> None:

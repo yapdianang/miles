@@ -47,8 +47,7 @@
         }
       },
       "required": [
-        "enabled",
-        "serviceAccount"
+        "enabled"
       ],
       "type": "object"
     },
@@ -523,7 +522,7 @@
       "additionalProperties": false,
       "properties": {
         "id": {
-          "maxLength": 40,
+          "maxLength": 35,
           "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
           "type": "string"
         },
@@ -588,7 +587,6 @@
       },
       "required": [
         "id",
-        "stateFile",
         "objectNames"
       ],
       "type": "object"

@@ -16,6 +16,9 @@ class BackendCapability(abc.ABC):
     @abc.abstractmethod
     def static_worker_provider(self, *, pool_id: str) -> BaseWorkerProvider: ...
 
+    def deploys_static_pool(self, *, pool_id: str) -> bool:
+        return True
+
     @abc.abstractmethod
     def cell_operations(self) -> BaseCellOperations: ...
 
@@ -30,6 +33,9 @@ class DeferredBackendCapability(BackendCapability):
 
     def static_worker_provider(self, *, pool_id: str) -> BaseWorkerProvider:
         return self._resolve().static_worker_provider(pool_id=pool_id)
+
+    def deploys_static_pool(self, *, pool_id: str) -> bool:
+        return self._resolve().deploys_static_pool(pool_id=pool_id)
 
     def cell_operations(self) -> BaseCellOperations:
         return self._resolve().cell_operations()

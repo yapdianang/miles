@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shlex
@@ -8,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from miles.ray.specs.addressing import compute_addressed_trainer_controllers, format_trainer_controller_addrs
 from miles.ray.specs.entrypoint import compute_specs
 from miles.utils.arguments import parse_args
 from miles.utils.external_utils.command_utils.base_backend import (
@@ -15,7 +17,13 @@ from miles.utils.external_utils.command_utils.base_backend import (
     ExecuteTrainConfig,
     ExecuteTrainRequest,
 )
-from miles.utils.external_utils.command_utils.common import ArgvManipulator, chart_dir, repo_base_dir, train_env_vars
+from miles.utils.external_utils.command_utils.common import (
+    MOONCAKE_INIT_KWARGS_FLAG,
+    ArgvManipulator,
+    chart_dir,
+    repo_base_dir,
+    train_env_vars,
+)
 from miles.utils.external_utils.command_utils.helm_backend import naming
 from miles.utils.external_utils.command_utils.helm_backend.launcher import manifest_diff
 from miles.utils.external_utils.command_utils.helm_backend.launcher.command_wrapper import CI_LABEL, Helm, Kubectl
@@ -32,13 +40,17 @@ from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc 
     InfraInfo,
     LaunchPlan,
     MooncakeInfo,
+    MooncakePlan,
 )
 from miles.utils.external_utils.command_utils.helm_backend.naming import RunFiles, RunNames
 from miles.utils.external_utils.command_utils.helm_backend.orchestrator.observer import wait_for_run
 from miles.utils.external_utils.model_args_utils import shell_safe_model_args
+from miles.utils.object_store import ObjectStoreBackend
 from miles.utils.run_uuid import derive_run_uuid
 from miles.utils.workers.serving.utils import override_argv
-from miles.utils.workers.types import ClusterBackend
+from miles.utils.workers.types import ClusterBackend, DeployComponent
+from miles.utils.workers.worker_provider.kubernetes.helm.naming import static_cell_addrs
+from miles.utils.workers.worker_spec import RPC_PORT_NAME, BaseWorkerSpec
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +64,26 @@ def execute_train(*, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -
     assert _RUN_ID_PATTERN.fullmatch(
         run_id
     ), f"run_id {run_id!r} names every object this run installs, so it has to match {_RUN_ID_PATTERN.pattern}"
+    assert not any(run_id.endswith(f"-{component.value}") for component in DeployComponent), (
+        f"run_id {run_id!r} ends in a component name, so its unsplit release would carry the very name a split "
+        f"launch of another run installs its {run_id.rpartition('-')[2]} release under"
+    )
 
     namespace = config.namespace
-    release = RunNames.release(run_id=run_id)
-    pod_argv, args = _compute_train_argv(request, run_id=run_id, release=release, namespace=namespace)
+    base_argv = _compute_base_argv(request, run_id=run_id)
+    with override_argv(base_argv):
+        args = parse_args()
+    deploy_component = DeployComponent(args.deploy_component)
+    assert deploy_component is config.deploy_component, (
+        f"the run's pods are told {deploy_component.value} while everything this launch installs is named after "
+        f"{config.deploy_component.value}"
+    )
+    deploys_orchestration_script = deploy_component.deploys_orchestration_script()
+    release = RunNames.release(run_id=run_id, deploy_component=deploy_component)
+    mooncake_plan = MooncakeInfo.plan_of_args(args) if deploys_orchestration_script else None
+    pod_argv = MooncakeInfo.with_cluster_master(
+        base_argv, plan=mooncake_plan, host=MooncakeInfo.master_service_host(release, namespace)
+    )
 
     specs = compute_specs(args)
     chart = chart_dir(repo_base_dir=repo_base_dir)
@@ -63,24 +91,26 @@ def execute_train(*, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -
     run_directory = RunFiles.run_dir(shared_root=shared_root, run_id=run_id)
 
     if config.ci_run:
-        _uninstall_leftover_ci_releases(namespace)
+        _uninstall_leftover_ci_releases(namespace, keep_run_id=run_id)
     Helm.build_dependencies(chart)
 
     installed_manifest = Helm.get_manifest(release, namespace)
-    state_file = _compute_state_file(
-        installed_manifest=installed_manifest, run_directory=run_directory, release=release
+    state_file = (
+        _compute_state_file(installed_manifest=installed_manifest, run_directory=run_directory, release=release)
+        if deploys_orchestration_script
+        else None
     )
 
     plan = LaunchPlan(
         run_id=run_id,
         release=release,
         namespace=namespace,
-        state_file=str(state_file),
-        orchestrator_command=["python", request.train_script, *pod_argv],
+        state_file=str(state_file) if state_file is not None else "",
+        orchestrator_command=["python", request.train_script, *pod_argv] if deploys_orchestration_script else [],
         worker_argv=pod_argv,
         env=train_env_vars(request, {}, config=config),
         colocate=bool(args.colocate),
-        mooncake_plan=MooncakeInfo.plan_of_args(args),
+        mooncake_plan=mooncake_plan,
         prepare_cmd=request.prepare_cmd,
     )
     values_path = RunFiles.new_values_file(run_directory=run_directory)
@@ -117,7 +147,45 @@ def execute_train(*, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -
         ci_run=config.ci_run,
     )
 
+    if not deploys_orchestration_script:
+        logger.info(
+            f"Installed {release}, which carries no orchestration script: it has no training to finish, so it stays "
+            f"up until you uninstall it with `helm uninstall {release} --namespace {namespace}`. "
+            f"Reach it with {_describe_reachable_addrs(args, specs=specs, release=release)}"
+        )
+        return
+
+    if deploy_component.is_split():
+        logger.info(
+            f"The other deployments of this run share the object store of {release}, so give each of them "
+            f"{_describe_shared_object_store(mooncake_plan, release=release, namespace=namespace)}"
+        )
+
     _follow_until_finished(release=release, namespace=namespace, state_file=state_file)
+
+
+def _describe_shared_object_store(plan: MooncakePlan | None, *, release: str, namespace: str) -> str:
+    assert plan is not None, (
+        f"{release} carries the orchestration script of a split run, so it runs the object store master the other "
+        f"deployments redeem their references at, and a run without one shares nothing"
+    )
+    init_kwargs = MooncakeInfo.cluster_init_kwargs(plan, host=MooncakeInfo.master_service_host(release, namespace))
+    return (
+        f"--object-store-backend {ObjectStoreBackend.MOONCAKE.value} "
+        f"{MOONCAKE_INIT_KWARGS_FLAG} {shlex.quote(json.dumps(init_kwargs))}"
+    )
+
+
+def _describe_reachable_addrs(args, *, specs: list[BaseWorkerSpec], release: str) -> str:
+    specs_by_pool_id = {spec.name: spec for spec in specs}
+    entries = [
+        (
+            controller,
+            static_cell_addrs(spec=specs_by_pool_id[controller.pool_id], release=release, cell_index=0)[RPC_PORT_NAME],
+        )
+        for controller in compute_addressed_trainer_controllers(args)
+    ]
+    return format_trainer_controller_addrs(entries)
 
 
 def _follow_until_finished(*, release: str, namespace: str, state_file: Path) -> None:
@@ -138,9 +206,7 @@ def _follow_until_finished(*, release: str, namespace: str, state_file: Path) ->
         raise SystemExit(outcome.exit_code)
 
 
-def _compute_train_argv(
-    request: ExecuteTrainRequest, *, run_id: str, release: str, namespace: str
-) -> tuple[list[str], Any]:
+def _compute_base_argv(request: ExecuteTrainRequest, *, run_id: str) -> list[str]:
     argv = [*shlex.split(shell_safe_model_args(request.megatron_model_type)), *shlex.split(request.train_args)]
     assert not ArgvManipulator.declares(argv, _ENV_REPORT_FLAG), (
         f"{_ENV_REPORT_FLAG} is what this launcher tells the pods about the launch that installed them, and an "
@@ -148,21 +214,13 @@ def _compute_train_argv(
     )
     argv = ArgvManipulator.with_flag(argv, CLUSTER_BACKEND_FLAG, ClusterBackend.KUBERNETES.value)
     # TODO: generate different run_uuid even for same run_id, but at the same time allow helm upgrading
-    argv = ArgvManipulator.with_flag(argv, _RUN_UUID_FLAG, derive_run_uuid(run_id))
-
-    with override_argv(argv):
-        args = parse_args()
-
-    pod_argv = MooncakeInfo.with_cluster_master(
-        argv, plan=MooncakeInfo.plan_of_args(args), host=MooncakeInfo.master_service_host(release, namespace)
-    )
-    return pod_argv, args
+    return ArgvManipulator.with_flag(argv, _RUN_UUID_FLAG, derive_run_uuid(run_id))
 
 
 def _compute_pod_record_file(*, installed_manifest: Manifest | None, record_path: Path) -> str | None:
     if installed_manifest is None:
         return str(record_path)
-    return installed_launch_record_file(manifest=installed_manifest, container=naming.ORCHESTRATOR_COMPONENT)
+    return installed_launch_record_file(manifest=installed_manifest)
 
 
 def _compute_state_file(*, installed_manifest: Manifest | None, run_directory: Path, release: str) -> Path:
@@ -205,8 +263,14 @@ def _assert_upgrade_only_resizes(
     logger.warning(f"forced: {message}")
 
 
-def _uninstall_leftover_ci_releases(namespace: str) -> list[str]:
-    releases = Helm.list_releases(namespace=namespace, selector=f"{CI_LABEL}=true")
+def _releases_of_run(run_id: str) -> set[str]:
+    return {RunNames.release(run_id=run_id, deploy_component=component) for component in DeployComponent}
+
+
+def _uninstall_leftover_ci_releases(namespace: str, *, keep_run_id: str) -> list[str]:
+    kept = _releases_of_run(keep_run_id)
+    listed = Helm.list_releases(namespace=namespace, selector=f"{CI_LABEL}=true")
+    releases = [release for release in listed if release not in kept]
     for release in releases:
         logger.info(f"Uninstalling the leftover ci release {release} before this run installs its own")
         Helm.uninstall(release=release, namespace=namespace)
