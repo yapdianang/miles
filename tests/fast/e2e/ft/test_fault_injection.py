@@ -631,11 +631,11 @@ class TestFaultFormsOfBackendAndCellType:
 
         assert [form.name for form in forms] == [f"inject_fault:{one.value}" for one in fi.FAILURE_MODES]
 
-    def test_ray_draws_the_same_kills_for_a_rollout_cell(self) -> None:
-        """On ray an engine is supervised by an actor that can be asked to die, exactly like a trainer cell."""
+    def test_ray_draws_a_sigkill_only_for_a_rollout_cell(self) -> None:
+        """The engine is a subprocess, and exit, segfault and deadlock are faults only its own code can commit."""
         forms = _api_server_fault_forms()["rollout"]
 
-        assert [form.name for form in forms] == [f"inject_fault:{one.value}" for one in fi.FAILURE_MODES]
+        assert [form.name for form in forms] == [f"inject_fault:{FailureMode.SIGKILL.value}"]
 
     def test_kubernetes_draws_the_kills_plus_pod_deletion_for_a_trainer_cell(self) -> None:
         """Trainer workers are served over rpc on k8s, so pod deletion joins the kills instead of replacing them."""

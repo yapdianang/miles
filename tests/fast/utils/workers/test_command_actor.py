@@ -193,15 +193,65 @@ class TestKillSubprocess:
 
 
 class TestInjectFault:
-    def test_inject_fault_forwards_the_requested_mode(self, monkeypatch: pytest.MonkeyPatch):
-        """The actor hands the caller's failure mode to the fault injector unchanged."""
-        injected_modes: list[str] = []
+    def test_a_sigkill_reaches_only_the_direct_child(self, monkeypatch: pytest.MonkeyPatch):
+        """Signalling the group would also crash whatever the engine spawned, which is a wider fault than asked for."""
+        killed: list[int] = []
+        monkeypatch.setattr(process_utils, "kill_process", lambda process: killed.append(process.pid))
+        monkeypatch.setattr(process_utils, "kill_process_tree", _refuse_to_signal_the_group)
+        actor = CommandActor()
+        actor._process = _FakeProcess(pid=4321)
 
-        def _record_injected_mode(mode: str) -> None:
-            injected_modes.append(mode)
+        actor.inject_fault("sigkill")
 
-        monkeypatch.setattr(fault_injector, "inject_fault", _record_injected_mode)
+        assert killed == [4321]
 
-        CommandActor().inject_fault(mode="segfault")
+    @pytest.mark.parametrize("mode", ["exit", "segfault", "deadlock"])
+    def test_every_other_failure_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch, mode: str):
+        """A process exits, segfaults and deadlocks from the inside; no signal an outsider sends reproduces that."""
+        monkeypatch.setattr(process_utils, "kill_process", _refuse_to_kill)
+        actor = CommandActor()
+        actor._process = _FakeProcess(pid=4321)
 
-        assert injected_modes == ["segfault"]
+        with pytest.raises(AssertionError, match="only sigkill"):
+            actor.inject_fault(mode)
+
+    def test_an_unknown_mode_is_rejected(self):
+        """A misspelt mode must not be waved through as some default crash."""
+        actor = CommandActor()
+        actor._process = _FakeProcess(pid=4321)
+
+        with pytest.raises(ValueError):
+            actor.inject_fault("nuke")
+
+    def test_the_actor_process_survives_the_injection(self, monkeypatch: pytest.MonkeyPatch):
+        """Production loses the engine, not its supervisor, so crashing the actor would be the wrong fault."""
+        monkeypatch.setattr(fault_injector, "inject_fault", _refuse_to_inject)
+        monkeypatch.setattr(process_utils, "kill_process", lambda process: None)
+        actor = CommandActor()
+        actor._process = _FakeProcess(pid=4321)
+
+        actor.inject_fault("sigkill")
+
+    def test_an_actor_without_a_subprocess_is_rejected(self, monkeypatch: pytest.MonkeyPatch):
+        """Falling back to killing the actor would inject a fault production never produces."""
+        monkeypatch.setattr(fault_injector, "inject_fault", _refuse_to_inject)
+
+        with pytest.raises(AssertionError, match="no subprocess"):
+            CommandActor().inject_fault("sigkill")
+
+
+class _FakeProcess:
+    def __init__(self, *, pid: int) -> None:
+        self.pid = pid
+
+
+def _refuse_to_inject(mode: str) -> None:
+    raise AssertionError(f"the actor process must not crash itself, but {mode} was injected into it")
+
+
+def _refuse_to_kill(process) -> None:
+    raise AssertionError(f"no kill was expected, but pid {process.pid} was killed")
+
+
+def _refuse_to_signal_the_group(process) -> None:
+    raise AssertionError(f"the process group of pid {process.pid} must not be signalled")
