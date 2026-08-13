@@ -276,6 +276,18 @@ class TestPrepareCmd:
             )
 
 
+class TestExtraManifests:
+    def test_a_ray_launch_refuses_the_manifests_it_could_only_ignore(self, commands):
+        """Nothing installs them without a helm release, and a silently missing engine looks like a hang."""
+        with pytest.raises(AssertionError, match="extra_manifests"):
+            _backend().execute_train(
+                train_args="",
+                num_gpus_per_node=1,
+                megatron_model_type="qwen3-4B",
+                extra_manifests=["apiVersion: v1\nkind: Service\n"],
+            )
+
+
 class TestExecuteTrain:
     def test_exports_unbuffered_python_to_ray(self, monkeypatch):
         """Ray start and job submit must export the correctly spelled PYTHONUNBUFFERED."""
@@ -531,6 +543,7 @@ class TestBuildTrainEnvVars:
             extra_env_vars={},
             megatron_path="/root/Megatron-LM",
             before_ray_job_submit=None,
+            extra_manifests=[],
         )
         return ExecuteTrainRequest(**{**defaults, **overrides})
 
