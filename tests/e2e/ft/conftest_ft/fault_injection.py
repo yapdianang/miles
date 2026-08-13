@@ -103,6 +103,22 @@ def _inject_fault_forms(*, base_url: str, failure_modes: list[FailureMode]) -> l
     return [InjectFaultForm(base_url=base_url, failure_mode=failure_mode) for failure_mode in failure_modes]
 
 
+CELL_TYPE_OF_FT_COMPONENT: dict[str, str] = {"train": ACTOR_CELL_TYPE, "rollout": ROLLOUT_CELL_TYPE}
+
+
+def compute_mean_interval_seconds_of_cell_type(
+    ft_components: tuple[str, ...], *, trainer_crash_interval_seconds: float, rollout_crash_interval_seconds: float
+) -> dict[str, float]:
+    interval_seconds_of_component: dict[str, float] = {
+        "train": trainer_crash_interval_seconds,
+        "rollout": rollout_crash_interval_seconds,
+    }
+
+    return {
+        CELL_TYPE_OF_FT_COMPONENT[component]: interval_seconds_of_component[component] for component in ft_components
+    }
+
+
 def cell_is_alive(cell: dict) -> bool:
     return any(cond["type"] == "Healthy" and cond["status"] == "True" for cond in cell["status"]["conditions"])
 
@@ -268,23 +284,25 @@ def run_fault_injection_loop(
     *,
     base_url: str,
     seed: int,
-    mean_interval_seconds: float,
+    mean_interval_seconds_of_cell_type: dict[str, float],
     stop_event: threading.Event,
     on_successful_injection: Callable[[], None],
-    cell_type: str | None,
     recovery_witness: RecoveryWitness,
     cell_fault_forms: CellFaultForms,
     poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
 ) -> None:
     rng = random.Random(seed)
     gate = RecoveryGate()
-    next_injection_time = _compute_next_injection_time(rng, mean_interval_seconds)
+    next_injection_time_of_cell_type: dict[str, float] = {
+        cell_type: _compute_next_injection_time(rng, mean_interval_seconds)
+        for cell_type, mean_interval_seconds in sorted(mean_interval_seconds_of_cell_type.items())
+    }
 
     while not stop_event.is_set():
         if stop_event.wait(timeout=poll_interval_seconds):
             break
 
-        cells = list_cells(base_url=base_url, cell_type=cell_type)
+        cells = list_cells(base_url=base_url, cell_types=set(mean_interval_seconds_of_cell_type))
         if cells is None:
             continue
 
@@ -296,7 +314,9 @@ def run_fault_injection_loop(
         if stop_event.is_set():
             break
 
-        if time.monotonic() < next_injection_time:
+        now: float = time.monotonic()
+        due_types = sorted(kind for kind, due_at in next_injection_time_of_cell_type.items() if now >= due_at)
+        if not due_types:
             continue
 
         live_replicas_of_type: dict[str, list[dict]] = {}
@@ -319,15 +339,17 @@ def run_fault_injection_loop(
             },
         )
 
-        spare_types = sorted(kind for kind, kind_cells in live_replicas_of_type.items() if len(kind_cells) > 1)
+        spare_types = [kind for kind in due_types if len(live_replicas_of_type.get(kind, [])) > 1]
         if not spare_types:
             logger.info(
-                "Deferring injection: no cell kind has a spare working replica (%s)",
+                "Deferring injection: no due cell kind has a spare working replica (due %s, alive %s)",
+                due_types,
                 {kind: len(kind_cells) for kind, kind_cells in sorted(live_replicas_of_type.items())},
             )
             continue
 
-        target = rng.choice(victims_of_type[rng.choice(spare_types)])
+        cell_type = rng.choice(spare_types)
+        target = rng.choice(victims_of_type[cell_type])
         cell_name = target["metadata"]["name"]
         form = rng.choice(cell_fault_forms[_cell_type_of(target)])
         try:
@@ -335,17 +357,19 @@ def run_fault_injection_loop(
             gate.note_injected(cell_name)
             recovery_witness.note_injected(cell_name)
             on_successful_injection()
-            next_injection_time = _compute_next_injection_time(rng, mean_interval_seconds)
+            next_injection_time_of_cell_type[cell_type] = _compute_next_injection_time(
+                rng, mean_interval_seconds_of_cell_type[cell_type]
+            )
             logger.info("Injected fault %s into %s", form.name, cell_name)
         except Exception:
             logger.info("Failed to inject fault %s into %s", form.name, cell_name, exc_info=True)
 
 
-def list_cells(*, base_url: str, cell_type: str | None) -> list[dict] | None:
+def list_cells(*, base_url: str, cell_types: set[str]) -> list[dict] | None:
     try:
         resp = requests.get(f"{base_url}/api/v1/cells", timeout=5)
         resp.raise_for_status()
-        return [c for c in resp.json()["items"] if _matches_cell_type(c, cell_type)]
+        return [c for c in resp.json()["items"] if _cell_type_of(c) in cell_types]
     except Exception:
         logger.info("Failed to list cells from api server", exc_info=True)
         return None
@@ -355,34 +379,28 @@ def _cell_type_of(cell: dict) -> str:
     return cell["metadata"]["labels"]["miles.io/cell-type"]
 
 
-def _matches_cell_type(cell: dict, cell_type: str | None) -> bool:
-    return cell_type is None or _cell_type_of(cell) == cell_type
-
-
 class FaultInjectorHandle:
     def __init__(
         self,
         *,
         base_url: str,
         seed: int,
-        mean_interval_seconds: float,
-        cell_type: str | None,
+        mean_interval_seconds_of_cell_type: dict[str, float],
         cell_fault_forms: CellFaultForms,
     ) -> None:
         self.num_successful_injections: int = 0
         self.recovery_witness = RecoveryWitness()
         self._base_url = base_url
-        self._cell_type = cell_type
+        self._cell_types: set[str] = set(mean_interval_seconds_of_cell_type)
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
             target=run_fault_injection_loop,
             kwargs={
                 "base_url": base_url,
                 "seed": seed,
-                "mean_interval_seconds": mean_interval_seconds,
+                "mean_interval_seconds_of_cell_type": mean_interval_seconds_of_cell_type,
                 "stop_event": self._stop_event,
                 "on_successful_injection": self._on_successful_injection,
-                "cell_type": cell_type,
                 "recovery_witness": self.recovery_witness,
                 "cell_fault_forms": cell_fault_forms,
             },
@@ -403,7 +421,7 @@ class FaultInjectorHandle:
         self._observe_final_snapshot()
 
     def _observe_final_snapshot(self) -> None:
-        cells = list_cells(base_url=self._base_url, cell_type=self._cell_type)
+        cells = list_cells(base_url=self._base_url, cell_types=self._cell_types)
         if cells is None:
             return
         self.recovery_witness.observe(cells)
@@ -416,15 +434,13 @@ def spawn_fault_injector(
     *,
     base_url: str,
     seed: int,
-    mean_interval_seconds: float,
-    cell_type: str | None,
+    mean_interval_seconds_of_cell_type: dict[str, float],
     cell_fault_forms: CellFaultForms,
 ) -> FaultInjectorHandle:
     handle = FaultInjectorHandle(
         base_url=base_url,
         seed=seed,
-        mean_interval_seconds=mean_interval_seconds,
-        cell_type=cell_type,
+        mean_interval_seconds_of_cell_type=mean_interval_seconds_of_cell_type,
         cell_fault_forms=cell_fault_forms,
     )
     handle.start()

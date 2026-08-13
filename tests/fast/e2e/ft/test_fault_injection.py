@@ -54,6 +54,10 @@ def _cell(name: str, *, healthy: bool, cell_type: str = "actor", phase: str = "R
     }
 
 
+def _intervals(cell_types: tuple[str, ...], mean_interval_seconds: float) -> dict[str, float]:
+    return {cell_type: mean_interval_seconds for cell_type in cell_types}
+
+
 def _by_name(*cells: dict) -> dict[str, dict]:
     return {c["metadata"]["name"]: c for c in cells}
 
@@ -160,10 +164,9 @@ def test_loop_never_kills_the_last_live_cell_under_stale_liveness() -> None:
         fi.run_fault_injection_loop(
             base_url="http://control",
             seed=0,
-            mean_interval_seconds=1e-6,
+            mean_interval_seconds_of_cell_type=_intervals(("actor", "rollout"), 1e-6),
             stop_event=stop_event,
             on_successful_injection=lambda: None,
-            cell_type=None,
             recovery_witness=fi.RecoveryWitness(),
             cell_fault_forms=_api_server_fault_forms(),
             poll_interval_seconds=1e-6,
@@ -201,10 +204,9 @@ def test_loop_injects_again_after_an_injected_cell_recovers() -> None:
         fi.run_fault_injection_loop(
             base_url="http://control",
             seed=0,
-            mean_interval_seconds=1e-6,
+            mean_interval_seconds_of_cell_type=_intervals(("actor", "rollout"), 1e-6),
             stop_event=stop_event,
             on_successful_injection=lambda: None,
-            cell_type=None,
             recovery_witness=fi.RecoveryWitness(),
             cell_fault_forms=_api_server_fault_forms(),
             poll_interval_seconds=1e-6,
@@ -217,7 +219,7 @@ def _typed_cell(name: str, cell_type: str, *, healthy: bool = True, serving: boo
     return _cell(name, healthy=healthy, cell_type=cell_type, serving=serving)
 
 
-def _run_typed_injection_loop(cells: list[dict], *, cell_type: str | None) -> list[str]:
+def _run_typed_injection_loop(cells: list[dict], *, cell_types: tuple[str, ...]) -> list[str]:
     injected: list[str] = []
     stop_event = threading.Event()
     polls = {"n": 0}
@@ -238,10 +240,9 @@ def _run_typed_injection_loop(cells: list[dict], *, cell_type: str | None) -> li
         fi.run_fault_injection_loop(
             base_url="http://control",
             seed=0,
-            mean_interval_seconds=1e-6,
+            mean_interval_seconds_of_cell_type=_intervals(cell_types, 1e-6),
             stop_event=stop_event,
             on_successful_injection=lambda: None,
-            cell_type=cell_type,
             recovery_witness=fi.RecoveryWitness(),
             cell_fault_forms=_api_server_fault_forms(),
             poll_interval_seconds=1e-6,
@@ -269,10 +270,9 @@ def test_a_stop_that_arrives_while_listing_buys_no_further_injection() -> None:
         fi.run_fault_injection_loop(
             base_url="http://control",
             seed=0,
-            mean_interval_seconds=1e-9,
+            mean_interval_seconds_of_cell_type=_intervals(("actor",), 1e-9),
             stop_event=stop_event,
             on_successful_injection=lambda: None,
-            cell_type=None,
             recovery_witness=fi.RecoveryWitness(),
             cell_fault_forms=_api_server_fault_forms(),
             poll_interval_seconds=1e-6,
@@ -290,7 +290,7 @@ def test_injection_can_be_restricted_to_one_kind_of_cell() -> None:
             _typed_cell("rollout-engine-0", "rollout"),
             _typed_cell("rollout-engine-1", "rollout"),
         ],
-        cell_type="rollout",
+        cell_types=("rollout",),
     )
 
     assert injected
@@ -305,14 +305,14 @@ def test_the_live_replica_count_only_considers_the_targeted_kind() -> None:
             _typed_cell("actor-1", "actor"),
             _typed_cell("rollout-engine-0", "rollout"),
         ],
-        cell_type="rollout",
+        cell_types=("rollout",),
     )
 
     assert injected == []
 
 
-def test_an_untyped_run_sees_every_cell() -> None:
-    """A mixed-ft soak declares no cell type, and must be able to crash either kind."""
+def test_a_mixed_run_sees_every_targeted_kind() -> None:
+    """A mixed-ft soak schedules both kinds, and must be able to crash either one."""
     injected = _run_typed_injection_loop(
         [
             _typed_cell("actor-0", "actor"),
@@ -320,13 +320,13 @@ def test_an_untyped_run_sees_every_cell() -> None:
             _typed_cell("rollout-engine-0", "rollout"),
             _typed_cell("rollout-engine-1", "rollout"),
         ],
-        cell_type=None,
+        cell_types=("actor", "rollout"),
     )
 
     assert injected
 
 
-def test_an_untyped_run_still_keeps_one_replica_of_each_kind() -> None:
+def test_a_mixed_run_still_keeps_one_replica_of_each_kind() -> None:
     """Counting kinds together would let the trainer cells license killing the last engine."""
     injected = _run_typed_injection_loop(
         [
@@ -334,7 +334,7 @@ def test_an_untyped_run_still_keeps_one_replica_of_each_kind() -> None:
             _typed_cell("actor-1", "actor"),
             _typed_cell("rollout-engine-0", "rollout"),
         ],
-        cell_type=None,
+        cell_types=("actor", "rollout"),
     )
 
     assert all(name.startswith("actor-") for name in injected), injected
@@ -454,25 +454,30 @@ def _mode(*ft_components: str) -> FTTestMode:
     return dataclasses.replace(next(iter(MODES.values())), ft_components=tuple(ft_components))
 
 
-def test_a_trainer_only_soak_targets_actor_cells() -> None:
+def _mean_intervals(*ft_components: str) -> dict[str, float]:
+    return fi.compute_mean_interval_seconds_of_cell_type(
+        tuple(ft_components), trainer_crash_interval_seconds=120.0, rollout_crash_interval_seconds=240.0
+    )
+
+
+def test_a_trainer_only_soak_schedules_actor_injections_only() -> None:
     """It must not crash engines that its assertions say nothing about."""
-    from tests.e2e.ft.conftest_ft.scenario_random_crash import compute_injected_cell_type
-
-    assert compute_injected_cell_type(_mode("train")) == "actor"
+    assert _mean_intervals("train") == {"actor": 120.0}
 
 
-def test_a_rollout_only_soak_targets_rollout_cells() -> None:
+def test_a_rollout_only_soak_schedules_rollout_injections_only() -> None:
     """Crashing trainer cells here would exercise a component this mode did not enable ft on."""
-    from tests.e2e.ft.conftest_ft.scenario_random_crash import compute_injected_cell_type
-
-    assert compute_injected_cell_type(_mode("rollout")) == "rollout"
+    assert _mean_intervals("rollout") == {"rollout": 240.0}
 
 
-def test_a_mixed_soak_targets_every_kind() -> None:
-    """The point of the mixed mode is that both kinds fail during one run."""
-    from tests.e2e.ft.conftest_ft.scenario_random_crash import compute_injected_cell_type
+def test_a_mixed_soak_keeps_each_kind_on_the_cadence_it_would_have_alone() -> None:
+    """Adding rollout to a soak must not dilute the trainer crash rate it was calibrated at."""
+    assert _mean_intervals("train", "rollout") == {"actor": 120.0, "rollout": 240.0}
 
-    assert compute_injected_cell_type(_mode("train", "rollout")) is None
+
+def test_a_kind_the_mode_does_not_enable_ft_on_gets_no_schedule_at_all() -> None:
+    """An entry in the map is what makes the loop consider a kind, so a stray one crashes an unwatched component."""
+    assert "rollout" not in _mean_intervals("train")
 
 
 def test_stop_and_join_takes_one_last_snapshot_before_the_witness_is_read() -> None:
@@ -480,8 +485,7 @@ def test_stop_and_join_takes_one_last_snapshot_before_the_witness_is_read() -> N
     handle = fi.FaultInjectorHandle(
         base_url="http://control",
         seed=0,
-        mean_interval_seconds=1e9,
-        cell_type="rollout",
+        mean_interval_seconds_of_cell_type=_intervals(("rollout",), 1e9),
         cell_fault_forms=_api_server_fault_forms(),
     )
 
@@ -547,10 +551,9 @@ class TestFaultInjectionLoopErrorHandling:
             fi.run_fault_injection_loop(
                 base_url="http://control",
                 seed=0,
-                mean_interval_seconds=1e-12,
+                mean_interval_seconds_of_cell_type=_intervals(("actor", "rollout"), 1e-12),
                 stop_event=stop_event,
                 on_successful_injection=lambda: None,
-                cell_type=None,
                 recovery_witness=witness,
                 cell_fault_forms=_api_server_fault_forms(),
                 poll_interval_seconds=1e-6,
@@ -594,10 +597,9 @@ class TestFaultInjectionLoopErrorHandling:
             fi.run_fault_injection_loop(
                 base_url="http://control",
                 seed=0,
-                mean_interval_seconds=1e-6,
+                mean_interval_seconds_of_cell_type=_intervals(("actor", "rollout"), 1e-6),
                 stop_event=stop_event,
                 on_successful_injection=note_success,
-                cell_type=None,
                 recovery_witness=witness,
                 cell_fault_forms=_api_server_fault_forms(),
                 poll_interval_seconds=1e-6,
@@ -608,16 +610,16 @@ class TestFaultInjectionLoopErrorHandling:
         assert witness.num_injections(cell_type="rollout") == 1
 
 
-class TestUntypedInjectionSelection:
-    def test_untyped_run_injects_rollout_when_only_rollout_has_a_spare(self) -> None:
-        """The mirror of the trainer case: untyped selection must not be hard-coded to actor cells."""
+class TestMixedInjectionSelection:
+    def test_mixed_run_injects_rollout_when_only_rollout_has_a_spare(self) -> None:
+        """The mirror of the trainer case: mixed selection must not be hard-coded to actor cells."""
         injected = _run_typed_injection_loop(
             [
                 _typed_cell("actor-0", "actor"),
                 _typed_cell("rollout-engine-0", "rollout"),
                 _typed_cell("rollout-engine-1", "rollout"),
             ],
-            cell_type=None,
+            cell_types=("actor", "rollout"),
         )
 
         assert injected
@@ -639,9 +641,9 @@ class TestFaultFormsOfBackendAndCellType:
 
     def test_kubernetes_draws_the_kills_plus_pod_deletion_for_a_trainer_cell(self) -> None:
         """Trainer workers are served over rpc on k8s, so pod deletion joins the kills instead of replacing them."""
-        forms_of = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
+        compute = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
 
-        forms = forms_of["actor"]
+        forms = compute(_typed_cell("actor-0", "actor"))
 
         assert [form.name for form in forms] == [
             *(f"inject_fault:{one.value}" for one in fi.FAILURE_MODES),
@@ -650,17 +652,17 @@ class TestFaultFormsOfBackendAndCellType:
 
     def test_kubernetes_draws_pod_deletion_only_for_a_rollout_cell(self) -> None:
         """A k8s engine pod runs sglang as its entrypoint with no rpc server, so a kill would blow up at runtime."""
-        forms_of = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
+        compute = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
 
-        forms = forms_of["rollout"]
+        forms = compute(_typed_cell("rollout-engine-0", "rollout"))
 
         assert [form.name for form in forms] == [fi.DELETE_POD_FORM_NAME]
 
     def test_every_kill_is_its_own_form_so_the_draw_stays_uniform(self) -> None:
         """Folding the kills into one form would make pod deletion half of every trainer injection."""
-        forms_of = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
+        compute = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
 
-        assert len(forms_of["actor"]) == len(fi.FAILURE_MODES) + 1
+        assert len(compute(_typed_cell("actor-0", "actor"))) == len(fi.FAILURE_MODES) + 1
 
     def test_a_kubernetes_run_without_a_namespace_fails_before_the_soak_starts(self) -> None:
         """kubectl would otherwise delete pods in whatever namespace the kubeconfig happens to point at."""
@@ -689,11 +691,9 @@ class TestFaultFormsOfBackendAndCellType:
         requests = MagicMock()
         monkeypatch.setattr(fi, "requests", requests)
 
-        forms_of = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
+        compute = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
         cell = _typed_cell("actor-0", "actor")
-        next(one for one in forms_of[fi.ROLLOUT_CELL_TYPE] if one.name == fi.DELETE_POD_FORM_NAME).inject(
-            cell, random.Random(0)
-        )
+        next(one for one in compute(cell) if one.name == fi.DELETE_POD_FORM_NAME).inject(cell, random.Random(0))
 
         assert [one["cell_id"] for one in seen] == ["actor-0"]
         assert [one["release"] for one in seen] == [RunNames.release(run_id=_RUN_ID)]
@@ -717,10 +717,9 @@ class TestFaultFormsOfBackendAndCellType:
             fi.run_fault_injection_loop(
                 base_url="http://control",
                 seed=0,
-                mean_interval_seconds=1e-12,
+                mean_interval_seconds_of_cell_type=_intervals(("actor", "rollout"), 1e-12),
                 stop_event=stop_event,
                 on_successful_injection=lambda: None,
-                cell_type=None,
                 recovery_witness=fi.RecoveryWitness(),
                 cell_fault_forms=_fixed_fault_forms(
                     [_StubFaultForm(fi.DELETE_POD_FORM_NAME, lambda cell, rng: drawn.append(fi.DELETE_POD_FORM_NAME))]
@@ -740,7 +739,7 @@ class TestRolloutSpareReadiness:
                 _typed_cell("rollout-engine-0", "rollout"),
                 _typed_cell("rollout-engine-1", "rollout", serving=False),
             ],
-            cell_type="rollout",
+            cell_types=("rollout",),
         )
 
         assert injected == []
@@ -752,7 +751,7 @@ class TestRolloutSpareReadiness:
                 _typed_cell("rollout-engine-0", "rollout"),
                 _typed_cell("rollout-engine-1", "rollout"),
             ],
-            cell_type="rollout",
+            cell_types=("rollout",),
         )
 
         assert injected
@@ -786,8 +785,7 @@ class TestRolloutSpareReadiness:
         handle = fi.FaultInjectorHandle(
             base_url="http://control",
             seed=0,
-            mean_interval_seconds=1e-12,
-            cell_type=None,
+            mean_interval_seconds_of_cell_type=_intervals(("actor", "rollout"), 1e-12),
             cell_fault_forms=_fixed_fault_forms([_StubFaultForm("slow", slow_inject)]),
         )
 

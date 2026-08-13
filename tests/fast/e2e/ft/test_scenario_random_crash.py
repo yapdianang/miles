@@ -27,7 +27,7 @@ def _injector(*, cell_type: str | None) -> fi.FaultInjectorHandle:
         seed=0,
         mean_interval_seconds=1e9,
         cell_type=cell_type,
-        compute_cell_fault_forms=fi.create_cell_fault_forms_fn(base_url="http://control", config=config),
+        cell_fault_forms=fi.create_cell_fault_forms(base_url="http://control", config=config),
     )
 
 
