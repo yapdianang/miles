@@ -90,6 +90,7 @@ class FSDPTrainRayActor(TrainRayActor):
         }
 
         if self.args.debug_rollout_only:
+            self._init_once.complete()
             return 0
 
         self.fsdp_cpu_offload = getattr(self.args, "fsdp_cpu_offload", False)
@@ -215,6 +216,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.prof.on_init_end()
 
+        self._init_once.complete()
         return int(getattr(self.args, "start_rollout_id", 0))
 
     def _get_model_cls(self):

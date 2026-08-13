@@ -18,6 +18,9 @@ class BaseWorkerHandle(abc.ABC):
     @abc.abstractmethod
     async def wait_ready(self, *, timeout: float) -> None: ...
 
+    async def claim_driver_epoch(self) -> None:
+        logger.info("%r has no driver-epoch fence, so nothing keeps an older script from driving it", self)
+
     async def wait_dead(self, *, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         while True:

@@ -11,6 +11,7 @@ from tests.fast.charts.utils import REPO_ROOT
 from miles.utils.external_utils.command_utils.base_backend import ExecuteTrainConfig, ExecuteTrainRequest
 from miles.utils.external_utils.command_utils.helm_backend.launcher import command_wrapper, entrypoint
 from miles.utils.external_utils.command_utils.helm_backend.launcher.command_wrapper import Helm
+from miles.utils.external_utils.command_utils.helm_backend.launcher.hot_restart import HotRestartPlan
 from miles.utils.external_utils.command_utils.helm_backend.launcher.manifest_types import Manifest
 from miles.utils.external_utils.command_utils.helm_backend.launcher.observability import cluster_info, log_follower
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc import MooncakeInfo
@@ -190,6 +191,23 @@ class TestDefusingAPendingUninstall:
 
         assert recorded.kubectl == []
         assert recorded.upgraded == [_RELEASE]
+
+    def test_a_hot_restart_deletes_the_job_because_it_replaces_the_wrapper_that_re_arms_it(
+        self, monkeypatch, tmp_path
+    ):
+        """The orchestrator pod really rolls here, so its new wrapper recreates the job this delete removes."""
+        recorded = _Recorded(kubectl=[], upgraded=[])
+        monkeypatch.setattr(
+            entrypoint,
+            "plan_hot_restart",
+            lambda args, **kwargs: HotRestartPlan(
+                restart_at="2026-08-13T00:00:00+00:00", rebuilt_object_keys=frozenset({"StatefulSet/myrun-values"})
+            ),
+        )
+
+        _launch(monkeypatch, tmp_path, recorded, installed=True)
+
+        assert _DELETE_UNINSTALL_JOB in recorded.kubectl
 
     def test_a_delete_the_cluster_refused_stops_the_launch(self, monkeypatch, tmp_path):
         """Installing over a job that is still armed hands the new run's release to the old run's uninstall."""

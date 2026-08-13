@@ -79,6 +79,7 @@ def _stub_driver_environment(monkeypatch):
         "resolve_megatron_config",
         lambda args: SimpleNamespace(leader_model_id="a", model_ids=["a", "b"]),
     )
+    monkeypatch.setattr(multi_policy_driver, "quiesce_trainers", AsyncMock())
     monkeypatch.setattr(multi_policy_driver, "create_trainers", AsyncMock(return_value={}))
     monkeypatch.setattr(multi_policy_driver, "create_rollout_components", AsyncMock())
 

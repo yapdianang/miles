@@ -28,12 +28,19 @@ class ManifestDiff(FrozenStrictBaseModel):
         return "\n".join(lines) or "  (no difference)"
 
 
-def diff_manifests(*, before: Manifest, after: Manifest) -> ManifestDiff:
+def diff_manifests(
+    *, before: Manifest, after: Manifest, rebuilt_object_keys: frozenset[str] = frozenset()
+) -> ManifestDiff:
     old = before.by_key
     new = after.by_key
     shared = sorted(set(old) & set(new))
     return ManifestDiff(
-        changed=[f"{key}: {path}" for key in shared for path in _disallowed_differences(old[key], new[key])],
+        changed=[
+            f"{key}: {path}"
+            for key in shared
+            if key not in rebuilt_object_keys
+            for path in _disallowed_differences(old[key], new[key])
+        ],
         added=sorted(set(new) - set(old)),
         removed=sorted(set(old) - set(new)),
         scaled=[

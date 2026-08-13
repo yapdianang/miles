@@ -44,6 +44,31 @@ DEPLOY_INSTANCE_SEPARATOR = ":"
 _ENGINE_GROUP_NAME_PATTERN = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
 
 
+class HotRestartComponent(Enum):
+    ORCHESTRATION = "orchestration"
+    ROLLOUT_EXECUTOR = "rollout_executor"
+
+
+HOT_RESTART_SEPARATOR = ","
+
+
+def parse_hot_restart(value: str) -> frozenset[HotRestartComponent]:
+    names = [name.strip() for name in value.split(HOT_RESTART_SEPARATOR) if name.strip()]
+    supported = [one.value for one in HotRestartComponent]
+    for name in names:
+        assert name in supported, (
+            f"--hot-restart {value!r} names {name!r}, and a hot restart replaces only {supported}: every other "
+            f"component of a run stays up and is taken over by the new orchestration script"
+        )
+    components = frozenset(HotRestartComponent(name) for name in names)
+    assert not components or components == frozenset(HotRestartComponent), (
+        f"--hot-restart {value!r} names {sorted(one.value for one in components)}, and the two components are "
+        f"replaced together or not at all: the new orchestration script cannot drive the executor its predecessor "
+        f"initialized, and an executor replaced under a live script kills the run it belongs to"
+    )
+    return components
+
+
 @dataclass(frozen=True)
 class DeploySelector:
     component: DeployComponent

@@ -160,7 +160,7 @@ class _RecordingRolloutExecutor:
         self.train_parallel_config = config
         self.train_parallel_config_model_id = trainer_model_id
 
-    async def load(self, rollout_id=None):
+    async def load(self, rollout_id=None, require_state=False):
         self.loaded_rollout_id = rollout_id
 
 
@@ -175,6 +175,12 @@ def _patch_train_controller_handles(monkeypatch, *, restored: dict[str, list[int
             self.inited_with = None
             self.calls = calls
             handles.append(self)
+
+        async def is_initialized(self):
+            return False
+
+        async def claim_driver_epoch(self):
+            calls.append((self.trainer_id, "claim_driver_epoch"))
 
         async def init(self, args):
             calls.append((self.trainer_id, "init"))

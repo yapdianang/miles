@@ -4,7 +4,8 @@ from pathlib import Path
 
 from miles.backends.megatron_utils.megatron_config import MegatronConfig, compute_trainer_args, resolve_megatron_config
 from miles.backends.sglang_utils.sglang_config import resolve_sglang_config
-from miles.ray.placement_group import assert_deployed_trainers_are_this_runs, create_training_model
+from miles.ray.hot_restart import TakeOverDeadline
+from miles.ray.placement_group import QuietTrainers, create_training_model
 from miles.ray.specs.train import compute_trainer_configs
 from miles.utils.arguments import validate_async_off_policy_correction
 from miles.utils.multi_policy.checkpoint_state import MultiPolicyCheckpointState
@@ -21,15 +22,20 @@ class TrainerInfo:
     handle: BaseWorkerHandle
 
 
-async def create_trainers(args, *, rollout_executor: BaseWorkerHandle) -> dict[str, TrainerInfo]:
-    await assert_deployed_trainers_are_this_runs(args)
+async def create_trainers(
+    args, *, rollout_executor: BaseWorkerHandle, quiet_trainers: QuietTrainers
+) -> dict[str, TrainerInfo]:
+    deadline = TakeOverDeadline(gate="the trainer state")
 
     trainers: dict[str, TrainerInfo] = {}
     for trainer_config in compute_trainer_configs(args):
         model_id = trainer_config.model_id
         assert model_id is not None, f"{trainer_config} carries no policy model id"
         created = await create_training_model(
-            compute_trainer_args(args, trainer_config), trainer_id=trainer_config.trainer_id
+            compute_trainer_args(args, trainer_config),
+            trainer_id=trainer_config.trainer_id,
+            quiet_trainers=quiet_trainers,
+            deadline=deadline,
         )
         trainers[model_id] = TrainerInfo(
             model_id=model_id, start_rollout_id=created.start_rollout_id, handle=created.handle

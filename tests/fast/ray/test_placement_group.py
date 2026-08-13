@@ -37,6 +37,8 @@ def fake_components():
     controller_handle.check_weights = AsyncMock()
     controller_handle.offload = AsyncMock()
     controller_handle.init = AsyncMock(return_value=None)
+    controller_handle.is_initialized = AsyncMock(return_value=False)
+    controller_handle.claim_driver_epoch = AsyncMock(return_value=None)
     controller_handle.get_eval_fleet_info = AsyncMock(return_value=None)
 
     async def resolve_router_addrs(args, *, router_providers) -> dict:
@@ -51,7 +53,10 @@ def fake_components():
         args.session_server_instance_ids = ["session-0"]
         events.append("session_servers_ready")
 
+    controller_handle.init = AsyncMock(side_effect=lambda: events.append("inference_controller_init"))
+
     executor_handle = MagicMock(name="rollout_executor")
+    executor_handle.is_initialized = AsyncMock(side_effect=lambda: events.append("executor_free_check") or False)
     executor_handle.init = AsyncMock(side_effect=lambda: events.append("executor_init"))
     executor_handle.get_num_rollout_per_epoch = AsyncMock(return_value=5)
     executor_handle.set_eval_fleet_info = AsyncMock(return_value=None)
@@ -82,9 +87,23 @@ class TestCreateRolloutComponents:
 
         await create_rollout_components(args)
 
-        assert fake_components.events == ["session_servers_ready", "executor_init"]
+        assert fake_components.events == [
+            "session_servers_ready",
+            "executor_free_check",
+            "inference_controller_init",
+            "executor_init",
+        ]
         assert args.session_server_addrs == ["10.0.0.2:5000"]
         assert args.session_server_instance_ids == ["session-0"]
+
+    async def test_the_previous_executor_is_gone_before_the_inference_side_is_reset(self, fake_components):
+        """An executor of the previous script that can still generate would fill the fleet right back up."""
+        args = _make_args(num_rollout=1)
+
+        await create_rollout_components(args)
+
+        events = fake_components.events
+        assert events.index("executor_free_check") < events.index("inference_controller_init")
 
     async def test_returns_two_worker_handles(self, fake_components):
         """Both halves of rollout are independent workers, so the driver only ever holds handles."""

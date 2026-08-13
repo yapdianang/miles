@@ -1,6 +1,11 @@
+from typing import Any
+
 import yaml
 
-from miles.utils.external_utils.command_utils.helm_backend.launcher.manifest_types import Manifest
+from miles.utils.external_utils.command_utils.helm_backend.launcher.manifest_types import (
+    RESTART_AT_ANNOTATION,
+    Manifest,
+)
 
 ORCHESTRATOR = "myrun-miles-run-orchestrator"
 
@@ -9,15 +14,20 @@ def _rendered(*documents: dict) -> str:
     return "---\n" + "---\n".join(yaml.safe_dump(document, sort_keys=True) for document in documents)
 
 
-def _stateful_set(*, name: str = ORCHESTRATOR, command: list[str] | None = None) -> dict:
+def _stateful_set(
+    *, name: str = ORCHESTRATOR, command: list[str] | None = None, annotations: dict[str, str] | None = None
+) -> dict:
     container = {"name": "orchestrator", "image": "miles:dev"}
     if command is not None:
         container["command"] = command
+    template: dict[str, Any] = {"spec": {"containers": [container]}}
+    if annotations is not None:
+        template["metadata"] = {"annotations": annotations}
     return {
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
         "metadata": {"name": name},
-        "spec": {"replicas": 1, "template": {"spec": {"containers": [container]}}},
+        "spec": {"replicas": 1, "template": template},
     }
 
 
@@ -137,3 +147,37 @@ class TestKindsItDoesNotModel:
         )
 
         assert manifest.state_file(container="orchestrator") is None
+
+
+_STAMP = "2026-08-12T09:00:00+00:00"
+
+
+class TestTheRestartStamp:
+    def test_a_manifest_that_was_never_hot_restarted_carries_none(self):
+        """Inventing a stamp would roll the pods of every run on its first ordinary relaunch."""
+        manifest = Manifest.parse(_rendered(_stateful_set(name="orchestrator")))
+
+        assert manifest.restart_at(object_name="orchestrator") is None
+
+    def test_each_object_is_asked_for_its_own_stamp(self):
+        """A pool that never got the stamp must not be rendered with it and turned into a refused diff."""
+        manifest = Manifest.parse(
+            _rendered(
+                _stateful_set(name="orchestrator", annotations={RESTART_AT_ANNOTATION: _STAMP}),
+                _stateful_set(name="rollout-executor"),
+            )
+        )
+
+        assert manifest.restart_at(object_name="orchestrator") == _STAMP
+        assert manifest.restart_at(object_name="rollout-executor") is None
+
+    def test_the_stamp_is_read_off_the_stateful_set_and_not_off_a_service_of_the_same_name(self):
+        """The chart renders the headless Service first, and reading that one always answers None."""
+        manifest = Manifest.parse(
+            _rendered(
+                {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "orchestrator"}},
+                _stateful_set(name="orchestrator", annotations={RESTART_AT_ANNOTATION: _STAMP}),
+            )
+        )
+
+        assert manifest.restart_at(object_name="orchestrator") == _STAMP

@@ -7,9 +7,14 @@ from miles.utils.pydantic_utils import StrictBaseModel
 EXPECTED_BOOT_UUID_HEADER = "x-miles-expected-boot-uuid"
 BOOT_UUID_HEADER = "x-miles-boot-uuid"
 
+DRIVER_EPOCH_HEADER = "x-miles-driver-epoch"
+
 BOOT_UUID_MISMATCH_STATUS = 412
+DRIVER_EPOCH_MISMATCH_STATUS = 421
 
 HEALTH_PATH = "/v1/health"
+IN_FLIGHT_PATH = "/v1/in-flight"
+CLAIM_EPOCH_PATH = "/v1/claim-epoch"
 CALL_STATUS_PATH = "/v1/calls/{call_id}"
 SUBMIT_PATH = "/v1/{method_name}"
 
@@ -35,3 +40,15 @@ class CallStatusResponse(StrictBaseModel):
 
 class HealthResponse(StrictBaseModel):
     status: Literal["ok"] = "ok"
+
+
+class InFlightResponse(StrictBaseModel):
+    call_ids: list[str]
+
+
+class ClaimEpochRequest(StrictBaseModel):
+    epoch: str
+
+
+class ClaimEpochResponse(StrictBaseModel):
+    epoch: str

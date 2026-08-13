@@ -24,6 +24,7 @@ from miles.utils.context_lock import (
     with_lock,
 )
 from miles.utils.ft_utils.api_server.models import CellStatus
+from miles.utils.init_once import InitOnce
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import NodeProbeMixin, SimpleTicker
 from miles.utils.workers.registration.models import RegistrationAck, RegistrationSnapshot
@@ -51,6 +52,7 @@ class InferenceController(NodeProbeMixin):
         registration_provider: RegistrationWorkerProvider | None = None,
     ) -> None:
         self.args = args
+        self._init_once = InitOnce(component="InferenceController")
         self._engine_provider = engine_provider
         self._router_providers = router_providers
         self._registration_provider = registration_provider
@@ -62,28 +64,58 @@ class InferenceController(NodeProbeMixin):
 
     @lock_exempt
     async def init(self) -> None:
-        configure_logger(self.args, source=SimpleProcessIdentity(component="inference_controller"))
+        with self._init_once.guard():
+            configure_logger(self.args, source=SimpleProcessIdentity(component="inference_controller"))
 
-        if self.args.debug_train_only:
-            return
+            if self.args.debug_train_only:
+                return
 
-        await self._engine_provider.init()
-        router_addrs = await resolve_router_addrs(self.args, router_providers=self._router_providers)
-        self.servers = await create_rollout_servers(
-            self.args,
-            context_lock=self.context_lock,
-            engine_provider=self._engine_provider,
-            router_addrs=router_addrs,
-        )
-        if self.args.eval_num_gpus > 0:
-            self._eval_fleet = InferenceControllerEvalFleet(self.args, srv=self.servers["eval"])
+            await self._engine_provider.init()
+            router_addrs = await resolve_router_addrs(self.args, router_providers=self._router_providers)
+            self.servers = await create_rollout_servers(
+                self.args,
+                context_lock=self.context_lock,
+                engine_provider=self._engine_provider,
+                router_addrs=router_addrs,
+            )
+            if self.args.eval_num_gpus > 0:
+                self._eval_fleet = InferenceControllerEvalFleet(self.args, srv=self.servers["eval"])
 
-        self._watcher_disposers.append(await self._engine_provider.watch_cells(self._reconcile))
-        self._ticker = SimpleTicker(self._tick_cells, interval_seconds=TICK_INTERVAL_SECONDS)
+            self._watcher_disposers.append(await self._engine_provider.watch_cells(self._reconcile))
+            self._ticker = SimpleTicker(self._tick_cells, interval_seconds=TICK_INTERVAL_SECONDS)
 
-        dashboard_hooks.register_router(self.args)
+            dashboard_hooks.register_router(self.args)
 
-        await asyncio.gather(*[srv.wait_expected_num_cells() for srv in self.servers.values()])
+            await self.wait_expected_num_cells()
+
+    # -------------------------- take over -----------------------------
+
+    @lock_exempt
+    async def is_initialized(self) -> bool:
+        return self._init_once.is_initialized
+
+    @lock_exempt
+    async def wait_expected_num_cells(self, timeout: float = CELLS_READY_TIMEOUT_SECONDS) -> None:
+        await asyncio.gather(*[srv.wait_expected_num_cells(timeout=timeout) for srv in self.servers.values()])
+
+    @lock_exempt
+    async def reset_broadcast_lock(self) -> bool:
+        """Free the lock a `start_update_weights` whose `end_update_weights` never came is still holding."""
+        if not self.context_lock.detached:
+            return False
+
+        self.context_lock.reattach()
+        try:
+            await self._health_monitoring_resume()
+        finally:
+            self.context_lock.release()
+        return True
+
+    @with_lock
+    async def abort_all(self) -> list[str]:
+        """Drop every in-flight generation, and answer the cells that refused, so a take-over knows what it left."""
+        per_server = await asyncio.gather(*[srv.abort_all() for srv in self.servers.values()])
+        return [cell_id for refused in per_server for cell_id in refused]
 
     # -------------------------- registration -----------------------------
 

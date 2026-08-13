@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import Any, TypeVar
 
 import httpx
@@ -10,6 +11,8 @@ from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.workers.rpc.common.protocol import (
     BOOT_UUID_HEADER,
     BOOT_UUID_MISMATCH_STATUS,
+    DRIVER_EPOCH_HEADER,
+    DRIVER_EPOCH_MISMATCH_STATUS,
     EXPECTED_BOOT_UUID_HEADER,
 )
 
@@ -24,6 +27,10 @@ _ABORT_SLACK_SECONDS = 1.0
 
 
 class ServerRestartedError(Exception):
+    pass
+
+
+class StaleDriverError(Exception):
     pass
 
 
@@ -49,10 +56,18 @@ WORKER_IS_GONE_ERRORS = (httpx.ConnectError,)
 
 
 class RpcTransport:
-    def __init__(self, *, server_url: str, http_client: httpx.AsyncClient | None, boot_uuid_pin: BootUuidPin) -> None:
+    def __init__(
+        self,
+        *,
+        server_url: str,
+        http_client: httpx.AsyncClient | None,
+        boot_uuid_pin: BootUuidPin,
+        driver_epoch_pin: DriverEpochPin,
+    ) -> None:
         self._server_url = server_url.rstrip("/")
         self._http_client_override = http_client
         self._boot_uuid_pin = boot_uuid_pin
+        self._driver_epoch_pin = driver_epoch_pin
 
     async def request(
         self, method: str, path: str, *, seconds: float, response_model: type[_ResponseT], **kwargs: Any
@@ -60,6 +75,8 @@ class RpcTransport:
         headers = dict(kwargs.pop("headers", {}))
         if self._boot_uuid_pin.expected is not None:
             headers[EXPECTED_BOOT_UUID_HEADER] = self._boot_uuid_pin.expected
+        if (epoch := self._driver_epoch_pin.claimed) is not None:
+            headers[DRIVER_EPOCH_HEADER] = epoch
         response = await asyncio.wait_for(
             self._client.request(
                 method,
@@ -74,6 +91,8 @@ class RpcTransport:
 
         if response.status_code == BOOT_UUID_MISMATCH_STATUS:
             raise ServerRestartedError(f"rpc server restarted: {response.text}")
+        if response.status_code == DRIVER_EPOCH_MISMATCH_STATUS:
+            raise StaleDriverError(f"a later orchestration script owns this worker: {response.text}")
         if response.status_code >= _LOWEST_SERVER_ERROR_STATUS:
             raise RetryableResponseError(f"{method} {path} returned {response.status_code}")
         if response.status_code != 200:
@@ -92,6 +111,19 @@ class RpcTransport:
         return GeneralHttpClientProvider.client()
 
 
+class DriverEpochPin:
+    def __init__(self) -> None:
+        self._value: str | None = None
+
+    @property
+    def claimed(self) -> str | None:
+        return self._value
+
+    def claim(self) -> str:
+        self._value = uuid.uuid4().hex
+        return self._value
+
+
 class BootUuidPin:
     def __init__(self, *, required: bool, worker_cls_name: str) -> None:
         self._required = required
@@ -104,6 +136,9 @@ class BootUuidPin:
 
     def needs_handshake(self) -> bool:
         return self._required and self._value is None
+
+    def rebaseline(self) -> None:
+        self._value = None
 
     def verify(self, response: httpx.Response) -> None:
         if not self._required:

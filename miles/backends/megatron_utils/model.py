@@ -938,6 +938,30 @@ def initialize_model_and_optimizer(
     model[0].role = role
     clear_memory()
 
+    iteration = load_model_state(
+        args,
+        model=model,
+        optimizer=optimizer,
+        opt_param_scheduler=opt_param_scheduler,
+        role=role,
+        checkpointing_context=checkpointing_context,
+    )
+    return model, optimizer, opt_param_scheduler, iteration
+
+
+def load_model_state(
+    args: Namespace,
+    *,
+    model: list[DDP],
+    optimizer: MegatronOptimizer | None,
+    opt_param_scheduler: OptimizerParamScheduler | None,
+    role: str,
+    checkpointing_context=None,
+) -> int:
+    """Load weights, optimizer and scheduler state into an already-built model, in place."""
+    if opt_param_scheduler is not None:
+        opt_param_scheduler.num_steps = 0
+
     if is_multi_lora_enabled(args):
         # Hide adapter params so the bridge's conversion-task walk doesn't see them
         # while loading the base checkpoint.
@@ -989,4 +1013,4 @@ def initialize_model_and_optimizer(
     if opt_param_scheduler is not None and not (args.use_checkpoint_opt_param_scheduler and iteration > 0):
         opt_param_scheduler.step(increment=iteration * args.global_batch_size)
 
-    return model, optimizer, opt_param_scheduler, iteration
+    return iteration

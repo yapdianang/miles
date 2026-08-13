@@ -7,7 +7,7 @@ from typing import Any
 import yaml
 from sglang_router.launch_router import RouterArgs
 
-from miles.backends.megatron_utils.megatron_config import resolve_args_checkpoint_load, resolve_megatron_config
+from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
 from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.backends.sglang_utils.sglang_config import resolve_sglang_config
@@ -40,6 +40,17 @@ from miles.utils.workers.worker_provider.static import parse_host_and_port
 from miles.utils.workers.worker_spec import RPC_PORT_NAME
 
 logger = logging.getLogger(__name__)
+
+CHECKPOINT_SOURCE_DEFAULTS: dict[str, Any] = {
+    "load": None,
+    "save": None,
+    "ckpt_step": None,
+    "finetune": False,
+    "no_load_optim": False,
+    "no_load_rng": False,
+    "critic_load": None,
+    "critic_save": None,
+}
 
 
 def resolve_rollout_function_paths(args) -> tuple[str, str]:
@@ -3357,8 +3368,10 @@ def miles_validate_args(args):
         if args.opd_teacher_urls:
             raise ValueError("--opd-teacher-urls is set but --use-opd is not enabled. Please add --use-opd flag.")
 
+    # TODO: During loading, we need to set the start_rollout_id here.
+    capture_requested_checkpoint_source(args)
     if not resolve_megatron_config(args).is_multi_policy:
-        resolve_args_checkpoint_load(args)
+        resolve_checkpoint_source(args)
 
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
@@ -3523,13 +3536,8 @@ def miles_validate_args(args):
         )
         args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
         args.critic_num_nodes = args.actor_num_nodes
-    if args.critic_load is None:
-        args.critic_load = args.load
     if args.critic_lr is None:
         args.critic_lr = args.lr
-    if args.critic_save is None and args.save is not None:
-        # a sibling dir, not args.save itself: sharing a dir would clobber the actor's iteration tracker
-        args.critic_save = args.save.rstrip("/") + "_critic"
 
     if args.offload:
         args.offload_train = True
@@ -3918,6 +3926,66 @@ def validate_skip_actor_forward_only(args) -> None:
             f"{option} requires exactly one optimizer step for {samples_per_rollout} rollout samples; "
             f"got --global-batch-size {args.global_batch_size}"
         )
+
+
+def capture_requested_checkpoint_source(args) -> None:
+    args.requested_checkpoint_source = {
+        name: getattr(args, name, default) for name, default in CHECKPOINT_SOURCE_DEFAULTS.items()
+    }
+
+
+def resolve_checkpoint_source(args) -> None:
+    """Re-derive where every role loads from, against a filesystem the run keeps writing checkpoints into."""
+    for name, value in args.requested_checkpoint_source.items():
+        setattr(args, name, value)
+
+    if args.critic_save is None and args.save is not None:
+        # a sibling dir, not args.save itself: sharing a dir would clobber the actor's iteration tracker
+        args.critic_save = args.save.rstrip("/") + "_critic"
+
+    args.load = _newest_checkpoint_source(load_dir=args.load, save_dir=args.save)
+
+    if args.megatron_to_hf_mode == "bridge":
+        # Fresh runs pass a not-yet-created `--load` dir; fall back to the reference
+        # weights (loaded via the HF bridge) instead of asserting in load_checkpoint.
+        # Mirrors the non-bridge branch below.
+        if not _holds_a_checkpoint(args.load):
+            args.load = args.ref_load or args.hf_checkpoint
+        args.start_rollout_id = 0
+    elif not _holds_a_checkpoint(args.load):
+        args.no_load_optim = True
+        args.no_load_rng = True
+        args.finetune = True
+        args.load = args.ref_load
+        if args.ref_ckpt_step is not None:
+            args.ckpt_step = args.ref_ckpt_step
+        args.start_rollout_id = 0
+
+    args.critic_load = _newest_checkpoint_source(
+        load_dir=args.critic_load if args.critic_load is not None else args.load, save_dir=args.critic_save
+    )
+
+
+def _newest_checkpoint_source(*, load_dir: str | None, save_dir: str | None) -> str | None:
+    if (saved := _checkpoint_iteration(save_dir)) is None:
+        return load_dir
+    loaded = _checkpoint_iteration(load_dir)
+    return save_dir if loaded is None or saved > loaded else load_dir
+
+
+def _holds_a_checkpoint(load_dir: str | None) -> bool:
+    return _checkpoint_iteration(load_dir) is not None
+
+
+def _checkpoint_iteration(directory: str | None) -> int | None:
+    if directory is None:
+        return None
+    tracker = os.path.join(directory, "latest_checkpointed_iteration.txt")
+    if not os.path.exists(tracker):
+        return None
+    with open(tracker) as f:
+        text = f.read().strip()
+    return int(text) if text.isdigit() else 0
 
 
 def validate_async_off_policy_correction(args) -> None:

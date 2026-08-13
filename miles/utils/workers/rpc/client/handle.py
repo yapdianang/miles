@@ -13,6 +13,7 @@ from miles.utils.workers.rpc.client.misc import (
     RETRYABLE_ERRORS,
     WORKER_IS_GONE_ERRORS,
     BootUuidPin,
+    DriverEpochPin,
     RpcTransport,
     ServerRestartedError,
 )
@@ -21,15 +22,27 @@ from miles.utils.workers.rpc.common.metadata import (
     canonicalize_method_arguments,
     collect_rpc_method_specs,
 )
-from miles.utils.workers.rpc.common.protocol import HEALTH_PATH, HealthResponse
+from miles.utils.workers.rpc.common.protocol import (
+    CLAIM_EPOCH_PATH,
+    HEALTH_PATH,
+    IN_FLIGHT_PATH,
+    ClaimEpochResponse,
+    HealthResponse,
+    InFlightResponse,
+)
 from miles.utils.workers.worker_handle import BaseWorkerHandle, WorkerUnreachableError
 
 DEFAULT_CALL_TIMEOUT_SECONDS = 3600.0
 DEFAULT_READY_TIMEOUT_SECONDS = 600.0
 
 _HEALTH_TIMEOUT_SECONDS = 5.0
+_IDLE_POLL_MAX_DELAY_SECONDS = 10.0
 
 logger = logging.getLogger(__name__)
+
+
+class _StillBusyError(Exception):
+    pass
 
 
 class RpcWorkerHandle(BaseWorkerHandle):
@@ -52,8 +65,12 @@ class RpcWorkerHandle(BaseWorkerHandle):
         self._call_timeout_seconds = call_timeout_seconds
         self._ready_timeout_seconds = ready_timeout_seconds
         self._boot_uuid_pin = BootUuidPin(required=require_stable_boot_uuid, worker_cls_name=worker_cls.__name__)
+        self._driver_epoch_pin = DriverEpochPin()
         self._transport = RpcTransport(
-            server_url=server_url, http_client=http_client, boot_uuid_pin=self._boot_uuid_pin
+            server_url=server_url,
+            http_client=http_client,
+            boot_uuid_pin=self._boot_uuid_pin,
+            driver_epoch_pin=self._driver_epoch_pin,
         )
 
     def __repr__(self) -> str:
@@ -75,6 +92,7 @@ class RpcWorkerHandle(BaseWorkerHandle):
 
     async def wait_ready(self, *, timeout: float) -> None:
         async def attempt(remaining: float) -> None:
+            self._boot_uuid_pin.rebaseline()
             await self._transport.request(
                 "GET", HEALTH_PATH, seconds=min(_HEALTH_TIMEOUT_SECONDS, remaining), response_model=HealthResponse
             )
@@ -91,6 +109,36 @@ class RpcWorkerHandle(BaseWorkerHandle):
             raise WorkerUnreachableError(
                 f"{self._worker_cls_name} rpc server not ready within {timeout}s: {e!r}"
             ) from e
+
+    async def claim_driver_epoch(self) -> None:
+        epoch = self._driver_epoch_pin.claim()
+        await self._transport.request(
+            "POST",
+            CLAIM_EPOCH_PATH,
+            seconds=_HEALTH_TIMEOUT_SECONDS,
+            response_model=ClaimEpochResponse,
+            json={"epoch": epoch},
+        )
+        logger.info(f"This orchestration script now drives {self._worker_cls_name} under epoch {epoch}")
+
+    async def wait_idle(self, *, timeout: float) -> None:
+        async def attempt(_remaining: float) -> None:
+            response = await self._transport.request(
+                "GET", IN_FLIGHT_PATH, seconds=_HEALTH_TIMEOUT_SECONDS, response_model=InFlightResponse
+            )
+            if response.call_ids:
+                raise _StillBusyError(f"{self._worker_cls_name} is still running {response.call_ids}")
+
+        try:
+            await retry_until_deadline(
+                attempt,
+                total_seconds=timeout,
+                retry_on=(_StillBusyError, *RETRYABLE_ERRORS),
+                initial_delay=RETRY_INITIAL_DELAY_SECONDS,
+                max_delay=_IDLE_POLL_MAX_DELAY_SECONDS,
+            )
+        except (_StillBusyError, *RETRYABLE_ERRORS) as e:
+            raise TimeoutError(f"{self._worker_cls_name} was still busy after {timeout}s: {e!r}") from e
 
     async def probe_is_dead(self) -> bool:
         try:

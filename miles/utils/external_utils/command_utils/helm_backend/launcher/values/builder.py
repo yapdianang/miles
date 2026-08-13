@@ -55,7 +55,7 @@ def _build_run_values(specs: list[BaseWorkerSpec], plan: LaunchPlan) -> RunValue
         state_file=plan.state_file or None,
         launch_record=plan.launch_record,
         object_names=_object_names(plan.release),
-        orchestrator=OrchestratorSection(command=plan.orchestrator_command),
+        orchestrator=OrchestratorSection(command=plan.orchestrator_command, restart_at=plan.restart_at or None),
         auto_uninstall=None if plan.orchestrator_command else AutoUninstallSection(enabled=False),
         static_workers=entries[STATIC_WORKERS_SECTION],
         inference_engines=entries[INFERENCE_ENGINES_SECTION],

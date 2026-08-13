@@ -387,3 +387,32 @@ class TestDefaultTtls:
         now[0] = 10.0 + FINISHED_TTL_SECONDS + 0.01
         store.begin(call_id="another")
         assert not store.contains("c1")
+
+
+class TestInFlightCallIds:
+    def test_a_fresh_store_is_idle(self):
+        """A take-over reads this to decide the previous orchestration script is really gone."""
+        assert _make_store().in_flight_call_ids() == []
+
+    def test_a_submitted_call_is_in_flight(self):
+        """A call still running is exactly what the take-over waits out before it reloads anything."""
+        store = _make_store()
+        store.begin(call_id="c1")
+
+        assert store.in_flight_call_ids() == ["c1"]
+
+    def test_a_finished_call_is_no_longer_in_flight(self):
+        """Waiting on a call whose result is already recorded would never let a hot restart proceed."""
+        store = _make_store()
+        store.begin(call_id="c1")
+        store.finish(call_id="c1", outcome=CallStatusResponse(status="success"))
+
+        assert store.in_flight_call_ids() == []
+
+    def test_the_call_ids_are_sorted(self):
+        """They are logged and compared, so an arbitrary dict order would make the wait look flaky."""
+        store = _make_store()
+        for call_id in ("c2", "c1"):
+            store.begin(call_id=call_id)
+
+        assert store.in_flight_call_ids() == ["c1", "c2"]

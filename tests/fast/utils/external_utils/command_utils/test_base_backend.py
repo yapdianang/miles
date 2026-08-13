@@ -77,3 +77,20 @@ class TestAScriptReadsItsLauncherConfigFromTheEnvironment:
         bound = inspect.signature(train).parameters[field].annotation.__metadata__[0].envvar
 
         assert bound == f"{SCRIPT_ENV_VAR_PREFIX}{field.upper()}"
+
+
+class TestAHotRestartIsRefusedOutsideKubernetes:
+    def test_the_ray_backend_refuses_a_hot_restart_before_it_cleans_anything_up(self):
+        """Its first act is to pkill every sglang, miles and ray process, i.e. exactly what the flag keeps alive."""
+        backend = ExecuteTrainConfig(
+            cluster_backend=ClusterBackend.RAY, hot_restart="orchestration,rollout_executor"
+        ).create_backend()
+
+        with pytest.raises(AssertionError, match="has no way to replace two pods"):
+            backend.execute_train(train_args="--train-backend fsdp", num_gpus_per_node=8, megatron_model_type=None)
+
+    def test_an_ordinary_ray_run_is_untouched_by_the_refusal(self):
+        """Every ray launch passes this check, so it must not fire without the flag."""
+        config = ExecuteTrainConfig(cluster_backend=ClusterBackend.RAY)
+
+        assert config.hot_restart_components == frozenset()

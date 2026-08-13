@@ -381,6 +381,10 @@ class SGLangApiClient:
         response.raise_for_status()
         return response
 
+    async def abort_all_requests(self):
+        """Abort every request the engine is generating right now."""
+        return await self._make_request("abort_request", {"abort_all": True})
+
     async def begin_weight_update(self, selector: str = "all"):
         """Open a weight-update session on the engine (restores packed weights for loading)."""
         return await self._make_request("begin_weight_update", {"selector": selector})

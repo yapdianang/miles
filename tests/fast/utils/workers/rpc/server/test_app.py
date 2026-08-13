@@ -11,7 +11,13 @@ from fastapi.responses import JSONResponse
 
 from miles.utils.pydantic_utils import StrictBaseModel
 from miles.utils.workers.rpc.common.metadata import collect_rpc_method_specs, rpc
-from miles.utils.workers.rpc.common.protocol import BOOT_UUID_HEADER, EXPECTED_BOOT_UUID_HEADER, CallStatusResponse
+from miles.utils.workers.rpc.common.protocol import (
+    BOOT_UUID_HEADER,
+    CLAIM_EPOCH_PATH,
+    DRIVER_EPOCH_HEADER,
+    EXPECTED_BOOT_UUID_HEADER,
+    CallStatusResponse,
+)
 from miles.utils.workers.rpc.server.app import create_rpc_app
 from miles.utils.workers.rpc.server.executor import RpcCallExecutor
 
@@ -191,6 +197,61 @@ class TestProtocolErrors:
         async with _client(_Worker()) as client:
             response = await client.post("/v1/demo_sync", json={"call_id": "c1", "query": {"a": 1, "b": 2}, "junk": 1})
             assert response.status_code == 400
+
+    async def test_a_worker_nobody_claimed_accepts_calls_without_an_epoch(self) -> None:
+        """A cold run never claims anything before its first call, so an unclaimed worker has to answer."""
+        async with _client(_Worker()) as client:
+            body = await _call(client, "demo_sync", {"a": 1, "b": 2})
+            assert body["status"] == "success"
+
+    async def test_a_call_carrying_the_claimed_epoch_is_accepted(self) -> None:
+        """The script that claimed the worker is the one allowed to drive it."""
+        async with _client(_Worker()) as client:
+            claim = await client.post(CLAIM_EPOCH_PATH, json={"epoch": "epoch-a"})
+            assert claim.status_code == 200
+
+            response = await client.post(
+                "/v1/demo_sync",
+                headers={DRIVER_EPOCH_HEADER: "epoch-a"},
+                json={"call_id": "c1", "query": {"a": 1, "b": 2}},
+            )
+            assert response.status_code == 200
+
+    async def test_a_call_carrying_a_superseded_epoch_is_refused_before_it_runs(self) -> None:
+        """The train POST an outgoing script already sent must not land after its successor took over."""
+        worker = _Worker()
+        async with _client(worker) as client:
+            await client.post(CLAIM_EPOCH_PATH, json={"epoch": "epoch-a"})
+            await client.post(CLAIM_EPOCH_PATH, json={"epoch": "epoch-b"})
+
+            response = await client.post(
+                "/v1/demo_sync",
+                headers={DRIVER_EPOCH_HEADER: "epoch-a"},
+                json={"call_id": "c1", "query": {"a": 1, "b": 2}},
+            )
+
+            assert response.status_code == 421
+            assert worker.calls == 0
+
+    async def test_a_call_carrying_no_epoch_at_all_is_refused_once_somebody_claimed_the_worker(self) -> None:
+        """The previous script's handle carries no epoch, and it is exactly the one that must be fenced out."""
+        worker = _Worker()
+        async with _client(worker) as client:
+            await client.post(CLAIM_EPOCH_PATH, json={"epoch": "epoch-a"})
+
+            response = await client.post("/v1/demo_sync", json={"call_id": "c1", "query": {"a": 1, "b": 2}})
+
+            assert response.status_code == 421
+            assert worker.calls == 0
+
+    async def test_a_stale_driver_may_still_claim_the_worker_back(self) -> None:
+        """Claiming is how a take-over announces itself, so it can never be fenced out by the epoch it replaces."""
+        async with _client(_Worker()) as client:
+            await client.post(CLAIM_EPOCH_PATH, json={"epoch": "epoch-a"})
+
+            claim = await client.post(CLAIM_EPOCH_PATH, json={"epoch": "epoch-b"})
+
+            assert claim.status_code == 200 and claim.json() == {"epoch": "epoch-b"}
 
     async def test_boot_uuid_mismatch_header_returns_412(self) -> None:
         """A stale boot UUID request header is refused before scheduling."""

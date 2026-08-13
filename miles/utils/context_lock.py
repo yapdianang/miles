@@ -47,6 +47,10 @@ class ContextLock:
         return self._lock.locked()
 
     @property
+    def detached(self) -> bool:
+        return self._detached
+
+    @property
     def held_in_current_context(self) -> bool:
         if self._active_generation is None:
             return False

@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 from miles.ray import train_actor
 from miles.ray.train_actor import TrainRayActor
+from miles.utils.init_once import InitOnce
+
 
 class TestConstructorSignature:
     def test_positional_constructor_arguments_are_rejected(self):
@@ -72,7 +74,17 @@ class TestInitRunsExactlyOnce:
     def test_a_second_init_is_refused(self):
         """A worker that already initialized is a stale process; reusing it must fail loudly, not train on."""
         actor = TrainRayActor.__new__(TrainRayActor)
-        actor._init_called = True
+        actor._init_once = InitOnce(component="TrainRayActor")
+        with actor._init_once.guard():
+            pass
 
-        with pytest.raises(AssertionError, match="stale worker"):
+        with pytest.raises(AssertionError, match="TrainRayActor is complete"):
             actor._init_common(None, "actor")
+
+    def test_a_worker_whose_init_failed_is_not_reported_as_initialized(self):
+        """load_state reloads state a finished init built, so a half-built worker must refuse it."""
+        actor = TrainRayActor.__new__(TrainRayActor)
+        actor._init_once = InitOnce(component="TrainRayActor")
+        actor._init_once.enter()
+
+        assert actor.is_initialized() is False

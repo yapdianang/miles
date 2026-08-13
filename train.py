@@ -8,6 +8,7 @@ from miles.ray.placement_group import (
     create_rollout_components,
     create_training_models,
     maybe_start_api_server,
+    quiesce_trainers,
     update_weights,
 )
 from miles.ray.wiring import launch_worker_manager
@@ -34,10 +35,11 @@ async def train(args):
 
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
+    quiet_trainers = await quiesce_trainers(args)
     inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(args)
 
     # create the actor and critic models
-    actor_model, critic_model = await create_training_models(args, rollout_executor)
+    actor_model, critic_model = await create_training_models(args, rollout_executor, quiet_trainers=quiet_trainers)
 
     maybe_start_api_server(args, actor_model=actor_model, inference_controller=inference_controller)
 

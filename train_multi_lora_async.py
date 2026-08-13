@@ -5,7 +5,12 @@ import logging
 from pathlib import Path
 
 from miles.ray.multi_lora.controller import get_multi_lora_controller
-from miles.ray.placement_group import create_rollout_components, create_training_models, update_weights
+from miles.ray.placement_group import (
+    create_rollout_components,
+    create_training_models,
+    quiesce_trainers,
+    update_weights,
+)
 from miles.ray.wiring import launch_worker_manager
 from miles.utils import object_store
 from miles.utils.adapter_config import parse_adapter_run_yaml
@@ -30,6 +35,7 @@ async def main(args):
     init_tracking(args)
     _worker_manager = launch_worker_manager(args)
     object_store.init_instance(args, contribute_segment=False)
+    quiet_trainers = await quiesce_trainers(args)
     inference_controller, rollout_executor, _num_rollout_per_epoch = await create_rollout_components(args)
 
     # Create a controller nclusing MultiLoRAController and MultiLoRAHTTPServer to manage lora
@@ -39,7 +45,7 @@ async def main(args):
     api_port = await controller.api_port()
     logger.info(f"Multi-LoRA control API listening on http://{host}:{api_port} (head node)")
 
-    actor_model, _ = await create_training_models(args, rollout_executor)
+    actor_model, _ = await create_training_models(args, rollout_executor, quiet_trainers=quiet_trainers)
 
     # CLI-registered adapters are loaded and pushed by the loop's first
     # reconcile + update_weights.

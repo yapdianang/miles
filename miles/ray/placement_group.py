@@ -8,6 +8,13 @@ from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from miles.backends.megatron_utils.megatron_config import compute_trainer_args
+from miles.ray.hot_restart import (
+    TakeOverDeadline,
+    init_or_load_trainer,
+    init_or_reset_inference_controller,
+    quiesce_and_claim_trainer,
+    wait_until_rollout_executor_is_free,
+)
 from miles.ray.rollout.router_manager import resolve_router_addrs, wait_session_server_ready
 from miles.ray.specs.inference import (
     SESSION_SERVER_POOL_ID,
@@ -160,10 +167,43 @@ class TrainerInfo(NamedTuple):
     start_rollout_id: int
 
 
+class QuietTrainers(NamedTuple):
+    """Gate 1's result: every trainer this run drives, quiet and claimed, but not yet rolled back."""
+
+    handles: dict[str, BaseWorkerHandle]
+    resumed: bool
+
+
 # TODO: move (when reorganizing files)
-async def create_training_model(args, *, trainer_id: str) -> TrainerInfo:
-    handle = create_trainer_controller_handle(args, capability=get_backend_capability(args), trainer_id=trainer_id)
-    restored_rollout_ids = await handle.init(args)
+async def quiesce_trainers(args) -> QuietTrainers:
+    """Gate 1: reach every trainer, let it finish what a previous orchestration script left running, own it."""
+    await assert_deployed_trainers_are_this_runs(args)
+    capability = get_backend_capability(args)
+    deadline = TakeOverDeadline(gate="the trainers")
+
+    handles: dict[str, BaseWorkerHandle] = {}
+    resumed: list[bool] = []
+    for config in compute_trainer_configs(args):
+        handle = create_trainer_controller_handle(args, capability=capability, trainer_id=config.trainer_id)
+        resumed.append(await quiesce_and_claim_trainer(handle, trainer_id=config.trainer_id, deadline=deadline))
+        handles[config.trainer_id] = handle
+
+    assert len(set(resumed)) == 1, (
+        f"the trainers of this run disagree about whether a previous orchestration script already initialized them "
+        f"({resumed}); a take-over drives all of them or none of them, so this run stops instead of mixing a "
+        f"resumed trainer with a freshly built one"
+    )
+    return QuietTrainers(handles=handles, resumed=resumed[0])
+
+
+# TODO: move (when reorganizing files)
+async def create_training_model(
+    args, *, trainer_id: str, quiet_trainers: QuietTrainers, deadline: TakeOverDeadline
+) -> TrainerInfo:
+    handle = quiet_trainers.handles[trainer_id]
+    restored_rollout_ids = await init_or_load_trainer(
+        handle, args, trainer_id=trainer_id, resumed=quiet_trainers.resumed, deadline=deadline
+    )
     assert len(set(restored_rollout_ids)) == 1, f"trainer {trainer_id!r} restored {restored_rollout_ids}"
     start_rollout_id = x if (x := args.start_rollout_id) is not None else restored_rollout_ids[0]
     return TrainerInfo(handle=handle, start_rollout_id=start_rollout_id)
@@ -171,14 +211,18 @@ async def create_training_model(args, *, trainer_id: str) -> TrainerInfo:
 
 # TODO: move (when reorganizing files)
 async def create_training_models(
-    args, rollout_executor: BaseWorkerHandle
+    args, rollout_executor: BaseWorkerHandle, *, quiet_trainers: QuietTrainers | None = None
 ) -> tuple[BaseWorkerHandle, BaseWorkerHandle | None]:
-    await assert_deployed_trainers_are_this_runs(args)
+    quiet_trainers = quiet_trainers if quiet_trainers is not None else await quiesce_trainers(args)
+    deadline = TakeOverDeadline(gate="the trainer state")
 
     trainer_configs = compute_trainer_configs(args)
     [actor_config] = [config for config in trainer_configs if config.role == ACTOR_ROLE]
     actor_info = await create_training_model(
-        compute_trainer_args(args, actor_config), trainer_id=actor_config.trainer_id
+        compute_trainer_args(args, actor_config),
+        trainer_id=actor_config.trainer_id,
+        quiet_trainers=quiet_trainers,
+        deadline=deadline,
     )
 
     critic_configs = [config for config in trainer_configs if config.role == CRITIC_ROLE]
@@ -186,7 +230,10 @@ async def create_training_models(
     if args.use_critic:
         [critic_config] = critic_configs
         critic_info = await create_training_model(
-            compute_trainer_args(args, critic_config), trainer_id=critic_config.trainer_id
+            compute_trainer_args(args, critic_config),
+            trainer_id=critic_config.trainer_id,
+            quiet_trainers=quiet_trainers,
+            deadline=deadline,
         )
         assert critic_info.start_rollout_id == actor_info.start_rollout_id, (
             f"the actor restored to rollout {actor_info.start_rollout_id} but its critic to "
@@ -201,7 +248,7 @@ async def create_training_models(
         args.start_rollout_id = actor_info.start_rollout_id
 
     await rollout_executor.set_train_parallel_config(await actor_info.handle.get_train_parallel_config())
-    await rollout_executor.load(args.start_rollout_id - 1)
+    await rollout_executor.load(args.start_rollout_id - 1, require_state=quiet_trainers.resumed)
 
     return actor_info.handle, critic_info.handle if critic_info is not None else None
 
@@ -268,10 +315,12 @@ async def create_rollout_components(args) -> RolloutComponents:
         )
         await wait_session_server_ready(args, provider=session_server_provider)
 
-    inference_controller = create_inference_controller_handle(capability=capability)
-    await inference_controller.init()
-
     rollout_executor = create_rollout_executor_handle(capability=capability)
+    await wait_until_rollout_executor_is_free(rollout_executor)
+
+    inference_controller = create_inference_controller_handle(capability=capability)
+    await init_or_reset_inference_controller(inference_controller)
+
     await rollout_executor.init()
 
     # calculate num_rollout from num_epoch

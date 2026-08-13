@@ -55,6 +55,8 @@ class LaunchPlan(FrozenStrictBaseModel):
     colocate: bool = False
     mooncake_plan: MooncakePlan | None = None
     prepare_cmd: dict[str, str] = {}
+    restart_at: str = ""
+    restart_pools: frozenset[str] = frozenset()
 
 
 class MooncakeInfo:

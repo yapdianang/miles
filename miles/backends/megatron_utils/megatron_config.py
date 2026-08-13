@@ -1,7 +1,6 @@
 import argparse
 import copy
 import logging
-import os
 import re
 from argparse import Namespace
 from pathlib import Path
@@ -215,10 +214,17 @@ def compute_trainer_args(args, trainer: MegatronTrainerConfig) -> Namespace:
     _apply_critical_derived_overrides(ans, base=args, trainer=trainer)
 
     if megatron_config.is_multi_policy:
-        ans.save = _compute_trainer_checkpoint_dir(base_dir=args.save, trainer_id=trainer.trainer_id)
-        ans.load = _compute_trainer_checkpoint_dir(base_dir=args.load, trainer_id=trainer.trainer_id)
-        resolve_args_checkpoint_load(ans)
+        from miles.utils.arguments import resolve_checkpoint_source
 
+        trainer_id = trainer.trainer_id
+        requested = dict(ans.requested_checkpoint_source)
+        requested["load"] = _compute_trainer_checkpoint_dir(base_dir=requested["load"], trainer_id=trainer_id)
+        requested["save"] = _compute_trainer_checkpoint_dir(base_dir=requested["save"], trainer_id=trainer_id)
+        requested["critic_save"] = _compute_trainer_checkpoint_dir(
+            base_dir=requested["critic_save"], trainer_id=trainer_id
+        )
+        ans.requested_checkpoint_source = requested
+        resolve_checkpoint_source(ans)
     return ans
 
 
@@ -235,34 +241,6 @@ def _compute_trainer_checkpoint_dir(*, base_dir: str | None, trainer_id: str) ->
     if base_dir is None:
         return None
     return str(Path(base_dir) / TRAINER_CHECKPOINT_DIRNAME / trainer_id)
-
-
-def resolve_args_checkpoint_load(args) -> None:
-    # TODO: During loading, we need to set the start_rollout_id here.
-    if args.megatron_to_hf_mode == "bridge":
-        # Fresh runs pass a not-yet-created `--load` dir; fall back to the reference
-        # weights (loaded via the HF bridge) instead of asserting in load_checkpoint.
-        # Mirrors the non-bridge branch below.
-        if not _has_megatron_checkpoint(args.load):
-            args.load = args.ref_load or args.hf_checkpoint
-        args.start_rollout_id = 0
-    else:
-        if not _has_megatron_checkpoint(args.load):
-            args.no_load_optim = True
-            args.no_load_rng = True
-            args.finetune = True
-            args.load = args.ref_load
-            if args.ref_ckpt_step is not None:
-                args.ckpt_step = args.ref_ckpt_step
-            args.start_rollout_id = 0
-
-
-def _has_megatron_checkpoint(load_dir: str | None) -> bool:
-    return (
-        load_dir is not None
-        and os.path.exists(load_dir)
-        and os.path.exists(os.path.join(load_dir, "latest_checkpointed_iteration.txt"))
-    )
 
 
 # ---------------------------- validation -----------------------------

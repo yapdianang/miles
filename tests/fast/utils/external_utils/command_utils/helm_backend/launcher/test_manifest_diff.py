@@ -186,3 +186,44 @@ class TestManifestRefusals:
 
         assert not diff.is_allowed
         assert diff.scaled == ["LeaderWorkerSet/myrun-miles-run-engine: replicas 2 -> 6"]
+
+
+_ORCHESTRATOR_KEY = "StatefulSet/myrun-miles-run-orchestrator"
+
+
+class TestTheObjectsAHotRestartRebuilds:
+    def test_a_rebuilt_object_may_change_in_any_field(self):
+        """Changing the orchestration script's arguments is the whole point of a hot restart."""
+        diff = manifest_diff.diff_manifests(
+            before=_manifest(_objects()),
+            after=_manifest_after(
+                lambda objects: objects[2]["spec"]["template"]["spec"]["containers"][0].update(image="miles:other")
+            ),
+            rebuilt_object_keys=frozenset({_ORCHESTRATOR_KEY}),
+        )
+
+        assert diff.is_allowed
+
+    def test_every_other_object_is_still_refused(self):
+        """ "I thought I was hot restarting but I changed the trainer" has to stop the launch."""
+        diff = manifest_diff.diff_manifests(
+            before=_manifest(_objects()),
+            after=_manifest_after(lambda objects: _worker_container(objects).update(image="miles:other")),
+            rebuilt_object_keys=frozenset({_ORCHESTRATOR_KEY}),
+        )
+
+        assert not diff.is_allowed
+        assert diff.changed == [
+            "LeaderWorkerSet/myrun-miles-run-engine: spec.leaderWorkerTemplate.workerTemplate.spec.containers.[0].image"
+        ]
+
+    def test_an_ordinary_relaunch_exempts_nothing(self):
+        """The default is the strict gate every run that is not being hot restarted keeps."""
+        diff = manifest_diff.diff_manifests(
+            before=_manifest(_objects()),
+            after=_manifest_after(
+                lambda objects: objects[2]["spec"]["template"]["spec"]["containers"][0].update(image="miles:other")
+            ),
+        )
+
+        assert not diff.is_allowed

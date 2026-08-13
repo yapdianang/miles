@@ -13,6 +13,9 @@ from miles.utils.workers.rpc.common.metadata import collect_rpc_method_specs
 from miles.utils.workers.rpc.common.protocol import (
     MAX_POLL_TIMEOUT_SECONDS,
     CallStatusResponse,
+    ClaimEpochRequest,
+    ClaimEpochResponse,
+    InFlightResponse,
     SubmitRequest,
     SubmitResponse,
 )
@@ -25,6 +28,7 @@ logger = logging.getLogger(__name__)
 class RpcServer:
     def __init__(self, *, worker: object) -> None:
         self.boot_uuid = uuid.uuid4().hex
+        self.driver_epoch: str | None = None
         self._specs = collect_rpc_method_specs(type(worker))
         self._store = CallStore()
         self._executor = RpcCallExecutor(worker=worker, specs=self._specs)
@@ -38,6 +42,18 @@ class RpcServer:
             methods=len(self._specs),
             groups=self._executor.concurrency_groups,
         )
+
+    def claim_epoch(self, *, request: ClaimEpochRequest) -> ClaimEpochResponse:
+        log_structured(
+            logger.info,
+            tag="rpc",
+            op="claim_epoch",
+            phase="accept",
+            previous=self.driver_epoch,
+            epoch=request.epoch,
+        )
+        self.driver_epoch = request.epoch
+        return ClaimEpochResponse(epoch=request.epoch)
 
     def submit_call(self, *, method_name: str, request: SubmitRequest) -> SubmitResponse:
         def reject(*, status_code: int, reason: str, detail: str) -> NoReturn:
@@ -75,6 +91,9 @@ class RpcServer:
         )
 
         return SubmitResponse()
+
+    def in_flight_calls(self) -> InFlightResponse:
+        return InFlightResponse(call_ids=self._store.in_flight_call_ids())
 
     async def query_call(self, *, call_id: str, timeout: float) -> CallStatusResponse:
         if not self._store.contains(call_id):

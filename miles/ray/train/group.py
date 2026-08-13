@@ -26,6 +26,7 @@ from miles.utils.data import RolloutDataPack, remove_train_output_refs
 from miles.utils.ft_utils.api_server.models import CellStatus
 from miles.utils.ft_utils.health_checker import ActivenessTracker, NoopHealthChecker, SimpleHealthCheckerConfig
 from miles.utils.ft_utils.indep_dp import IndepDPInfo, create_tcp_store
+from miles.utils.init_once import InitOnce
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import NodeProbeMixin
 from miles.utils.retry_utils import NonRetryableError, retry, retry_until_deadline
@@ -65,6 +66,7 @@ class TrainerController(NodeProbeMixin):
         with_opd_teacher: bool = False,
     ) -> None:
         self._launch_args = launch_args
+        self._init_once = InitOnce(component=f"TrainerController({trainer_id})")
         self._inference_controller = inference_controller
         self._trainer_id = trainer_id
         self._role = role
@@ -307,43 +309,54 @@ class TrainerController(NodeProbeMixin):
         Observe the controller's cells, then allocate GPU resources and initialize
         model, optimzier, local ckpt, etc.
         """
-        self.args = args
-        configure_logger(args, source=TrainerControllerProcessIdentity(trainer_id=self._trainer_id))
-        object_store.init_instance(args, contribute_segment=False)
+        with self._init_once.guard():
+            self.args = args
+            configure_logger(args, source=TrainerControllerProcessIdentity(trainer_id=self._trainer_id))
+            object_store.init_instance(args, contribute_segment=False)
 
-        if self._expected_num_cells > 1:
-            self._indep_dp_store, self._indep_dp_store_addr = create_tcp_store()
+            if self._expected_num_cells > 1:
+                self._indep_dp_store, self._indep_dp_store_addr = create_tcp_store()
 
-        self._health_checker_config = compute_trainer_health_checker_config(
-            args, expected_num_cells=self._expected_num_cells
-        )
+            self._health_checker_config = compute_trainer_health_checker_config(
+                args, expected_num_cells=self._expected_num_cells
+            )
 
-        self._witness_allocator: WitnessIdAllocator | None = (
-            WitnessIdAllocator(buffer_size=args.witness_buffer_size) if args.enable_witness else None
-        )
-        if self._witness_allocator is not None and args.save_debug_event_data is not None:
-            self._witness_allocator.resume(read_persisted_witness_counter(Path(args.save_debug_event_data)))
+            self._witness_allocator: WitnessIdAllocator | None = (
+                WitnessIdAllocator(buffer_size=args.witness_buffer_size) if args.enable_witness else None
+            )
+            if self._witness_allocator is not None and args.save_debug_event_data is not None:
+                self._witness_allocator.resume(read_persisted_witness_counter(Path(args.save_debug_event_data)))
 
-        self._test_action_executor = FTTestActionControllerExecutor.from_args(
-            args, controller=self, cell_operations=self._cell_operations
-        )
+            self._test_action_executor = FTTestActionControllerExecutor.from_args(
+                args, controller=self, cell_operations=self._cell_operations
+            )
 
-        self._watcher_disposer = await self._provider.watch_cells(self._reconcile)
-        await self._wait_expected_num_cells()
+            self._watcher_disposer = await self._provider.watch_cells(self._reconcile)
+            await self._wait_expected_num_cells()
 
-        cell_results = await asyncio.gather(
-            *[
-                cell.init(
-                    indep_dp_info=self._compute_indep_dp_info(
-                        cell_index=cell.cell_index,
-                        # all cells will be alive for this first initialization
-                        alive_cell_indices=list(range(len(self._cells))),
-                    ),
-                    indep_dp_store_addr=self._indep_dp_store_addr,
-                )
-                for cell in self._cells
-            ]
-        )
+            cell_results = await asyncio.gather(
+                *[
+                    cell.init(
+                        indep_dp_info=self._compute_indep_dp_info(
+                            cell_index=cell.cell_index,
+                            # all cells will be alive for this first initialization
+                            alive_cell_indices=list(range(len(self._cells))),
+                        ),
+                        indep_dp_store_addr=self._indep_dp_store_addr,
+                    )
+                    for cell in self._cells
+                ]
+            )
+        return [item for sublist in cell_results for item in sublist]
+
+    async def is_initialized(self) -> bool:
+        return self._init_once.is_initialized
+
+    async def load_state(self) -> list[Any]:
+        """Reload every cell's state from the checkpoint, in place, and answer the rollout id to resume at."""
+        self._init_once.assert_initialized()
+
+        cell_results = await asyncio.gather(*[cell.load_state() for cell in self._cells])
         return [item for sublist in cell_results for item in sublist]
 
     async def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

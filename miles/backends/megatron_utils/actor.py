@@ -18,6 +18,7 @@ from miles.ray.specs.train import compute_trainer_pool_id
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import async_utils, object_store, train_dump_utils
 from miles.utils.argparse_utils import inplace_modify_args
+from miles.utils.arguments import resolve_checkpoint_source
 from miles.utils.audit_utils.event_logger.logger import event_logger_context
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.context_utils import with_defer
@@ -57,7 +58,7 @@ from .ft.in_memory_checkpoint import InMemoryCheckpointManager
 from .ft.indep_dp import reconfigure_indep_dp_group
 from .initialize import init, is_first_replica_megatron_main_rank
 from .lora_utils import is_lora_enabled, lora_rollout_enabled
-from .model import TrainStepOutcome, forward_only, initialize_model_and_optimizer, save, train
+from .model import TrainStepOutcome, forward_only, initialize_model_and_optimizer, load_model_state, save, train
 from .parallel import verify_megatron_parallel_state
 from .replay_utils import register_replay_list_moe
 from .update_weight.common import named_params_and_buffers
@@ -171,6 +172,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 _setup_disk_offload_reclaim(os.environ.get("TMS_DISK_BACKUP_DIR"))
 
         if self.args.debug_rollout_only:
+            self._init_once.complete()
             return 0
 
         if role != "critic":
@@ -187,6 +189,7 @@ class MegatronTrainRayActor(TrainRayActor):
             checkpointing_context = {"local_checkpoint_manager": ckpt_manager}
         elif args.non_persistent_ckpt_type == "local":
             checkpointing_context = {"local_checkpoint_manager": InMemoryCheckpointManager()}
+        self._reload_checkpointing_context = None if recv_ckpt_src_rank is not None else checkpointing_context
 
         heal_load_overrides: dict[str, object] = (
             dict(no_load_optim=False, no_load_rng=False, finetune=False) if recv_ckpt_src_rank is not None else {}
@@ -213,6 +216,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if role == "critic":
             if self.args.offload_train:
                 self.sleep()
+            self._init_once.complete()
             return start_rollout_id
 
         main_cast_ctx = None
@@ -228,22 +232,7 @@ class MegatronTrainRayActor(TrainRayActor):
             main_cast_ctx=main_cast_ctx,
         )
         self._active_model_tag: str | None = "actor"
-        if self._enable_weight_backup:
-            self.weights_backuper.backup("actor")
-
-        if with_ref:
-            self.load_other_checkpoint("ref", args.ref_load)
-
-        # Load teacher model for Megatron-based on-policy distillation
-        if with_opd_teacher:
-            self.load_other_checkpoint("teacher", args.opd_teacher_load)
-
-        if self.args.keep_old_actor:
-            # Load old_actor checkpoint
-            self.load_other_checkpoint("old_actor", args.load)
-            # Create rollout_actor as a copy of current actor
-            if args.update_weights_interval == 1:
-                self.weights_backuper.backup("rollout_actor")
+        self._load_auxiliary_checkpoints()
 
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
@@ -290,7 +279,76 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.prof.on_init_end()
 
+        self._init_once.complete()
         return start_rollout_id
+
+    @with_logs
+    def load_state(self) -> int:
+        assert self.is_initialized(), "load_state reloads the state of a trainer that init already built"
+
+        if self.args.debug_rollout_only:
+            return 0
+
+        if self._asleep:
+            self.wake_up()
+
+        self._finalize_pending_async_save()
+        self._refresh_checkpoint_source()
+
+        loaded_rollout_id = load_model_state(
+            self.args,
+            model=self.model,
+            optimizer=self.optimizer,
+            opt_param_scheduler=self.opt_param_scheduler,
+            role=self.role,
+            checkpointing_context=self._reload_checkpointing_context,
+        )
+        self._last_rollout_id = loaded_rollout_id
+
+        if self.role != "critic":
+            self._load_auxiliary_checkpoints()
+            self.loaded_adapters = {}
+            self._multi_lora_pending_push = set()
+            self._switch_model("actor")
+
+        clear_memory()
+        if self.args.offload_train:
+            self.sleep()
+
+        logger.info(f"load_state rolled this trainer back to checkpoint iteration {loaded_rollout_id}")
+        return loaded_rollout_id + 1
+
+    def _load_auxiliary_checkpoints(self) -> None:
+        if self._enable_weight_backup:
+            self.weights_backuper.backup("actor")
+
+        if self.with_ref:
+            self.load_other_checkpoint("ref", self.args.ref_load)
+
+        # Load teacher model for Megatron-based on-policy distillation
+        if self.with_opd_teacher:
+            self.load_other_checkpoint("teacher", self.args.opd_teacher_load)
+
+        if self.args.keep_old_actor:
+            # Load old_actor checkpoint
+            self.load_other_checkpoint("old_actor", self.args.load)
+            # Create rollout_actor as a copy of current actor
+            if self.args.update_weights_interval == 1:
+                self.weights_backuper.backup("rollout_actor")
+
+    def _finalize_pending_async_save(self) -> None:
+        if not self.args.async_save:
+            return
+
+        from megatron.training.async_utils import maybe_finalize_async_save
+
+        maybe_finalize_async_save(blocking=True)
+
+    def _refresh_checkpoint_source(self) -> None:
+        resolve_checkpoint_source(self.args)
+        if self.role == "critic":
+            self.args.load = self.args.critic_load
+            self.args.save = self.args.critic_save
 
     @with_logs
     @timer

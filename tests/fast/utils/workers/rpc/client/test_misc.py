@@ -9,12 +9,19 @@ from pydantic import ValidationError
 from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.workers.rpc.client.misc import (
     BootUuidPin,
+    DriverEpochPin,
     RetryableResponseError,
     RpcProtocolError,
     RpcTransport,
     ServerRestartedError,
+    StaleDriverError,
 )
-from miles.utils.workers.rpc.common.protocol import BOOT_UUID_HEADER, EXPECTED_BOOT_UUID_HEADER, HealthResponse
+from miles.utils.workers.rpc.common.protocol import (
+    BOOT_UUID_HEADER,
+    DRIVER_EPOCH_HEADER,
+    EXPECTED_BOOT_UUID_HEADER,
+    HealthResponse,
+)
 
 
 def _response(*, status_code: int = 200, boot_uuid: str | None = None) -> httpx.Response:
@@ -26,6 +33,7 @@ def _transport_over(
     handler: Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]],
     *,
     pin: BootUuidPin | None = None,
+    driver_epoch_pin: DriverEpochPin | None = None,
 ) -> tuple[RpcTransport, httpx.AsyncClient]:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     boot_uuid_pin = pin or BootUuidPin(required=False, worker_cls_name="Worker")
@@ -33,8 +41,58 @@ def _transport_over(
         server_url="http://testserver",
         http_client=client,
         boot_uuid_pin=boot_uuid_pin,
+        driver_epoch_pin=driver_epoch_pin or DriverEpochPin(),
     )
     return transport, client
+
+
+class TestDriverEpochPin:
+    def test_a_fresh_pin_claims_nothing(self) -> None:
+        """A cold run drives workers nobody claimed, so it must send no epoch until it claims one."""
+        assert DriverEpochPin().claimed is None
+
+    def test_claiming_twice_produces_two_different_epochs(self) -> None:
+        """Two orchestration scripts must never accidentally share a token and fence nothing."""
+        assert DriverEpochPin().claim() != DriverEpochPin().claim()
+
+
+class TestDriverEpochOverTheWire:
+    async def test_no_epoch_header_is_sent_before_anything_is_claimed(self) -> None:
+        """Adding a header to every cold-start call would fence out the script that is sending it."""
+        seen: list[str | None] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.headers.get(DRIVER_EPOCH_HEADER))
+            return httpx.Response(200, json={"status": "ok"}, request=request)
+
+        transport, client = _transport_over(handler)
+        async with client:
+            await transport.request("GET", "/v1/health", seconds=1.0, response_model=HealthResponse)
+
+        assert seen == [None]
+
+    async def test_every_call_carries_the_claimed_epoch(self) -> None:
+        """The fence only works if the driving calls, not just the claim, identify their driver."""
+        pin = DriverEpochPin()
+        epoch = pin.claim()
+        seen: list[str | None] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.headers.get(DRIVER_EPOCH_HEADER))
+            return httpx.Response(200, json={"status": "ok"}, request=request)
+
+        transport, client = _transport_over(handler, driver_epoch_pin=pin)
+        async with client:
+            await transport.request("GET", "/v1/health", seconds=1.0, response_model=HealthResponse)
+
+        assert seen == [epoch]
+
+    async def test_a_refused_epoch_raises_instead_of_being_retried_as_a_transport_hiccup(self) -> None:
+        """A superseded script has to stop, not keep hammering the worker its successor owns."""
+        transport, client = _transport_over(lambda request: httpx.Response(421, request=request))
+        async with client:
+            with pytest.raises(StaleDriverError, match="later orchestration script"):
+                await transport.request("GET", "/v1/health", seconds=1.0, response_model=HealthResponse)
 
 
 class TestBootUuidPin:
@@ -288,3 +346,43 @@ class TestRpcTransport:
                     seconds=1.0,
                     response_model=HealthResponse,
                 )
+
+
+class TestRebaseliningThePin:
+    def test_rebaselining_forgets_the_pinned_value(self):
+        """A hot restart replaces a pod on purpose, and only wait_ready may accept the new boot uuid."""
+        pin = BootUuidPin(required=True, worker_cls_name="Worker")
+        pin.verify(_response(boot_uuid="boot-a"))
+
+        pin.rebaseline()
+
+        assert pin.expected is None
+        assert pin.needs_handshake() is True
+
+    def test_a_rebaselined_pin_adopts_the_next_boot_uuid(self):
+        """The replacement process is the one this client drives from now on."""
+        pin = BootUuidPin(required=True, worker_cls_name="Worker")
+        pin.verify(_response(boot_uuid="boot-a"))
+        pin.rebaseline()
+
+        pin.verify(_response(boot_uuid="boot-b"))
+
+        assert pin.expected == "boot-b"
+
+    def test_a_rebaselined_pin_is_strict_again_afterwards(self):
+        """Fencing has to come back the moment readiness is established, or a silent restart passes."""
+        pin = BootUuidPin(required=True, worker_cls_name="Worker")
+        pin.rebaseline()
+        pin.verify(_response(boot_uuid="boot-b"))
+
+        with pytest.raises(ServerRestartedError, match="boot-c"):
+            pin.verify(_response(boot_uuid="boot-c"))
+
+    def test_rebaselining_an_optional_pin_changes_nothing(self):
+        """A client that does not require a stable server has nothing to forget."""
+        pin = BootUuidPin(required=False, worker_cls_name="Worker")
+
+        pin.rebaseline()
+
+        assert pin.expected is None
+        assert pin.needs_handshake() is False

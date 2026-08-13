@@ -4,7 +4,12 @@ import os
 from pathlib import Path
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
-from miles.ray.placement_group import create_rollout_components, maybe_start_api_server, update_weights
+from miles.ray.placement_group import (
+    create_rollout_components,
+    maybe_start_api_server,
+    quiesce_trainers,
+    update_weights,
+)
 from miles.ray.wiring import launch_worker_manager
 from miles.utils import object_store
 from miles.utils.arguments import parse_args
@@ -40,9 +45,10 @@ async def train_multi_policy(args) -> None:
     _worker_manager = launch_worker_manager(args)
     object_store.init_instance(args, contribute_segment=False)
 
+    quiet_trainers = await quiesce_trainers(args)
     inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(args)
 
-    trainers = await create_trainers(args, rollout_executor=rollout_executor)
+    trainers = await create_trainers(args, rollout_executor=rollout_executor, quiet_trainers=quiet_trainers)
     assert_consistent_restore(args, trainers=trainers, leader_model_id=megatron_config.leader_model_id)
 
     maybe_start_api_server(
