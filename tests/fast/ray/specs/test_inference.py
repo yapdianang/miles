@@ -10,8 +10,8 @@ from tests.fast.ray.rollout.conftest import make_args, make_sglang_config_yaml
 
 from miles.backends.sglang_utils.router_args_utils import parse_router_args_argv
 from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig
-from miles.ray.rollout.inference_controller import InferenceController
 from miles.ray.rollout import external_engine_provider as external_engine_provider_module
+from miles.ray.rollout.inference_controller import InferenceController
 from miles.ray.specs import inference as inference_specs
 from miles.ray.specs.inference import (
     INFERENCE_CONTROLLER_POOL_ID,
@@ -20,20 +20,36 @@ from miles.ray.specs.inference import (
     _compute_session_server_primary_port_info,
     _compute_spec_router,
     compute_engine_pool_ids,
+    compute_expected_num_cells_by_model,
+    compute_inference_controller_provider,
     compute_inference_engine_env_vars,
+    compute_registration_provider,
+    compute_registration_reporter_id,
     compute_router_pool_id,
     inference_controller_worker_name,
     spec_inference_controller,
     spec_session_server,
     specs_inference_engine,
 )
+from miles.ray.specs.static_addrs import inference_controller_urls
 from miles.rollout.session.config import SessionServerConfig
 from miles.router.config import MilesRouterConfig
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.builder import build_values
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc import SECTION_OF_CATEGORY, LaunchPlan
 from miles.utils.function_registry import load_function
 from miles.utils.workers.argv_utils import parse_config_argv
-from miles.utils.workers.worker_spec import HostAndPort, LaunchCommandContext, WorkerCtorContext, WorkerMetaContext
+from miles.utils.workers.registration.provider import RegistrationWorkerProvider
+from miles.utils.workers.worker_provider.base import CellInfo
+from miles.utils.workers.worker_provider.fan_in import FanInWorkerProvider
+from miles.utils.workers.worker_provider.kubernetes.helm.env import RELEASE_ENV_VAR
+from miles.utils.workers.worker_provider.static import StaticWorkerProvider
+from miles.utils.workers.worker_spec import (
+    RPC_PORT_NAME,
+    HostAndPort,
+    LaunchCommandContext,
+    WorkerCtorContext,
+    WorkerMetaContext,
+)
 
 
 def _controller_layout() -> LaunchPlan:
@@ -801,3 +817,107 @@ class TestTheEngineEnvironment:
     def test_every_engine_is_told_to_report_its_own_env_vars(self) -> None:
         """Without the gate the engine answers /server_info with no env_vars, and the audit is empty."""
         assert compute_inference_engine_env_vars(make_args())["SGLANG_EXPOSE_OWN_ENV_VARS"] == "1"
+
+
+class TestRegistrationWiring:
+    @staticmethod
+    def _args(tmp_path, **overrides) -> Namespace:
+        config_path = tmp_path / "sglang.yaml"
+        config_path.write_text(
+            make_sglang_config_yaml(
+                server_groups=[{"worker_type": "regular", "num_gpus": 8, "num_gpus_per_engine": 4}]
+            )
+        )
+        return make_args(sglang_config=str(config_path), rollout_num_gpus=8, **overrides)
+
+    @staticmethod
+    def _ctor_context(capability: FakeBackendCapability) -> WorkerCtorContext:
+        return WorkerCtorContext(cell_index=0, worker_in_cell_index=0, gpu_ids=[], capability=capability)
+
+    def test_a_run_that_expects_nobody_keeps_the_engine_provider_it_always_had(self, tmp_path):
+        """Every unsplit run must reach its own engines exactly as it did before registration existed."""
+        args = self._args(tmp_path)
+        capability = FakeBackendCapability(cells_provider=object(), static_provider=object())
+
+        kwargs = spec_inference_controller(args).ctor_kwargs(self._ctor_context(capability))
+
+        assert kwargs["registration_provider"] is None
+        assert not isinstance(kwargs["engine_provider"], FanInWorkerProvider)
+
+    def test_a_run_that_expects_reporters_serves_from_its_own_engines_and_the_reported_ones(self, tmp_path):
+        """The rest of the run must not know which deployment launched an engine it generates from."""
+        args = self._args(tmp_path, expected_registration_reporters=2, registration_token="secret")
+        capability = FakeBackendCapability(cells_provider=object(), static_provider=object())
+
+        kwargs = spec_inference_controller(args).ctor_kwargs(self._ctor_context(capability))
+
+        assert isinstance(kwargs["engine_provider"], FanInWorkerProvider)
+        assert isinstance(kwargs["registration_provider"], RegistrationWorkerProvider)
+
+    def test_the_registry_takes_the_token_and_the_models_the_launch_was_given(self, tmp_path):
+        """It would otherwise take in a deployment of another run, or engines no router of this run addresses."""
+        args = self._args(tmp_path, expected_registration_reporters=1, registration_token="secret")
+
+        provider = compute_registration_provider(args)
+
+        assert provider._token == "secret"
+        assert provider._expected_num_reporters == 1
+        assert provider._refuse_cell(_registered_cell_info(model_id="default")) is None
+        assert provider._refuse_cell(_registered_cell_info(model_id="other")) is not None
+
+    def test_an_engine_deployment_reports_into_the_controller_it_was_given(self, tmp_path):
+        """It derives no name of another release, so this address is the only way it finds the run."""
+        args = self._args(
+            tmp_path,
+            deploy_component="inference",
+            inference_controller_addrs=["http://controller:9000"],
+            registration_token="secret",
+        )
+        capability = FakeBackendCapability(cells_provider=object())
+
+        provider = compute_inference_controller_provider(args, capability=capability)
+
+        assert isinstance(provider, StaticWorkerProvider)
+        addrs = provider._compute_addrs(0, 0)
+        assert addrs[RPC_PORT_NAME] == HostAndPort(host="controller", port=9000)
+        assert capability.requested_static_pool_ids == []
+
+    def test_a_run_that_holds_its_controller_addresses_it_by_its_own_release(self, tmp_path):
+        """Naming another release's pods from here is exactly what a split run may not do."""
+        args = self._args(tmp_path)
+        capability = FakeBackendCapability(static_provider=object())
+
+        compute_inference_controller_provider(args, capability=capability)
+
+        assert capability.requested_static_pool_ids == [INFERENCE_CONTROLLER_POOL_ID]
+
+    def test_more_than_one_controller_address_is_refused(self, tmp_path):
+        """A run holds exactly one controller, and every engine deployment registers into that one."""
+        args = self._args(tmp_path, inference_controller_addrs=["a:8000", "b:8000"])
+
+        with pytest.raises(AssertionError, match="--inference-controller-addrs"):
+            inference_controller_urls(args)
+
+    def test_a_reporter_announces_the_cells_its_own_deployment_expects(self, tmp_path):
+        """The run waits for that many cells, and only this deployment knows how many it brings."""
+        args = self._args(tmp_path)
+
+        assert compute_expected_num_cells_by_model(args) == {"default": 2}
+
+    def test_a_kubernetes_engine_deployment_is_named_by_its_own_release(self, tmp_path, monkeypatch):
+        """Two engine groups namespace their pool ids by this, so it has to differ between them."""
+        monkeypatch.setenv(RELEASE_ENV_VAR, "miles-run-r1-inference")
+        args = self._args(tmp_path, cluster_backend="kubernetes")
+
+        assert compute_registration_reporter_id(args) == "miles-run-r1-inference"
+
+
+def _registered_cell_info(*, model_id: str) -> CellInfo:
+    return CellInfo(
+        cell_id="pool-0",
+        pool_id="pool",
+        alive=True,
+        worker_names=["pool-0-0"],
+        workers_hash="hash-1",
+        meta=dict(model_id=model_id, worker_type="regular"),
+    )

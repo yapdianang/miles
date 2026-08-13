@@ -26,6 +26,8 @@ from miles.utils.context_lock import (
 from miles.utils.ft_utils.api_server.models import CellStatus
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import NodeProbeMixin, SimpleTicker
+from miles.utils.workers.registration.models import RegistrationAck, RegistrationSnapshot
+from miles.utils.workers.registration.provider import RegistrationWorkerProvider
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
 from miles.utils.workers.worker_provider.utils import apply_cell_observation
 
@@ -46,10 +48,12 @@ class InferenceController(NodeProbeMixin):
         *,
         engine_provider: BaseWorkerProvider,
         router_providers: Sequence[BaseWorkerProvider],
+        registration_provider: RegistrationWorkerProvider | None = None,
     ) -> None:
         self.args = args
         self._engine_provider = engine_provider
         self._router_providers = router_providers
+        self._registration_provider = registration_provider
         self.context_lock = ContextLock("InferenceController")
         self.servers: dict[str, RolloutServer] = {}
         self._eval_fleet: InferenceControllerEvalFleet | None = None
@@ -80,6 +84,17 @@ class InferenceController(NodeProbeMixin):
         dashboard_hooks.register_router(self.args)
 
         await asyncio.gather(*[srv.wait_expected_num_cells() for srv in self.servers.values()])
+
+    # -------------------------- registration -----------------------------
+
+    @lock_exempt
+    async def apply_registration_snapshot(self, *, snapshot: RegistrationSnapshot) -> RegistrationAck:
+        assert self._registration_provider is not None, (
+            f"reporter {snapshot.reporter_id} registers the engines of its deployment into this run, but this run "
+            f"was launched without --expected-registration-reporters, so it counts on the engines it launches "
+            f"itself and would never wait for the ones being announced"
+        )
+        return await self._registration_provider.apply_snapshot(snapshot)
 
     # -------------------------- rollout lifecycle hooks -----------------------------
 

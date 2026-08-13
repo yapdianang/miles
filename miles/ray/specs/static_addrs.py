@@ -5,6 +5,17 @@ from miles.utils.workers.worker_provider.static import parse_host_and_port
 from miles.utils.workers.worker_spec import HostAndPort
 
 TRAINER_CONTROLLER_ADDRS_FLAG = "--trainer-controller-addrs"
+INFERENCE_CONTROLLER_ADDRS_FLAG = "--inference-controller-addrs"
+
+
+def inference_controller_urls(args) -> list[str] | None:
+    if (entries := args.inference_controller_addrs) is None:
+        return None
+    assert len(entries) == 1, (
+        f"{INFERENCE_CONTROLLER_ADDRS_FLAG} names {len(entries)} controllers, but a run holds exactly one of them, "
+        f"and every engine deployment of that run registers its cells into that one"
+    )
+    return list(entries)
 
 
 def trainer_controller_url(args, *, trainer_id: str, trainer_ids: list[str]) -> str | None:
@@ -26,7 +37,7 @@ def static_trainer_controller_addrs(args, *, trainer_ids: list[str]) -> list[Hos
     ]
 
 
-def assert_deployment_is_this_runs_trainer(identity: DeploymentIdentity, *, args) -> None:
+def assert_deployment_is_this_runs_trainer(identity: DeploymentIdentity, *, args, instance: str | None = None) -> None:
     assert identity.run_uuid == args.run_uuid, (
         f"{TRAINER_CONTROLLER_ADDRS_FLAG} names the {identity.deploy_component} deployment of run "
         f"{identity.run_uuid}, but this launch drives run {args.run_uuid}: every deployment a split run reaches has "
@@ -37,6 +48,11 @@ def assert_deployment_is_this_runs_trainer(identity: DeploymentIdentity, *, args
         f"{identity.run_uuid}, and only a deployment that carries nothing but the trainer is reached by address: "
         f"an {DeployComponent.ALL.value} release of this run runs an orchestration script of its own, so both "
         f"scripts would drive the same trainer"
+    )
+    assert instance is None or identity.deploy_instance == instance, (
+        f"{TRAINER_CONTROLLER_ADDRS_FLAG} names the {identity.deploy_instance!r} of run {identity.run_uuid} as its "
+        f"{instance!r}, so this launch would drive the ranks of one trainer through the workflow of another; "
+        f"the entries of {TRAINER_CONTROLLER_ADDRS_FLAG} are keyed by trainer id, and two of them are swapped"
     )
 
 

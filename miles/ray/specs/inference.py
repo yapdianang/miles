@@ -2,10 +2,12 @@ import logging
 import os
 import shlex
 import sys
+from typing import Any
 
 from miles.backends.sglang_utils.router_args_utils import compute_sglang_router_args, router_args_to_argv
 from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, resolve_sglang_config
 from miles.backends.sglang_utils.sglang_engine import compute_engine_launch_cmd
+from miles.ray.specs.static_addrs import inference_controller_urls
 from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from miles.rollout.session.config import compute_session_server_config
 from miles.router.config import compute_miles_router_config
@@ -15,8 +17,14 @@ from miles.utils.workers.argv_utils import config_to_argv
 from miles.utils.workers.backend_capability.base import BackendCapability
 from miles.utils.workers.launch_gate import GATE_PORT_NAME
 from miles.utils.workers.naming import compute_worker_name
+from miles.utils.workers.registration.provider import RegistrationWorkerProvider
+from miles.utils.workers.registration.reporter import RegistrationReporter
+from miles.utils.workers.types import ClusterBackend, DeployComponent, DeploySelector
 from miles.utils.workers.worker_handle import BaseWorkerHandle
-from miles.utils.workers.worker_provider.base import BaseWorkerProvider
+from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo
+from miles.utils.workers.worker_provider.fan_in import FanInWorkerProvider
+from miles.utils.workers.worker_provider.kubernetes.helm.env import current_release
+from miles.utils.workers.worker_provider.static import StaticWorkerProvider
 from miles.utils.workers.worker_spec import (
     CommandWorkerSpec,
     LaunchCommandContext,
@@ -32,6 +40,8 @@ POOL_CATEGORY_INFERENCE_ENGINE = "inference_engine"
 INFERENCE_CONTROLLER_POOL_ID = "inference-controller"
 SESSION_SERVER_POOL_ID = "session-server"
 INFERENCE_CONTROLLER_WORKER_CLASS = "miles.ray.rollout.inference_controller.InferenceController"
+REGISTRATION_REPORTER_POOL_ID = "registration-reporter"
+REGISTRATION_REPORTER_WORKER_CLASS = "miles.utils.workers.registration.reporter.RegistrationReporterWorker"
 
 
 def spec_inference_controller(args) -> ServeWorkerSpec:
@@ -47,12 +57,96 @@ def spec_inference_controller(args) -> ServeWorkerSpec:
             pin_to_head=args.pin_rollout_manager_to_head,
         ),
         worker_class=INFERENCE_CONTROLLER_WORKER_CLASS,
-        ctor_kwargs=lambda ctx: dict(
-            args=args,
-            engine_provider=compute_engine_provider(args, capability=ctx.capability),
-            router_providers=compute_router_providers(args, capability=ctx.capability),
-        ),
+        ctor_kwargs=lambda ctx: _compute_inference_controller_kwargs(args, capability=ctx.capability),
     )
+
+
+def _compute_inference_controller_kwargs(args, *, capability: BackendCapability) -> dict[str, Any]:
+    registration_provider = compute_registration_provider(args)
+    engine_provider = compute_engine_provider(args, capability=capability)
+    return dict(
+        args=args,
+        engine_provider=(
+            engine_provider
+            if registration_provider is None
+            else FanInWorkerProvider(providers=[engine_provider, registration_provider])
+        ),
+        router_providers=compute_router_providers(args, capability=capability),
+        registration_provider=registration_provider,
+    )
+
+
+def compute_registration_provider(args) -> RegistrationWorkerProvider | None:
+    if args.expected_registration_reporters == 0:
+        return None
+    model_ids = {model_cfg.name for model_cfg in resolve_sglang_config(args).models}
+    return RegistrationWorkerProvider(
+        expected_num_reporters=args.expected_registration_reporters,
+        token=args.registration_token,
+        refuse_cell=lambda info: _compute_registered_cell_refusal_reason(info, model_ids=model_ids),
+    )
+
+
+def specs_registration_reporter(args) -> list[ServeWorkerSpec]:
+    if DeploySelector.of(args).component is not DeployComponent.INFERENCE:
+        return []
+
+    return [
+        ServeWorkerSpec(
+            name=REGISTRATION_REPORTER_POOL_ID,
+            deploy_component=DeployComponent.INFERENCE,
+            port_infos=[],
+            env_var=lambda _ctx: {},
+            scheduling=SchedulingSpec(
+                num_cells=1,
+                num_workers_per_cell=1,
+                num_gpus_per_worker=0,
+                num_cpus_per_worker=1,
+                pin_to_head=args.pin_rollout_manager_to_head,
+            ),
+            worker_class=REGISTRATION_REPORTER_WORKER_CLASS,
+            ctor_kwargs=lambda ctx: dict(reporter=compute_registration_reporter(args, capability=ctx.capability)),
+        )
+    ]
+
+
+def compute_registration_reporter(args, *, capability: BackendCapability) -> RegistrationReporter:
+    controller_provider = compute_inference_controller_provider(args, capability=capability)
+    return RegistrationReporter(
+        reporter_id=compute_registration_reporter_id(args),
+        controller=controller_provider.get_handle(inference_controller_worker_name()),
+        engine_provider=compute_engine_provider(args, capability=capability),
+        expected_num_cells_by_model=compute_expected_num_cells_by_model(args),
+        token=args.registration_token,
+    )
+
+
+def compute_registration_reporter_id(args) -> str:
+    if ClusterBackend(args.cluster_backend) is ClusterBackend.KUBERNETES:
+        return current_release()
+    if (instance := DeploySelector.of(args).instance) is not None:
+        return f"{args.run_uuid}-{instance}"
+    return args.run_uuid
+
+
+def compute_expected_num_cells_by_model(args) -> dict[str, int]:
+    return {
+        model_cfg.name: sum(
+            group_cfg.num_gpus // group_cfg.num_gpus_per_engine
+            for group_cfg in model_cfg.server_groups
+            if group_cfg.worker_type != "placeholder"
+        )
+        for model_cfg in resolve_sglang_config(args).models
+    }
+
+
+def _compute_registered_cell_refusal_reason(info: CellInfo, *, model_ids: set[str]) -> str | None:
+    if (model_id := info.meta.get("model_id")) not in model_ids:
+        return (
+            f"it serves model {model_id!r}, and this run serves {sorted(model_ids)}, so no router of this run "
+            f"would ever send it a request"
+        )
+    return None
 
 
 def compute_engine_provider(args, *, capability: BackendCapability) -> BaseWorkerProvider:
@@ -78,6 +172,10 @@ def create_inference_controller_handle(*, capability: BackendCapability) -> Base
 
 
 def compute_inference_controller_provider(args, *, capability: BackendCapability) -> BaseWorkerProvider:
+    if (urls := inference_controller_urls(args)) is not None:
+        return StaticWorkerProvider.of_rpc_urls(
+            pool_id=INFERENCE_CONTROLLER_POOL_ID, urls=urls, worker_class=INFERENCE_CONTROLLER_WORKER_CLASS
+        )
     return capability.static_worker_provider(pool_id=INFERENCE_CONTROLLER_POOL_ID)
 
 
@@ -268,6 +366,7 @@ def _compute_spec_inference_engine(
     return CommandWorkerSpec(
         name=compute_engine_pool_id(model_idx=model_idx, group_index=group_index),
         category=POOL_CATEGORY_INFERENCE_ENGINE,
+        deploy_component=DeployComponent.INFERENCE,
         port_infos=[
             PortInfo(name="primary", static_port=8000, allow_dynamic=True),
             PortInfo(

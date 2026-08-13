@@ -568,16 +568,29 @@ _RAY_RPC_ARGS = ["--cluster-backend", "ray", "--worker-comm-backend", "rpc"]
 
 _RAY_ACTOR_ARGS = ["--cluster-backend", "ray", "--worker-comm-backend", "ray"]
 
+_INFERENCE_ARGS = [
+    "--deploy-component",
+    "inference",
+    "--inference-controller-addrs",
+    "controller:8000",
+    "--registration-token",
+    "secret",
+]
+
+
+def _parse_deploy_args(extra, *, use_critic: bool = False):
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+    args = parser.parse_args(["--cluster-backend", "kubernetes", *extra, *REQUIRED_ARGS, "--num-rollout", "1"])
+    args.ft_components = []
+    args.mini_ft_controller_enable = False
+    args.use_critic = use_critic
+    return args
+
 
 class TestDeployComponent:
     def _parse(self, extra):
-        parser = argparse.ArgumentParser()
-        get_miles_extra_args_provider()(parser)
-        args = parser.parse_args(["--cluster-backend", "kubernetes", *extra, *REQUIRED_ARGS, "--num-rollout", "1"])
-        args.ft_components = []
-        args.mini_ft_controller_enable = False
-        args.use_critic = False
-        return args
+        return _parse_deploy_args(extra)
 
     def _parse_validated(self, extra):
         args = self._parse(extra)
@@ -590,10 +603,15 @@ class TestDeployComponent:
         """A run that does not mention the flag is one deployment, exactly as before the flag existed."""
         assert self._parse([]).deploy_component == "all"
 
-    def test_rejects_a_component_that_is_not_one_of_the_three(self):
-        """The three values partition the run, so a fourth name would deploy an undefined subset."""
-        with pytest.raises(SystemExit):
-            self._parse(["--deploy-component", "inference"])
+    def test_rejects_a_component_that_names_no_part_of_a_run(self):
+        """The values partition the run, so an unknown name would deploy an undefined subset."""
+        with pytest.raises(AssertionError, match="--deploy-component"):
+            _validate_deploy_component(self._parse(["--deploy-component", "rollout"]))
+
+    def test_rejects_an_instance_of_a_component_a_run_has_exactly_one_of(self):
+        """Two primaries would be two orchestration scripts driving one run against each other."""
+        with pytest.raises(AssertionError, match="--deploy-component"):
+            _validate_deploy_component(self._parse(["--deploy-component", "primary:west"]))
 
     def test_an_unsplit_run_is_validated_exactly_as_it_was_before_the_flag(self):
         """`all` must stay free of every split-only requirement, or it would break every existing launch."""
@@ -719,6 +737,112 @@ class TestDeployComponent:
                 self._parse(
                     ["--deploy-component", "primary", "--trainer-controller-addrs", "10.0.0.1", *_SHARED_STORE_ARGS]
                 )
+            )
+
+    def test_a_trainer_role_deployment_is_validated_as_a_trainer_deployment(self):
+        """One role per release is still a trainer release, so nothing about its rules may change with it."""
+        _validate_deploy_component(self._parse(["--deploy-component", "trainer:actor", *_SHARED_STORE_ARGS]))
+
+    def test_rejects_a_role_this_run_does_not_drive(self):
+        """A misspelled role installs a release carrying no worker, while the run waits for a controller forever."""
+        with pytest.raises(AssertionError, match="actro"):
+            _validate_deploy_component(self._parse(["--deploy-component", "trainer:actro", *_SHARED_STORE_ARGS]))
+
+    def test_accepts_the_critic_role_of_a_run_that_drives_one(self):
+        """The critic is a role of the run like any other, and it is deployable on its own."""
+        _validate_deploy_component(
+            _parse_deploy_args(["--deploy-component", "trainer:critic", *_SHARED_STORE_ARGS], use_critic=True)
+        )
+
+    def test_rejects_the_critic_role_of_a_run_that_drives_none(self):
+        """Nothing in such a run ever calls that controller, so its release would idle forever."""
+        with pytest.raises(AssertionError, match="critic"):
+            _validate_deploy_component(self._parse(["--deploy-component", "trainer:critic", *_SHARED_STORE_ARGS]))
+
+
+class TestEngineRegistrationArguments:
+    def test_a_fully_told_engine_deployment_validates(self):
+        """The controller address and the token are all it needs; it redeems no object store reference of the run."""
+        _validate_deploy_component(_parse_deploy_args([*_INFERENCE_ARGS]))
+
+    def test_an_engine_deployment_has_to_be_told_which_controller_to_register_into(self):
+        """It holds no controller, so an unnamed one leaves its engines announcing themselves to nobody."""
+        with pytest.raises(AssertionError, match="--inference-controller-addrs"):
+            _validate_deploy_component(
+                _parse_deploy_args(["--deploy-component", "inference", "--registration-token", "secret"])
+            )
+
+    def test_an_engine_deployment_waits_for_no_reporter_of_its_own(self):
+        """Only the deployment holding the controller counts the groups that report into it."""
+        with pytest.raises(AssertionError, match="--expected-registration-reporters"):
+            _validate_deploy_component(
+                _parse_deploy_args([*_INFERENCE_ARGS, "--expected-registration-reporters", "1"])
+            )
+
+    @pytest.mark.parametrize("component", ["all", "primary", "trainer"])
+    def test_only_an_engine_deployment_is_told_where_the_controller_is(self, component):
+        """Every other component holds that controller in its own process, so an address contradicts it."""
+        with pytest.raises(AssertionError, match="--inference-controller-addrs"):
+            _validate_deploy_component(
+                _parse_deploy_args(
+                    [
+                        "--deploy-component",
+                        component,
+                        "--inference-controller-addrs",
+                        "controller:8000",
+                        "--registration-token",
+                        "secret",
+                        *_SHARED_STORE_ARGS,
+                    ]
+                )
+            )
+
+    def test_a_reporting_deployment_has_to_present_a_token(self):
+        """Without one, any deployment of any run could announce its engines into this one."""
+        with pytest.raises(AssertionError, match="--registration-token"):
+            _validate_deploy_component(
+                _parse_deploy_args(
+                    ["--deploy-component", "inference", "--inference-controller-addrs", "controller:8000"]
+                )
+            )
+
+    def test_a_receiving_deployment_has_to_present_the_same_token(self):
+        """The token is checked snapshot by snapshot, so a run that holds none accepts every reporter."""
+        with pytest.raises(AssertionError, match="--registration-token"):
+            _validate_deploy_component(_parse_deploy_args(["--expected-registration-reporters", "1"]))
+
+    def test_a_whole_run_that_expects_reporters_validates(self):
+        """An unsplit run may still take in engine groups deployed beside it."""
+        _validate_deploy_component(
+            _parse_deploy_args(["--expected-registration-reporters", "2", "--registration-token", "secret"])
+        )
+
+    def test_refuses_a_token_nothing_in_this_launch_ever_presents(self):
+        """A token that is never checked reads as protection that is not there."""
+        with pytest.raises(AssertionError, match="--registration-token"):
+            _validate_deploy_component(_parse_deploy_args(["--registration-token", "secret"]))
+
+    def test_refuses_a_negative_count_of_reporters(self):
+        """It reads as "expects nobody", bans the token, and then lets any anonymous snapshot in."""
+        with pytest.raises(AssertionError, match="--expected-registration-reporters"):
+            _validate_deploy_component(_parse_deploy_args(["--expected-registration-reporters", "-1"]))
+
+    def test_refuses_an_engine_deployment_serving_a_disaggregated_model(self, tmp_path):
+        """Its reporter refuses every such snapshot, so the run would wait for engines never announced."""
+        config_path = tmp_path / "sglang.yaml"
+        config_path.write_text(
+            "models:\n"
+            "  - name: default\n"
+            "    server_groups:\n"
+            "      - worker_type: prefill\n"
+            "        num_gpus: 4\n"
+            "      - worker_type: decode\n"
+            "        num_gpus: 4\n"
+        )
+
+        with pytest.raises(AssertionError, match="prefill"):
+            _validate_deploy_component(
+                _parse_deploy_args([*_INFERENCE_ARGS, "--sglang-config", str(config_path), "--rollout-num-gpus", "8"])
             )
 
 

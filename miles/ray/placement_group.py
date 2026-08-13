@@ -25,7 +25,7 @@ from miles.ray.specs.train import (
 )
 from miles.ray.wiring import get_backend_capability
 from miles.utils.ft_utils.api_server.server import start_api_server
-from miles.utils.workers.types import DeployComponent
+from miles.utils.workers.types import DeployComponent, DeploySelector
 from miles.utils.workers.worker_handle import BaseWorkerHandle
 from miles.utils.workers.worker_provider.static import wait_static_addrs_ready
 
@@ -107,22 +107,33 @@ def _create_placement_group(num_gpus) -> PlacementGroupInfo:
 
 
 def _get_placement_group_layout(args) -> tuple[int, int]:
-    selector = DeployComponent(args.deploy_component)
-    num_policies = len([config for config in compute_trainer_configs(args) if config.role == ACTOR_ROLE])
+    selector = DeploySelector.of(args)
     trainer_num_gpus = (
-        args.actor_num_nodes * args.actor_num_gpus_per_node * num_policies
+        _compute_trainer_pg_num_gpus(args, selector=selector)
         if selector.selects(DeployComponent.TRAINER) and not args.debug_rollout_only
         else 0
     )
     rollout_num_gpus = (
         args.rollout_num_gpus + args.eval_num_gpus
-        if selector.selects(DeployComponent.PRIMARY) and not args.debug_train_only and not args.rollout_external
+        if selector.selects(DeployComponent.INFERENCE) and not args.debug_train_only and not args.rollout_external
         else 0
     )
 
     if args.colocate and trainer_num_gpus and rollout_num_gpus:
         return max(trainer_num_gpus, rollout_num_gpus), 0
     return trainer_num_gpus + rollout_num_gpus, trainer_num_gpus
+
+
+def _compute_trainer_pg_num_gpus(args, *, selector: DeploySelector) -> int:
+    if selector.instance == CRITIC_ROLE:
+        return args.critic_num_nodes * args.critic_num_gpus_per_node
+
+    deployed = [
+        config
+        for config in compute_trainer_configs(args)
+        if config.role != CRITIC_ROLE and (selector.instance is None or selector.instance == config.trainer_id)
+    ]
+    return args.actor_num_nodes * args.actor_num_gpus_per_node * len(deployed)
 
 
 def create_placement_groups(args) -> dict[str, PlacementGroupInfo]:
@@ -140,7 +151,7 @@ def create_placement_groups(args) -> dict[str, PlacementGroupInfo]:
         "rollout": PlacementGroupInfo(pg, rollout_pg_reordered_bundle_indices, rollout_pg_reordered_gpu_ids),
     }
     if args.use_critic:
-        ans["critic"] = ans["actor"]
+        ans[CRITIC_ROLE] = ans["actor"]
     return ans
 
 
@@ -212,8 +223,8 @@ async def assert_deployed_trainers_are_this_runs(args) -> None:
         for trainer_id in trainer_ids
     ]
     identities = await asyncio.gather(*[handle.get_deployment_identity() for handle in handles])
-    for identity in identities:
-        assert_deployment_is_this_runs_trainer(identity, args=args)
+    for trainer_id, identity in zip(trainer_ids, identities, strict=True):
+        assert_deployment_is_this_runs_trainer(identity, args=args, instance=trainer_id)
 
 
 # TODO: move (when reorganizing files)

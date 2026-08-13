@@ -1,6 +1,7 @@
 from argparse import Namespace
 
 import pytest
+import yaml
 from tests.fast.fixtures.capability_fixtures import FakeBackendCapability
 from tests.fast.fixtures.megatron_config_fixtures import encode_megatron_config
 
@@ -26,9 +27,45 @@ def _layout_args(**overrides):
         "critic_lr": None,
         "critic_lr_warmup_iters": None,
         "deploy_component": "all",
+        "critic_num_nodes": 1,
+        "critic_num_gpus_per_node": 3,
     }
     values.update(overrides)
     return Namespace(**values)
+
+
+def _multi_policy_config(tmp_path) -> str:
+    config_path = tmp_path / "megatron.yaml"
+    config_path.write_text(yaml.dump({"megatron": [{"name": "a"}, {"name": "b"}]}))
+    return str(config_path)
+
+
+class TestTheLayoutOfOneTrainerDeployment:
+    def test_one_trainers_deployment_reserves_the_gpus_of_that_trainer_only(self, tmp_path):
+        """Reserving every policy's gpus for one policy's release leaves it unschedulable on a sized cluster."""
+        args = _layout_args(
+            deploy_component="trainer:a-actor",
+            use_critic=False,
+            megatron_config=_multi_policy_config(tmp_path),
+        )
+
+        assert _get_placement_group_layout(args) == (2, 2)
+
+    def test_a_whole_trainer_deployment_still_reserves_every_trainer(self, tmp_path):
+        """One release carrying every policy has to bundle the gpus of all of them."""
+        args = _layout_args(
+            deploy_component="trainer",
+            use_critic=False,
+            megatron_config=_multi_policy_config(tmp_path),
+        )
+
+        assert _get_placement_group_layout(args) == (4, 4)
+
+    def test_a_critic_deployment_reserves_the_critics_own_gpus(self, tmp_path):
+        """The critic is sized by its own flags, and no policy trainer answers for it."""
+        args = _layout_args(deploy_component="trainer:critic")
+
+        assert _get_placement_group_layout(args) == (3, 3)
 
 
 @pytest.mark.parametrize(
@@ -103,6 +140,11 @@ class TestTheLayoutOfASplitDeployment:
     def test_a_primary_deployment_without_local_engines_bundles_nothing(self, overrides):
         """Neither flag leaves an engine inside ray, and an empty group is what asks the cluster for nothing."""
         assert _get_placement_group_layout(_layout_args(deploy_component="primary", **overrides)) == (0, 0)
+
+    @pytest.mark.parametrize("deploy_component", ["inference", "inference:extra"])
+    def test_an_inference_deployment_bundles_the_engine_gpus_alone(self, deploy_component):
+        """An engine release carries the same engines the primary would, and never a trainer rank."""
+        assert _get_placement_group_layout(_layout_args(deploy_component=deploy_component)) == (4, 0)
 
     def test_a_trainer_deployment_of_a_rollout_only_run_bundles_nothing(self):
         """--debug-rollout-only trains nothing, so this release has no rank to place."""
@@ -314,7 +356,9 @@ async def test_train_parallel_config_comes_from_the_actor_not_the_critic(monkeyp
 class _IdentifyingHandle:
     def __init__(self, *, trainer_id: str, run_uuid: str, deploy_component: str, calls: list[tuple[str, str]]) -> None:
         self.trainer_id = trainer_id
-        self.identity = DeploymentIdentity(run_uuid=run_uuid, deploy_component=deploy_component)
+        self.identity = DeploymentIdentity(
+            run_uuid=run_uuid, deploy_component=deploy_component, deploy_instance=trainer_id
+        )
         self.calls = calls
 
     async def get_deployment_identity(self) -> DeploymentIdentity:

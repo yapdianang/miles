@@ -251,3 +251,40 @@ class TestRouterFlagsAtStartup:
 
         with pytest.raises(AssertionError, match="external router mode was removed"):
             await _create_servers(args)
+
+
+class _RegisteringProvider(_StubProvider):
+    def __init__(self, extra: int) -> None:
+        self._extra = extra
+
+    def extra_expected_num_cells(self, *, model_id: str) -> int:
+        return self._extra
+
+
+class TestExpectedNumCellsCountsRegisteredDeployments:
+    async def test_the_barrier_waits_for_the_cells_other_deployments_report(self) -> None:
+        """A run that waited only for its own engines would start with a fraction of the fleet it will serve from."""
+        args = make_args(rollout_num_gpus=8, rollout_num_gpus_per_engine=4)
+
+        servers = await create_rollout_servers(
+            args,
+            context_lock=ContextLock("InferenceController"),
+            engine_provider=_RegisteringProvider(3),
+            router_addrs={"default": HostAndPort(host="127.0.0.1", port=20000)},
+        )
+
+        assert servers["default"].expected_num_cells == 2
+        assert servers["default"].total_expected_num_cells() == 5
+
+    async def test_a_run_nobody_registers_into_waits_for_its_own_engines_alone(self) -> None:
+        """Every unsplit run must keep the barrier it always had."""
+        args = make_args(rollout_num_gpus=8, rollout_num_gpus_per_engine=4)
+
+        servers = await create_rollout_servers(
+            args,
+            context_lock=ContextLock("InferenceController"),
+            engine_provider=_StubProvider(),
+            router_addrs={"default": HostAndPort(host="127.0.0.1", port=20000)},
+        )
+
+        assert servers["default"].total_expected_num_cells() == 2

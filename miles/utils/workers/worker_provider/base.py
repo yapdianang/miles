@@ -20,6 +20,11 @@ class CellInfo:
     meta: dict[str, Any]  # TODO: in k8s native mode, may be provided from pod annotations
 
 
+def cell_id_of_worker(worker_name: str) -> str:
+    pool_id, cell_index, _worker_in_cell_index = parse_worker_name(worker_name)
+    return compute_cell_id(pool_id=pool_id, cell_index=cell_index)
+
+
 # args: (cell_id, CellInfo)
 ReconcileFn = Callable[[str, CellInfo | None], Awaitable[None]]
 StopWatchFn = Callable[[], Awaitable[None]]
@@ -41,10 +46,11 @@ class BaseWorkerProvider(abc.ABC):
     def expected_num_cells(self, *, model_id: str) -> int | None:
         return None
 
+    def extra_expected_num_cells(self, *, model_id: str) -> int:
+        return 0
+
     def get_handle(self, worker_name: str) -> BaseWorkerHandle:
-        pool_id, cell_index, _worker_in_cell_index = parse_worker_name(worker_name)
-        cell_id = compute_cell_id(pool_id=pool_id, cell_index=cell_index)
-        (infos,) = self.get_worker_infos(cell_ids=[cell_id])
+        (infos,) = self.get_worker_infos(cell_ids=[cell_id_of_worker(worker_name)])
         handles = self.get_handles_of_worker_infos(infos)
         assert worker_name in handles, f"{worker_name=} is not one of {sorted(handles)}"
         return handles[worker_name]

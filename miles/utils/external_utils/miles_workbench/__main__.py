@@ -82,8 +82,8 @@ def stop_command(
     namespace: Namespace,
     run_id: Annotated[str, typer.Argument(help="Run id the release is named after")],
     deploy_component: Annotated[
-        DeployComponent, typer.Option(help="Which deployment of the run to stop, when it was deployed in parts")
-    ] = DeployComponent.ALL,
+        str, typer.Option(help="Which deployment of the run to stop, when it was deployed in parts")
+    ] = DeployComponent.ALL.value,
 ) -> None:
     uninstall(ReleaseArgs(namespace=namespace, release=run_release_name(run_id, deploy_component)))
 

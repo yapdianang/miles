@@ -11,7 +11,7 @@ from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.function_registry import load_function
 from miles.utils.logging_utils import configure_logger
 from miles.utils.workers.serving.utils import override_argv, split_worker_argv
-from miles.utils.workers.types import DeployComponent
+from miles.utils.workers.types import DeploySelector
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +32,10 @@ def main() -> None:
 
 async def _serve_deployed_workers(args, *, own_args: argparse.Namespace, worker_argv: list[str]) -> None:
     configure_logger(args, source=SimpleProcessIdentity(component="main"))
-    component = DeployComponent(args.deploy_component)
-    assert component is DeployComponent.TRAINER, (
-        f"this entrypoint installs the workers of a deployment that carries no orchestration script, which is only "
-        f"the {DeployComponent.TRAINER.value} one, not {component.value}: everything else is launched by the "
-        f"orchestration script itself"
+    selector = DeploySelector.of(args)
+    assert not selector.deploys_orchestration_script(), (
+        f"this entrypoint installs the workers of a deployment that carries no orchestration script, and "
+        f"--deploy-component {selector.value} carries one: launch it through its driver script instead"
     )
 
     wiring: DeploymentWiring = load_function(own_args.wiring)(worker_argv)
@@ -44,7 +43,7 @@ async def _serve_deployed_workers(args, *, own_args: argparse.Namespace, worker_
 
     _worker_manager = wiring.launch_worker_manager()
     logger.info(
-        f"Deployed the {component.value} workers of this run: "
+        f"Deployed the {selector.value} workers of this run: "
         f"{[spec.name for spec in specs]}. "
         f"{await wiring.describe_reachability()}"
     )

@@ -33,7 +33,7 @@ from miles.utils.test_utils.ft_test_actions import FTTestActionControllerExecuto
 from miles.utils.tracking_utils.structured_log import log_structured
 from miles.utils.workers.cell_operations.base import BaseCellOperations
 from miles.utils.workers.rpc.common.wire_types import Pickled
-from miles.utils.workers.types import DeploymentIdentity
+from miles.utils.workers.types import DeploymentIdentity, DeploySelector
 from miles.utils.workers.worker_handle import BaseWorkerHandle
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
 from miles.utils.workers.worker_provider.utils import apply_cell_observation
@@ -407,7 +407,9 @@ class TrainerController(NodeProbeMixin):
 
     async def get_deployment_identity(self) -> DeploymentIdentity:
         return DeploymentIdentity(
-            run_uuid=self._launch_args.run_uuid, deploy_component=self._launch_args.deploy_component
+            run_uuid=self._launch_args.run_uuid,
+            deploy_component=DeploySelector.of(self._launch_args).component.value,
+            deploy_instance=self._trainer_id,
         )
 
     async def onload(self) -> None:

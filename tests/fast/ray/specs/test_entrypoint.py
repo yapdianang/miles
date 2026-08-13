@@ -135,3 +135,46 @@ class TestDeployComponentFiltering:
         ]
 
         assert sorted(whole) == sorted(parts)
+
+    def test_a_trainer_role_deployment_holds_that_role_only(self, tmp_path):
+        """One release per role is what lets a run's trainers be sized, upgraded and lost independently."""
+        specs = compute_specs(self._args(tmp_path, deploy_component="trainer:critic"))
+
+        assert [spec.name for spec in specs] == ["trainer-controller-critic", "trainer-engine-critic"]
+
+    def test_the_roles_of_a_trainer_partition_the_trainer_deployment(self, tmp_path):
+        """A role in neither release would never be deployed, and one in both would be deployed twice."""
+        whole = [spec.name for spec in compute_specs(self._args(tmp_path, deploy_component="trainer"))]
+        parts = [
+            spec.name
+            for component in ("trainer:actor", "trainer:critic")
+            for spec in compute_specs(self._args(tmp_path, deploy_component=component))
+        ]
+
+        assert sorted(whole) == sorted(parts)
+
+    def test_an_inference_deployment_holds_the_engines_and_the_one_reporter(self, tmp_path):
+        """An engine release carries no controller and no router; it only announces the engines it launches."""
+        specs = compute_specs(
+            self._args(
+                tmp_path,
+                deploy_component="inference",
+                inference_controller_addrs=["controller:8000"],
+                registration_token="secret",
+            )
+        )
+
+        assert [spec.name for spec in specs] == ["registration-reporter", "inference-engine-0-0"]
+
+    def test_the_primary_deployment_keeps_engines_of_its_own(self, tmp_path):
+        """An engine deployment adds engines to a run rather than moving the run's own engines out of it."""
+        specs = compute_specs(self._args(tmp_path, deploy_component="primary"))
+
+        assert "inference-engine-0-0" in [spec.name for spec in specs]
+
+    @pytest.mark.parametrize("component", ["all", "primary", "trainer"])
+    def test_only_an_inference_deployment_carries_a_reporter(self, tmp_path, component):
+        """A reporter beside the controller it reports into would register a deployment into itself."""
+        specs = compute_specs(self._args(tmp_path, deploy_component=component))
+
+        assert "registration-reporter" not in [spec.name for spec in specs]

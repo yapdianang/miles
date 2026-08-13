@@ -102,6 +102,7 @@ def _compute_spec_trainer_controller(
     return ServeWorkerSpec(
         name=compute_trainer_controller_pool_id(trainer_id),
         deploy_component=DeployComponent.TRAINER,
+        deploy_instance=trainer_id,
         port_infos=[],
         env_var=lambda _ctx: {},
         scheduling=SchedulingSpec(
@@ -188,6 +189,7 @@ def _compute_spec_trainer(
         name=compute_trainer_pool_id(trainer_id),
         category=POOL_CATEGORY_TRAINER_ENGINE,
         deploy_component=DeployComponent.TRAINER,
+        deploy_instance=trainer_id,
         port_infos=[PortInfo(name=MASTER_PORT_NAME, static_port=9000, mode="master", allow_dynamic=True)],
         env_var=lambda ctx: compute_trainer_env_vars(args, ctx),
         scheduling=SchedulingSpec(

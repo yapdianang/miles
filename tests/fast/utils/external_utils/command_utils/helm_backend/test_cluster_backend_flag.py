@@ -37,7 +37,7 @@ NAMESPACE = "rl"
 RUN_ID = "260101-000000-000"
 
 
-def _config(run_id: str = RUN_ID, deploy_component: DeployComponent = DeployComponent.ALL) -> ExecuteTrainConfig:
+def _config(run_id: str = RUN_ID, deploy_component: str = DeployComponent.ALL.value) -> ExecuteTrainConfig:
     return ExecuteTrainConfig(
         cluster_backend=ClusterBackend.KUBERNETES,
         namespace=NAMESPACE,
@@ -75,7 +75,7 @@ def launch_argv(
     *,
     train_args: str,
     run_id: str = RUN_ID,
-    deploy_component: DeployComponent = DeployComponent.ALL,
+    deploy_component: str = DeployComponent.ALL.value,
     recorded_releases: list[str] | None = None,
 ) -> list[str]:
     recorded: list[list[str]] = []
@@ -221,7 +221,9 @@ class TestExecuteTrainTellsThePodsWhichPartOfTheRunTheyAre:
 
     def test_the_train_argv_names_the_part_the_launch_deploys(self, monkeypatch: pytest.MonkeyPatch):
         """The pods filter the run's spec table by this flag, so it is what makes them a subset of the run."""
-        argv = launch_argv(monkeypatch, train_args="--rollout-num-gpus 8", deploy_component=DeployComponent.TRAINER)
+        argv = launch_argv(
+            monkeypatch, train_args="--rollout-num-gpus 8", deploy_component=DeployComponent.TRAINER.value
+        )
 
         assert declared_deploy_components(argv) == ["trainer"]
 
@@ -232,7 +234,7 @@ class TestExecuteTrainTellsThePodsWhichPartOfTheRunTheyAre:
         launch_argv(
             monkeypatch,
             train_args="--rollout-num-gpus 8",
-            deploy_component=DeployComponent.TRAINER,
+            deploy_component=DeployComponent.TRAINER.value,
             recorded_releases=releases,
         )
 
@@ -244,7 +246,7 @@ class TestExecuteTrainTellsThePodsWhichPartOfTheRunTheyAre:
         argv = launch_argv(
             monkeypatch,
             train_args="--rollout-num-gpus 8",
-            deploy_component=DeployComponent.TRAINER,
+            deploy_component=DeployComponent.TRAINER.value,
             recorded_releases=releases,
         )
 
@@ -258,7 +260,7 @@ class TestExecuteTrainTellsThePodsWhichPartOfTheRunTheyAre:
         argv = launch_argv(
             monkeypatch,
             train_args="--deploy-component trainer --rollout-num-gpus 8",
-            deploy_component=DeployComponent.TRAINER,
+            deploy_component=DeployComponent.TRAINER.value,
         )
 
         assert declared_deploy_components(argv) == ["trainer"]
@@ -276,7 +278,7 @@ class TestApiServerHost:
 
         assert host == f"miles-run-{RUN_ID}-orchestrator.{NAMESPACE}.svc.cluster.local"
 
-    @pytest.mark.parametrize("component", [DeployComponent.PRIMARY, DeployComponent.TRAINER])
+    @pytest.mark.parametrize("component", ["primary", "trainer", "trainer:actor", "inference"])
     def test_no_deployment_of_a_split_run_has_an_api_server_to_name(self, component):
         """A split run is refused an api server, so any host answered here would only ever time out."""
         backend = KubernetesCommandBackend(_config(deploy_component=component))

@@ -108,6 +108,9 @@ def make_args(**overrides: Any) -> Namespace:
         # deployment
         deploy_component="all",
         trainer_controller_addrs=None,
+        inference_controller_addrs=None,
+        expected_registration_reporters=0,
+        registration_token=None,
         # external rollout
         rollout_external=False,
         rollout_external_engine_addrs=None,

@@ -155,9 +155,10 @@ class RolloutServer:
     @lock_exempt
     async def wait_expected_num_cells(self, timeout: float = 3600):
         async def _check(remaining_seconds: float) -> None:
+            expected = self.total_expected_num_cells()
             count = self._count_startable_cells()
-            if count < self.expected_num_cells:
-                raise Exception(f"Only {count}/{self.expected_num_cells} cells of {self.model_name} are ready")
+            if count < expected:
+                raise Exception(f"Only {count}/{expected} cells of {self.model_name} are ready")
 
         await retry_until_deadline(
             _check,
@@ -167,6 +168,10 @@ class RolloutServer:
             max_delay=WAIT_CELLS_MAX_DELAY_SECONDS,
             log_fields=dict(op="wait_expected_num_cells", model_name=self.model_name),
         )
+
+    @lock_exempt
+    def total_expected_num_cells(self) -> int:
+        return self.expected_num_cells + self.engine_provider.extra_expected_num_cells(model_id=self.model_name)
 
     @lock_exempt
     def _count_startable_cells(self) -> int:

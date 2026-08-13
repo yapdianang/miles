@@ -97,6 +97,18 @@ class BaseWorkerSpec(FrozenStrictBaseModel):
     scheduling: SchedulingSpec
     meta: SpecMetaFn | None = None
     deploy_component: DeployComponent = DeployComponent.PRIMARY
+    deploy_instance: str | None = None
+
+    @model_validator(mode="after")
+    def _reject_the_selector_as_a_component(self) -> "BaseWorkerSpec":
+        assert (
+            self.deploy_component is not DeployComponent.ALL
+        ), f"pool {self.name} must name the one component it is deployed with, not the selector for all of them"
+        assert self.deploy_instance is None or self.deploy_component.takes_instance(), (
+            f"pool {self.name} names the instance {self.deploy_instance!r} of {self.deploy_component.value}, "
+            f"but a run deploys exactly one of that component"
+        )
+        return self
 
 
 class HostAndPort(FrozenStrictBaseModel):

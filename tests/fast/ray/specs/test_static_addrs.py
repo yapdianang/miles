@@ -114,8 +114,8 @@ class TestProviderSelection:
 
 class TestTheAddressesNameOneRun:
     @staticmethod
-    def _identity(*, run_uuid: str, deploy_component: str = "trainer") -> DeploymentIdentity:
-        return DeploymentIdentity(run_uuid=run_uuid, deploy_component=deploy_component)
+    def _identity(*, run_uuid: str, deploy_component: str = "trainer", role: str = "actor") -> DeploymentIdentity:
+        return DeploymentIdentity(run_uuid=run_uuid, deploy_component=deploy_component, deploy_instance=role)
 
     def test_a_deployment_of_this_run_is_accepted(self, tmp_path):
         """Every deployment of one run carries the same run uuid, so the usual case must pass silently."""
@@ -137,4 +137,21 @@ class TestTheAddressesNameOneRun:
         with pytest.raises(AssertionError, match="nothing but the trainer"):
             assert_deployment_is_this_runs_trainer(
                 self._identity(run_uuid=args.run_uuid, deploy_component="all"), args=args
+            )
+
+    def test_the_role_the_deployment_answers_for_is_the_role_it_was_addressed_as(self, tmp_path):
+        """Two swapped entries would drive the critic ranks through the actor workflow and the other way round."""
+        args = _args(tmp_path)
+
+        assert_deployment_is_this_runs_trainer(
+            self._identity(run_uuid=args.run_uuid, role="actor"), args=args, instance="actor"
+        )
+
+    def test_a_deployment_of_another_role_of_this_run_stops_the_launch(self, tmp_path):
+        """The run uuid alone is the same on both sides, so swapped urls used to pass unnoticed."""
+        args = _args(tmp_path)
+
+        with pytest.raises(AssertionError, match="swapped"):
+            assert_deployment_is_this_runs_trainer(
+                self._identity(run_uuid=args.run_uuid, role="critic"), args=args, instance="actor"
             )

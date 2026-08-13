@@ -122,14 +122,23 @@ class TestUninstallLeftoverCiReleases:
             f"miles-run-{run_id}",
             f"miles-run-{run_id}-primary",
             f"miles-run-{run_id}-trainer",
+            f"miles-run-{run_id}-inference",
         }
 
     def test_a_release_of_a_run_whose_id_starts_with_this_one_is_still_cleaned(self, monkeypatch):
         """A prefix test reads another run's releases as this run's siblings and leaves them behind forever."""
         run_id = "260101-000000-000"
-        _cluster(monkeypatch, [{"name": f"miles-run-{run_id}-trainer-primary", "namespace": NAMESPACE, "ci": True}])
+        _cluster(monkeypatch, [{"name": f"miles-run-{run_id}-x-primary", "namespace": NAMESPACE, "ci": True}])
 
-        assert _clean_up(keep_run_id=run_id) == [f"miles-run-{run_id}-trainer-primary"]
+        assert _clean_up(keep_run_id=run_id) == [f"miles-run-{run_id}-x-primary"]
+
+    def test_the_instance_releases_of_this_run_are_kept(self, monkeypatch):
+        """A trainer role and a named engine group are releases of this run, installed under a name of their own."""
+        run_id = "260101-000000-000"
+        siblings = [f"miles-run-{run_id}-trainer-actor", f"miles-run-{run_id}-inference-dc1"]
+        _cluster(monkeypatch, [{"name": name, "namespace": NAMESPACE, "ci": True} for name in siblings])
+
+        assert _clean_up(keep_run_id=run_id) == []
 
     def test_treats_empty_helm_output_as_nothing_to_clean(self, monkeypatch):
         """helm prints an empty body rather than [] when it has no rows, and json.loads would raise on it."""
