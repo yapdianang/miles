@@ -181,6 +181,7 @@ class TestWaitRouterReady:
 class TestWaitSessionServerReady:
     async def test_disabled_session_server_does_not_create_a_provider_or_publish_addresses(self, monkeypatch):
         """Disabling the session server publishes no addr / instance-id fields and resolves no addrs."""
+
         class _FakeProvider:
             async def get_addrs(self, worker_name: str) -> NamedHostAndPorts:
                 raise AssertionError("the disabled branch must not resolve any addrs")

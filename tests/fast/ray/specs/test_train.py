@@ -10,7 +10,6 @@ from tests.fast.fixtures.megatron_config_fixtures import write_megatron_config, 
 
 from miles.backends.megatron_utils.megatron_config import compute_trainer_args
 from miles.ray.placement_group import _get_placement_group_layout
-from miles.utils.workers.rpc.common.metadata import declared_concurrency_groups
 from miles.ray.specs.train import (
     TRAINER_CONCURRENCY_GROUPS,
     TRAINER_CONTROLLER_WORKER_CLASS,
@@ -25,7 +24,7 @@ from miles.ray.specs.train import (
 from miles.ray.train_actor import TrainRayActor
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.builder import build_values
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc import SECTION_OF_CATEGORY, LaunchPlan
-from miles.utils.workers.rpc.common.metadata import _find_rpc_config
+from miles.utils.workers.rpc.common.metadata import _find_rpc_config, declared_concurrency_groups
 from miles.utils.workers.worker_spec import WorkerCtorContext
 
 

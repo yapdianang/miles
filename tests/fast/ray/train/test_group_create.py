@@ -1,8 +1,8 @@
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
-from unittest.mock import MagicMock
 from tests.fast.ray.train import conftest as train_conftest
 
 from miles.ray.specs.train import compute_trainer_pool_id
@@ -60,9 +60,7 @@ def _make_args(*, num_cells: int) -> SimpleNamespace:
 
 @pytest.fixture
 def provider() -> _RecordingWorkerProvider:
-    return _RecordingWorkerProvider(
-        worker_manager_handle=train_conftest.fake_worker_manager, pool_ids=[_POOL_ID]
-    )
+    return _RecordingWorkerProvider(worker_manager_handle=train_conftest.fake_worker_manager, pool_ids=[_POOL_ID])
 
 
 async def _create_controller(*, num_cells: int, provider: _RecordingWorkerProvider) -> TrainerController:

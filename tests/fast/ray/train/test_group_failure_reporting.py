@@ -1,14 +1,13 @@
 from types import SimpleNamespace
 
 import pytest
-
-from miles.utils.data import RolloutDataPack
-from miles.utils.object_store import _MooncakeStoreObjectRef
 import ray
 from tests.fast.ray.train.conftest import get_raw_actor_handles, make_alive_cell, make_cell
 
 from miles.ray.train.group import TrainerController
+from miles.utils.data import RolloutDataPack
 from miles.utils.ft_utils.health_checker import ActivenessTracker
+from miles.utils.object_store import _MooncakeStoreObjectRef
 from miles.utils.retry_utils import NonRetryableError
 
 
