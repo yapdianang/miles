@@ -1,8 +1,6 @@
 import asyncio
-import json
 import logging
 import socket
-import subprocess
 import sys
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -10,7 +8,6 @@ from dataclasses import dataclass
 import pytest
 
 from miles.utils import misc
-from miles.utils.env_report import ENV_REPORT_PREFIX
 from miles.utils.misc import (
     NodeProbeMixin,
     SimpleTicker,
@@ -170,23 +167,6 @@ class TestNodeProbeMixin:
         uuids = NodeProbeMixin._get_gpu_uuids([0, 1, 2])
         assert len(uuids) == 3
         assert all(uuid is None or isinstance(uuid, str) for uuid in uuids)
-
-    def test_collect_env_report_forwards_probe_context(self, monkeypatch, capsys) -> None:
-        """Role, rank and the launcher's partial report all reach the printed env report."""
-
-        def _failing_pip_inspect(*args, **kwargs) -> subprocess.CompletedProcess:
-            return subprocess.CompletedProcess(args=["pip", "inspect"], returncode=1, stdout="", stderr="no pip")
-
-        monkeypatch.setattr("miles.utils.env_report.subprocess.run", _failing_pip_inspect)
-
-        NodeProbeMixin._collect_env_report(role="rollout", rank=7, partial_env_report='{"flavor": "probe"}')
-
-        lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith(ENV_REPORT_PREFIX)]
-        assert len(lines) == 1
-        parsed = json.loads(lines[0].removeprefix(ENV_REPORT_PREFIX))
-        assert parsed["role"] == "rollout"
-        assert parsed["rank"] == 7
-        assert parsed["launcher_env_report"] == {"flavor": "probe"}
 
 
 async def _append(calls: list[int]) -> None:

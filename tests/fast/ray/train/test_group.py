@@ -16,13 +16,13 @@ from miles.utils.audit_utils.event_logger.models import CellReconfigureEvent
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.audit_utils.witness.allocator import WitnessIdAllocator
 from miles.utils.data import RolloutDataPack
-from miles.utils.object_store import StoreObjectRef
+from miles.utils.object_store import _MooncakeStoreObjectRef
 from miles.utils.ray_utils import Box
 from miles.utils.retry_utils import NonRetryableError
 
 pytestmark = pytest.mark.asyncio
 
-_DUMMY_DATA_PACK = RolloutDataPack(sample_indices=[0], data_ref=StoreObjectRef(payload="data"))
+_DUMMY_DATA_PACK = RolloutDataPack(sample_indices=[0], data_ref=_MooncakeStoreObjectRef(payload="data"))
 
 
 def _make_mock_args(

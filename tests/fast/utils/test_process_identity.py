@@ -5,7 +5,6 @@ from pydantic import TypeAdapter, ValidationError
 
 from miles.utils.audit_utils.process_identity import (
     ProcessIdentity,
-    RolloutExecutorProcessIdentity,
     SimpleProcessIdentity,
     TrainerControllerProcessIdentity,
     TrainProcessIdentity,
@@ -75,19 +74,20 @@ class TestTrainProcessIdentityValidation:
 
 class TestProcessIdentityUnion:
     def test_process_identity_union_deserializes_rollout_executor(self) -> None:
-        """The discriminated union maps the wire component "rollout_executor" to RolloutExecutorProcessIdentity."""
+        """The discriminated union maps the wire component "rollout_executor" to SimpleProcessIdentity."""
         parsed = TypeAdapter(ProcessIdentity).validate_python({"component": "rollout_executor"})
 
-        assert isinstance(parsed, RolloutExecutorProcessIdentity)
+        assert isinstance(parsed, SimpleProcessIdentity)
         assert parsed.to_name() == "rollout_executor"
 
     def test_rollout_executor_survives_a_union_json_roundtrip(self) -> None:
-        """A serialized RolloutExecutorProcessIdentity is parsed back to the same type through the union."""
+        """A serialized rollout executor identity is parsed back to the same value through the union."""
         adapter = TypeAdapter(ProcessIdentity)
+        source = SimpleProcessIdentity(component="rollout_executor")
 
-        parsed = adapter.validate_json(RolloutExecutorProcessIdentity().model_dump_json())
+        parsed = adapter.validate_json(source.model_dump_json())
 
-        assert parsed == RolloutExecutorProcessIdentity()
+        assert parsed == source
 
     def test_unknown_component_is_rejected_by_the_union(self) -> None:
         """An unknown component discriminator fails validation instead of falling back to a member."""
