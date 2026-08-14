@@ -643,7 +643,7 @@ class TestFaultFormsOfBackendAndCellType:
         """Trainer workers are served over rpc on k8s, so pod deletion joins the kills instead of replacing them."""
         compute = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
 
-        forms = compute(_typed_cell("actor-0", "actor"))
+        forms = compute[fi.ACTOR_CELL_TYPE]
 
         assert [form.name for form in forms] == [
             *(f"inject_fault:{one.value}" for one in fi.FAILURE_MODES),
@@ -654,7 +654,7 @@ class TestFaultFormsOfBackendAndCellType:
         """A k8s engine pod runs sglang as its entrypoint with no rpc server, so a kill would blow up at runtime."""
         compute = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
 
-        forms = compute(_typed_cell("rollout-engine-0", "rollout"))
+        forms = compute[fi.ROLLOUT_CELL_TYPE]
 
         assert [form.name for form in forms] == [fi.DELETE_POD_FORM_NAME]
 
@@ -662,7 +662,7 @@ class TestFaultFormsOfBackendAndCellType:
         """Folding the kills into one form would make pod deletion half of every trainer injection."""
         compute = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
 
-        assert len(compute(_typed_cell("actor-0", "actor"))) == len(fi.FAILURE_MODES) + 1
+        assert len(compute[fi.ACTOR_CELL_TYPE]) == len(fi.FAILURE_MODES) + 1
 
     def test_a_kubernetes_run_without_a_namespace_fails_before_the_soak_starts(self) -> None:
         """kubectl would otherwise delete pods in whatever namespace the kubeconfig happens to point at."""
@@ -693,7 +693,8 @@ class TestFaultFormsOfBackendAndCellType:
 
         compute = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
         cell = _typed_cell("actor-0", "actor")
-        next(one for one in compute(cell) if one.name == fi.DELETE_POD_FORM_NAME).inject(cell, random.Random(0))
+        forms = compute[fi.ACTOR_CELL_TYPE]
+        next(one for one in forms if one.name == fi.DELETE_POD_FORM_NAME).inject(cell, random.Random(0))
 
         assert [one["cell_id"] for one in seen] == ["actor-0"]
         assert [one["release"] for one in seen] == [RunNames.release(run_id=_RUN_ID)]
@@ -768,7 +769,7 @@ class TestRolloutSpareReadiness:
                 _typed_cell("rollout-engine-1", "rollout"),
                 _typed_cell("rollout-engine-2", "rollout", serving=False),
             ],
-            cell_type="rollout",
+            cell_types=("rollout",),
         )
 
         assert injected

@@ -23,7 +23,9 @@ class TestGetCommonTrainArgs:
         self, tmp_path: Path
     ) -> None:
         """Without real rollout engines there is nothing to colocate, whatever the mode declares."""
-        mode = dataclasses.replace(MODES["kill_rollout__dp2_cp2__colocate"], rollout_num_engines=0)
+        mode = dataclasses.replace(
+            MODES["kill_rollout__dp2_cp2__colocate"], rollout_num_engines=0, ft_components=("train",)
+        )
 
         args = get_common_train_args(mode, dump_dir=str(tmp_path))
 

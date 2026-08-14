@@ -16,6 +16,7 @@ from miles.utils.external_utils.command_utils.helm_backend import naming
 from miles.utils.external_utils.command_utils.helm_backend.launcher import command_wrapper, entrypoint
 from miles.utils.external_utils.command_utils.helm_backend.launcher.command_wrapper import Helm
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc import LaunchPlan
+from miles.utils.external_utils.model_args_utils import shell_safe_model_args
 from miles.utils.workers.serving.utils import override_argv
 from miles.utils.workers.types import ClusterBackend
 
@@ -98,9 +99,18 @@ def model_dir(sandbox: Path) -> Path:
     return path
 
 
+def ref_load_dir(sandbox: Path) -> Path:
+    path = sandbox / f"{script.MODEL_NAME}_torch_dist"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def train_args_of(config: ExecuteTrainConfig, addrs: list[str], sandbox: Path) -> str:
-    written = script._train_args(addrs, object_store_args=script._object_store_args(config))
-    return written.replace(f"/root/models/{script.MODEL_NAME}/", f"{model_dir(sandbox)}/")
+    written = f"{shell_safe_model_args(script.MODEL_TYPE)} " + script._train_args(
+        addrs, object_store_args=script._object_store_args(config)
+    )
+    written = written.replace(f"/root/models/{script.MODEL_NAME}/", f"{model_dir(sandbox)}/")
+    return written.replace(f"/root/{script.MODEL_NAME}_torch_dist/", f"{ref_load_dir(sandbox)}/")
 
 
 def launch(monkeypatch, sandbox: Path) -> _Launch:
@@ -183,7 +193,7 @@ class TestTheScriptOwnArgvSelectsTheExternalPath:
 
         argv = shlex.split(train_args_of(config, script._external_engines(config).addrs, tmp_path))
 
-        with override_argv(["train.py", *argv]):
+        with override_argv(argv):
             args = parse_args()
 
         assert args.rollout_external

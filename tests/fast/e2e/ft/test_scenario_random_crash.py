@@ -1,9 +1,7 @@
-import dataclasses
 from pathlib import Path
 
 import pytest
 from tests.e2e.ft.conftest_ft import fault_injection as fi
-from tests.e2e.ft.conftest_ft.modes import MODES, FTTestMode
 from tests.e2e.ft.conftest_ft.scenario_random_crash import assert_healing
 
 from miles.utils.audit_utils.event_logger.logger import EventLogger
@@ -16,17 +14,14 @@ _ROLLOUT_CELL_NAME = "rollout-engine-0"
 _ACTOR_CELL_NAME = "actor-0"
 
 
-def _mode(*ft_components: str) -> FTTestMode:
-    return dataclasses.replace(next(iter(MODES.values())), ft_components=tuple(ft_components))
-
-
 def _injector(*, cell_type: str | None) -> fi.FaultInjectorHandle:
+    """cell_type None is a mixed soak, which crashes both kinds of cell."""
     config = command_utils.ExecuteTrainConfig(cluster_backend=ClusterBackend.RAY)
+    cell_types = [fi.ACTOR_CELL_TYPE, fi.ROLLOUT_CELL_TYPE] if cell_type is None else [cell_type]
     return fi.FaultInjectorHandle(
         base_url="http://control",
         seed=0,
-        mean_interval_seconds=1e9,
-        cell_type=cell_type,
+        mean_interval_seconds_of_cell_type={one_type: 1e9 for one_type in cell_types},
         cell_fault_forms=fi.create_cell_fault_forms(base_url="http://control", config=config),
     )
 
@@ -96,7 +91,12 @@ class TestAssertHealing:
         _note_actor_injections(injector, 3)
 
         with pytest.raises(AssertionError, match="Healing witness failed"):
-            assert_healing(_mode("train"), injector=injector, dump_dir=str(tmp_path))
+            assert_healing(
+            ("train",),
+            injector=injector,
+            event_dir=tmp_path / "events",
+            context="a unit test of the soak assertions",
+        )
 
     def test_trainer_soak_ignores_rollout_injections_when_counting_its_own(self, tmp_path: Path) -> None:
         """A mixed soak's engine crashes say nothing about trainer healing, so they must not be counted."""
@@ -108,7 +108,12 @@ class TestAssertHealing:
             witness.note_injected(_ROLLOUT_CELL_NAME)
 
         with pytest.raises(AssertionError, match="Soak proved too little"):
-            assert_healing(_mode("train", "rollout"), injector=injector, dump_dir=str(tmp_path))
+            assert_healing(
+                ("train", "rollout",),
+                injector=injector,
+                event_dir=tmp_path / "events",
+                context="a unit test of the soak assertions",
+            )
 
     def test_rollout_soak_rejects_unfinished_engine_recovery(self, tmp_path: Path) -> None:
         """A rollout-only soak that ends with an accepted injection still relaunching must fail."""
@@ -122,7 +127,12 @@ class TestAssertHealing:
         witness.observe([_rollout_cell(fi.ObservedCellState.PENDING)])
 
         with pytest.raises(AssertionError, match="Rollout recovery witness failed"):
-            assert_healing(_mode("rollout"), injector=injector, dump_dir=str(tmp_path))
+            assert_healing(
+                ("rollout",),
+                injector=injector,
+                event_dir=tmp_path / "events",
+                context="a unit test of the soak assertions",
+            )
 
 
 class TestTrainerHealingPairing:
@@ -133,7 +143,12 @@ class TestTrainerHealingPairing:
         _note_actor_injections(injector, 3)
 
         with pytest.raises(AssertionError, match="Trainer recovery witness failed"):
-            assert_healing(_mode("train"), injector=injector, dump_dir=str(tmp_path))
+            assert_healing(
+            ("train",),
+            injector=injector,
+            event_dir=tmp_path / "events",
+            context="a unit test of the soak assertions",
+        )
 
     def test_two_cells_healed_by_one_reconfigure_event_count_as_two_healings(self, tmp_path: Path) -> None:
         """One reconfigure can readmit several cells, so counting events would under-count the healing."""
@@ -142,7 +157,12 @@ class TestTrainerHealingPairing:
         _note_actor_injections(injector, 1, name="actor-0")
         _note_actor_injections(injector, 1, name="actor-1")
 
-        assert_healing(_mode("train"), injector=injector, dump_dir=str(tmp_path))
+        assert_healing(
+            ("train",),
+            injector=injector,
+            event_dir=tmp_path / "events",
+            context="a unit test of the soak assertions",
+        )
 
     def test_healing_a_cell_that_was_never_injected_does_not_pay_another_cells_debt(self, tmp_path: Path) -> None:
         """Counting healings without pairing them by cell index would call this a healthy soak."""
@@ -151,7 +171,12 @@ class TestTrainerHealingPairing:
         _note_actor_injections(injector, 2, name="actor-1")
 
         with pytest.raises(AssertionError, match="Trainer recovery witness failed"):
-            assert_healing(_mode("train"), injector=injector, dump_dir=str(tmp_path))
+            assert_healing(
+            ("train",),
+            injector=injector,
+            event_dir=tmp_path / "events",
+            context="a unit test of the soak assertions",
+        )
 
     def test_every_injection_paired_with_a_healing_of_the_same_cell_passes(self, tmp_path: Path) -> None:
         """The assertion must stay invisible on the path a healthy soak actually takes."""
@@ -160,4 +185,9 @@ class TestTrainerHealingPairing:
         _note_actor_injections(injector, 1, name="actor-0")
         _note_actor_injections(injector, 1, name="actor-1")
 
-        assert_healing(_mode("train"), injector=injector, dump_dir=str(tmp_path))
+        assert_healing(
+            ("train",),
+            injector=injector,
+            event_dir=tmp_path / "events",
+            context="a unit test of the soak assertions",
+        )
