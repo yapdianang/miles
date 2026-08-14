@@ -27,6 +27,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = U.create_run_id()
 
     hf_checkpoint: str | None = None
+    megatron_model_type: str = "qwen3-4B"
     model_dir: str = "/root/models"
     save_dir: str = "/tmp/tinker_backend"
     megatron_path: str = "/root/Megatron-LM"
@@ -49,6 +50,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     n_samples_per_prompt: int = 1
     global_batch_size: int = 32
     use_dynamic_batch_size: bool = True
+    max_tokens_per_gpu: int = 9216
+    sglang_mem_fraction_static: float = 0.8
 
     api_port: int = 8068
     enable_wandb: bool = False
@@ -97,7 +100,9 @@ def _serve(args: ScriptArgs, service: bool):
     optimizer_args = "--optimizer adam --lr 1e-4 --lr-decay-style constant "
 
     dynamic_batch_args = (
-        "--use-dynamic-batch-size --max-tokens-per-gpu 9216 " if args.use_dynamic_batch_size else ""
+        f"--use-dynamic-batch-size --max-tokens-per-gpu {args.max_tokens_per_gpu} "
+        if args.use_dynamic_batch_size
+        else ""
     )
     perf_args = (
         f"--tensor-model-parallel-size {args.tp} --sequence-parallel "
@@ -106,7 +111,10 @@ def _serve(args: ScriptArgs, service: bool):
         f"{dynamic_batch_args}"
     )
 
-    sglang_args = "--rollout-num-gpus-per-engine 1 --sglang-mem-fraction-static 0.8 "
+    sglang_args = (
+        "--rollout-num-gpus-per-engine 1 "
+        f"--sglang-mem-fraction-static {args.sglang_mem_fraction_static} "
+    )
     topology_args = (
         f"--actor-num-nodes 1 --actor-num-gpus-per-node {args.actor_num_gpus} "
         f"--rollout-num-gpus {args.rollout_num_gpus} "
@@ -130,7 +138,7 @@ def _serve(args: ScriptArgs, service: bool):
         train_args=train_args,
         config=args,
         num_gpus_per_node=args.num_gpus_per_node,
-        megatron_model_type="qwen3-4B",
+        megatron_model_type=args.megatron_model_type,
         train_script="train_tinker_backend.py",
         megatron_path=args.megatron_path,
         extra_env_vars={

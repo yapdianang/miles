@@ -83,6 +83,7 @@
         "group": "Qwen",
         "pages": [
          "models/qwen/index",
+         "models/qwen/qwen3-8",
          {
           "group": "Qwen3.6",
           "pages": [
