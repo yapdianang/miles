@@ -34,7 +34,7 @@ def test_dynamic_batch_mode_remains_the_default(monkeypatch):
     assert "--sglang-mem-fraction-static 0.5" in train_args
 
 
-def test_service_forwards_model_type(monkeypatch):
+def test_service_forwards_model_identity(monkeypatch):
     captured = {}
 
     def capture_execute_train(**kwargs):
@@ -42,7 +42,11 @@ def test_service_forwards_model_type(monkeypatch):
 
     monkeypatch.setattr(run_tinker_backend.U, "execute_train", capture_execute_train)
 
-    args = run_tinker_backend.ScriptArgs(megatron_model_type="qwen3.8-27B")
+    args = run_tinker_backend.ScriptArgs(
+        megatron_model_type="qwen3.8-27B",
+        tinker_base_model="Qwen/Qwen3.8-27B",
+    )
     run_tinker_backend._serve(args, service=True)
 
     assert captured["megatron_model_type"] == "qwen3.8-27B"
+    assert "--tinker-base-model Qwen/Qwen3.8-27B" in captured["train_args"]

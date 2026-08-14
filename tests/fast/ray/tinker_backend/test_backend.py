@@ -25,6 +25,7 @@ def make_backend(max_adapters: int = 4) -> TinkerBackend:
         lora_rank=32,
         lora_alpha=64,
         hf_checkpoint="Qwen/Qwen3-0.6B",
+        tinker_base_model="Qwen/Qwen3-0.6B",
     )
     return TinkerBackend(args, "http://unused")
 
@@ -428,6 +429,14 @@ def test_service_info_reports_the_v1_matrix():
     assert info["lora_rank_max"] == 32 and info["n_adapters"] == 4
     assert info["occupied_slots"] == [0] and info["ready_adapters"] == ["X"]
     assert info["supported_loss_fns"] == ["cross_entropy", "importance_sampling", "ppo"]
+
+
+def test_service_info_prefers_canonical_tinker_model_id():
+    backend = make_backend()
+    backend.args.hf_checkpoint = "/models/Qwen3.8-27B"
+    backend.args.tinker_base_model = "Qwen/Qwen3.8-27B"
+
+    assert backend.service_info()["base_model"] == "Qwen/Qwen3.8-27B"
 
 
 def test_engine_aborts_go_through_the_inference_admin_port():

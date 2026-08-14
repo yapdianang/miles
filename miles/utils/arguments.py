@@ -1804,6 +1804,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "Requires --multi-lora-n-adapters > 0.",
             )
             parser.add_argument(
+                "--tinker-base-model",
+                type=str,
+                default=None,
+                help="Canonical model ID exposed through the Tinker API. Defaults to --hf-checkpoint.",
+            )
+            parser.add_argument(
                 "--tinker-max-coalesce-wait-s",
                 type=float,
                 default=2.0,

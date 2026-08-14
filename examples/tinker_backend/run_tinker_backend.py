@@ -12,6 +12,7 @@ Usage:
 """
 
 from dataclasses import dataclass
+from shlex import quote
 
 import typer
 
@@ -27,6 +28,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = U.create_run_id()
 
     hf_checkpoint: str | None = None
+    tinker_base_model: str = "Qwen/Qwen3-4B"
     megatron_model_type: str = "qwen3-4B"
     model_dir: str = "/root/models"
     save_dir: str = "/tmp/tinker_backend"
@@ -76,7 +78,10 @@ def _serve(args: ScriptArgs, service: bool):
 
     ckpt_args = f"--hf-checkpoint {args.hf_checkpoint} --megatron-to-hf-mode bridge "
     lora_args = f'--lora-rank {args.lora_rank} --lora-alpha {args.lora_alpha} --lora-dropout 0.0 --target-modules "{args.target_modules}" '
-    tinker_args = f"--tinker-backend --multi-lora-n-adapters {args.n_adapters} --multi-lora-idle-poll-s 5 "
+    tinker_args = (
+        f"--tinker-backend --tinker-base-model {quote(args.tinker_base_model)} "
+        f"--multi-lora-n-adapters {args.n_adapters} --multi-lora-idle-poll-s 5 "
+    )
     if service:
         tinker_args += f"--multi-lora-api-port {args.api_port} "
     else:
