@@ -15,7 +15,10 @@ FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
 
 # ======================================== Arguments =============================================
 
-ARG SGLANG_BRANCH=sglang-miles
+# DELIVERY PIN: the chain needs the five sglang commits that are not on sglang-miles yet,
+# gated launch among them. Revert both defaults once they land.
+ARG SGLANG_REMOTE=https://github.com/fzyzcjy/sglang.git
+ARG SGLANG_BRANCH=tom/refactor-miles-repo-sglang/deliver-2
 ARG SGLANG_COMMIT=""
 
 ARG MEGATRON_REPO=radixark/Megatron-LM
@@ -197,7 +200,7 @@ RUN rm -rf /root/.cache/pip /root/flash-attention
 # the cu13 markers, and sglang's editable install makes them visible to every later pip
 # resolve, which would drag cu13 packages onto a cu12 image.
 RUN cd /sgl-workspace/sglang && \
-    git fetch origin ${SGLANG_BRANCH} && \
+    git fetch ${SGLANG_REMOTE} ${SGLANG_BRANCH} && \
     if [ -n "${SGLANG_COMMIT}" ]; then \
       git checkout -f ${SGLANG_COMMIT}; \
     else \
