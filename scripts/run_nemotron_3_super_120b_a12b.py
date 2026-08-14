@@ -181,7 +181,6 @@ def _execute_train(args: ScriptArgs):
 
     U.execute_train(
         train_args=train_args,
-        config=args,
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type=args.megatron_model_type,
         before_ray_job_submit=lambda: _wait_for_ray_gpus(total_gpus),

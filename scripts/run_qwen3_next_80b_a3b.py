@@ -256,7 +256,6 @@ def execute(args: ScriptArgs):
     join_workers = args.join_ray_workers and args.recipe.actor_num_nodes > 1
     U.execute_train(
         train_args=train_args,
-        config=args,
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type=args.megatron_model_type,
         before_ray_job_submit=(

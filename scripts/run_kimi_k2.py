@@ -219,7 +219,6 @@ def execute(args: ScriptArgs):
 
     U.execute_train(
         train_args=train_args,
-        config=args,
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type=recipe.megatron_model_type,
         megatron_path=args.megatron_path,
