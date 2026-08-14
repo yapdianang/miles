@@ -362,6 +362,27 @@ def _patch_init(monkeypatch: pytest.MonkeyPatch, *, servers: dict[str, _Recordin
     monkeypatch.setattr(inference_controller_module, "resolve_router_addrs", _fake_resolve_router_addrs)
 
 
+class _RefusingWorkerProvider(_FakeWorkerProvider):
+    """A provider a run must never touch, so touching it is the failure."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+
+    async def init(self) -> None:
+        raise AssertionError("debug_train_only must not init any worker provider")
+
+    async def watch_cells(self, reconcile: ReconcileFn) -> StopWatchFn:
+        raise AssertionError("debug_train_only must not watch cells")
+
+
+def _make_controller(args: Namespace, *, engine_provider: _FakeWorkerProvider | None = None) -> InferenceController:
+    return InferenceController(
+        args,
+        engine_provider=engine_provider if engine_provider is not None else _FakeWorkerProvider([]),
+        router_providers=[_FakeWorkerProvider([])],
+    )
+
+
 async def _init_controller(args: Namespace, *, engine_provider: _FakeWorkerProvider) -> None:
     controller = InferenceController(args, engine_provider=engine_provider, router_providers=[_FakeWorkerProvider([])])
     await controller.init()
@@ -838,20 +859,19 @@ class TestInitLifecycle:
         async def _no_servers(args: Namespace, **kwargs: Any) -> dict:
             raise AssertionError("debug_train_only must not create rollout servers")
 
-        async def _no_session_server(args: Namespace) -> None:
-            raise AssertionError("debug_train_only must not wait for the session server")
+        async def _no_router_addrs(args: Namespace, **kwargs: Any) -> dict:
+            raise AssertionError("debug_train_only must not resolve any router")
 
         monkeypatch.setattr(inference_controller_module, "create_rollout_servers", _no_servers)
-        monkeypatch.setattr(inference_controller_module, "wait_session_server_ready", _no_session_server)
-        monkeypatch.setattr(
-            inference_controller_module,
-            "RayWorkerProvider",
-            SimpleNamespace(create=lambda **kwargs: pytest.fail("debug_train_only must not watch cells")),
-        )
+        monkeypatch.setattr(inference_controller_module, "resolve_router_addrs", _no_router_addrs)
         monkeypatch.setattr(
             dashboard_hooks, "register_router", lambda args: pytest.fail("debug_train_only has no router")
         )
-        controller = InferenceController(make_args(debug_train_only=True))
+        controller = InferenceController(
+            make_args(debug_train_only=True),
+            engine_provider=_RefusingWorkerProvider(),
+            router_providers=[_RefusingWorkerProvider()],
+        )
 
         await controller.init()
 
@@ -875,7 +895,7 @@ class TestInitLifecycle:
             "RayWorkerProvider",
             SimpleNamespace(create=lambda *, pool_ids: _FakeWorkerProvider([]).created_with(pool_ids)),
         )
-        controller = InferenceController(make_args())
+        controller = _make_controller(make_args())
 
         await controller.init()
         await controller.dispose()
@@ -887,8 +907,8 @@ class TestInitLifecycle:
         """The eval fleet drives the dedicated eval engines, so it must be handed that server and no other."""
         monkeypatch.setattr(inference_controller_module, "InferenceControllerEvalFleet", _RecordingEvalFleet)
         default, eval_srv = _RecordingServer(model_name="default"), _RecordingServer(model_name="eval")
-        _patch_init(monkeypatch, provider=_FakeWorkerProvider([]), servers={"default": default, "eval": eval_srv})
-        controller = InferenceController(make_args(eval_num_gpus=2))
+        _patch_init(monkeypatch, servers={"default": default, "eval": eval_srv})
+        controller = _make_controller(make_args(eval_num_gpus=2))
 
         await controller.init()
         await controller.dispose()
@@ -905,7 +925,7 @@ class TestInitLifecycle:
             "InferenceControllerEvalFleet",
             lambda *args, **kwargs: pytest.fail("no eval fleet without eval gpus"),
         )
-        _patch_init(monkeypatch, provider=_FakeWorkerProvider([]), servers={"default": _RecordingServer()})
+        _patch_init(monkeypatch, servers={"default": _RecordingServer()})
         controller = InferenceController(make_args(eval_num_gpus=0))
 
         await controller.init()
@@ -917,18 +937,13 @@ class TestInitLifecycle:
     async def test_init_registers_routing_and_waits_for_every_startup_gate(self, monkeypatch: pytest.MonkeyPatch):
         """Returning before every server has its cells would start a rollout against engines that are not up."""
         registered: list[Namespace] = []
-        waited_session: list[Namespace] = []
-
-        async def _wait_session_server_ready(args: Namespace) -> None:
-            waited_session.append(args)
 
         monkeypatch.setattr(dashboard_hooks, "register_router", registered.append)
-        monkeypatch.setattr(inference_controller_module, "wait_session_server_ready", _wait_session_server_ready)
         gate = asyncio.Event()
         ready, blocked = _RecordingServer(), _RecordingServer(cells_gate=gate)
-        _patch_init(monkeypatch, provider=_FakeWorkerProvider([]), servers={"default": ready, "frozen": blocked})
+        _patch_init(monkeypatch, servers={"default": ready, "frozen": blocked})
         args = make_args()
-        controller = InferenceController(args)
+        controller = _make_controller(args)
 
         task = asyncio.create_task(controller.init())
         for _ in range(20):
@@ -940,7 +955,6 @@ class TestInitLifecycle:
         await controller.dispose()
 
         assert registered == [args]
-        assert waited_session == [args]
         assert blocked.waited_expected_num_cells == 1
 
     @pytest.mark.asyncio
@@ -949,8 +963,8 @@ class TestInitLifecycle:
         monkeypatch.setattr(inference_controller_module, "TICK_INTERVAL_SECONDS", 0.01)
         cell = _TickingCell()
         provider = _FakeWorkerProvider([])
-        _patch_init(monkeypatch, provider=provider, servers={"default": _RecordingServer({"engine-0": cell})})
-        controller = InferenceController(make_args())
+        _patch_init(monkeypatch, servers={"default": _RecordingServer({"engine-0": cell})})
+        controller = _make_controller(make_args(), engine_provider=provider)
 
         await controller.init()
         await asyncio.sleep(0.05)

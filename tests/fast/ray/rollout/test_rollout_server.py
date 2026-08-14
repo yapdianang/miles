@@ -11,7 +11,6 @@ from miles.backends.sglang_utils.sglang_config import (
     _compute_rollout_offset,
     resolve_sglang_config,
 )
-from miles.ray.rollout import rollout_server as rollout_server_module
 from miles.ray.rollout.cell_state import CellAddrInfo, StateServing
 from miles.ray.rollout.rollout_server import RolloutServer, create_rollout_servers
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
@@ -220,22 +219,23 @@ class TestCreateRolloutServersWiring:
     )
 
     @pytest.mark.asyncio
-    async def test_create_rollout_servers_wires_each_model_and_router_completely(self, tmp_path, monkeypatch):
+    async def test_create_rollout_servers_wires_each_model_and_router_completely(self, tmp_path):
         """Every model gets its own router and its own activeness tracker, the first one is published on the legacy args, and the injected lock and update_weights survive."""
-
-        async def _wait_router_ready(model_idx: int) -> HostAndPort:
-            return HostAndPort(host=f"10.0.0.{model_idx + 1}", port=20000 + model_idx)
-
-        monkeypatch.setattr(rollout_server_module, "wait_router_ready", _wait_router_ready)
 
         cfg_path = tmp_path / "cfg.yaml"
         cfg_path.write_text(self._CONFIG_YAML)
         args = make_args(sglang_config=str(cfg_path), rollout_num_gpus=12, debug_rollout_only=True)
         lock = ContextLock("InferenceControllerUnderTest")
+        router_addrs = {
+            name: HostAndPort(host=f"10.0.0.{model_idx + 1}", port=20000 + model_idx)
+            for model_idx, name in enumerate(("actor", "ref"))
+        }
 
         servers = await create_rollout_servers(
             args,
             context_lock=lock,
+            engine_provider=_StubProvider(),
+            router_addrs=router_addrs,
         )
 
         assert {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()} == {

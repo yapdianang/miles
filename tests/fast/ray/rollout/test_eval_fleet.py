@@ -56,7 +56,7 @@ class FakeEvalServer:
 
     @property
     def api_clients(self):
-        assert self.context_lock.held_in_current_context(), "api_clients is read under the server's lock"
+        assert self.context_lock.held_in_current_context, "api_clients is read under the server's lock"
         return list(self._engines)
 
 

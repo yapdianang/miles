@@ -11,6 +11,7 @@ from miles.ray.placement_group import PlacementGroupInfo
 from miles.ray.specs.inference import specs_inference_engine
 from miles.utils.workers.naming import compute_worker_name
 from miles.utils.workers.ray_worker_manager import RayWorkerManager
+from miles.utils.workers.types import WorkerCommBackend
 from miles.utils.workers.worker_spec import CommandWorkerSpec, LaunchCommandContext, NamedHostAndPorts
 
 
@@ -75,6 +76,7 @@ async def _launch_engines(args: Namespace) -> dict[str, LaunchCommandContext]:
                 pg_reordered_gpu_ids=list(range(max(num_slots, 1))),
             )
         },
+        comm_backend=WorkerCommBackend.RAY,
     )
 
     return contexts
