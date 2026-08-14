@@ -1,10 +1,46 @@
 import dataclasses
+import random
 import threading
+from collections.abc import Callable
 from unittest.mock import MagicMock, patch
 
+import pytest
 from tests.e2e.ft.conftest_ft import fault_injection as fi
 from tests.e2e.ft.conftest_ft.fault_injection import RecoveryGate, cell_is_alive
 from tests.e2e.ft.conftest_ft.modes import MODES, FTTestMode
+
+from miles.utils.external_utils import command_utils
+from miles.utils.external_utils.command_utils.helm_backend.naming import RunNames
+from miles.utils.test_utils.fault_injector import FailureMode
+from miles.utils.workers.types import ClusterBackend
+
+_NAMESPACE = "miles-e2e"
+_RUN_ID = "abc123"
+
+
+def _config(backend: ClusterBackend, *, namespace: str = _NAMESPACE) -> command_utils.ExecuteTrainConfig:
+    return command_utils.ExecuteTrainConfig(cluster_backend=backend, namespace=namespace, run_id=_RUN_ID)
+
+
+def _api_server_fault_forms() -> fi.CellFaultForms:
+    return fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.RAY))
+
+
+class _StubFaultForm(fi.BaseFaultForm):
+    def __init__(self, form_name: str, on_inject: Callable[[dict, random.Random], None]) -> None:
+        self._name = form_name
+        self._on_inject = on_inject
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def inject(self, cell: dict, rng: random.Random) -> None:
+        self._on_inject(cell, rng)
+
+
+def _fixed_fault_forms(forms: list[fi.BaseFaultForm]) -> fi.CellFaultForms:
+    return {fi.ACTOR_CELL_TYPE: forms, fi.ROLLOUT_CELL_TYPE: forms}
 
 
 def _cell(name: str, *, healthy: bool, cell_type: str = "actor", phase: str = "Running") -> dict:
@@ -126,6 +162,7 @@ def test_loop_never_kills_the_last_live_cell_under_stale_liveness() -> None:
             on_successful_injection=lambda: None,
             cell_type=None,
             recovery_witness=fi.RecoveryWitness(),
+            cell_fault_forms=_api_server_fault_forms(),
             poll_interval_seconds=1e-6,
         )
 
@@ -166,6 +203,7 @@ def test_loop_injects_again_after_an_injected_cell_recovers() -> None:
             on_successful_injection=lambda: None,
             cell_type=None,
             recovery_witness=fi.RecoveryWitness(),
+            cell_fault_forms=_api_server_fault_forms(),
             poll_interval_seconds=1e-6,
         )
 
@@ -202,6 +240,7 @@ def _run_typed_injection_loop(cells: list[dict], *, cell_type: str | None) -> li
             on_successful_injection=lambda: None,
             cell_type=cell_type,
             recovery_witness=fi.RecoveryWitness(),
+            cell_fault_forms=_api_server_fault_forms(),
             poll_interval_seconds=1e-6,
         )
 
@@ -404,7 +443,13 @@ def test_a_mixed_soak_targets_every_kind() -> None:
 
 def test_stop_and_join_takes_one_last_snapshot_before_the_witness_is_read() -> None:
     """Regression: a recovery completing after the final poll must not be lost to a race."""
-    handle = fi.FaultInjectorHandle(base_url="http://control", seed=0, mean_interval_seconds=1e9, cell_type="rollout")
+    handle = fi.FaultInjectorHandle(
+        base_url="http://control",
+        seed=0,
+        mean_interval_seconds=1e9,
+        cell_type="rollout",
+        cell_fault_forms=_api_server_fault_forms(),
+    )
 
     with patch.object(fi, "requests") as mock_requests:
         mock_requests.get.side_effect = lambda url, timeout: _mock_response(
@@ -473,6 +518,7 @@ class TestFaultInjectionLoopErrorHandling:
                 on_successful_injection=lambda: None,
                 cell_type=None,
                 recovery_witness=witness,
+                cell_fault_forms=_api_server_fault_forms(),
                 poll_interval_seconds=1e-6,
             )
 
@@ -519,6 +565,7 @@ class TestFaultInjectionLoopErrorHandling:
                 on_successful_injection=note_success,
                 cell_type=None,
                 recovery_witness=witness,
+                cell_fault_forms=_api_server_fault_forms(),
                 poll_interval_seconds=1e-6,
             )
 
@@ -541,3 +588,111 @@ class TestUntypedInjectionSelection:
 
         assert injected
         assert all(name.startswith("rollout-engine-") for name in injected), injected
+
+
+class TestFaultFormsOfBackendAndCellType:
+    def test_ray_draws_the_in_process_kills_for_a_trainer_cell(self) -> None:
+        """Ray owns no pods, so the only fault it can be asked for is a kill inside the worker."""
+        forms = _api_server_fault_forms()["actor"]
+
+        assert [form.name for form in forms] == [f"inject_fault:{one.value}" for one in fi.FAILURE_MODES]
+
+    def test_ray_draws_the_same_kills_for_a_rollout_cell(self) -> None:
+        """On ray an engine is supervised by an actor that can be asked to die, exactly like a trainer cell."""
+        forms = _api_server_fault_forms()["rollout"]
+
+        assert [form.name for form in forms] == [f"inject_fault:{one.value}" for one in fi.FAILURE_MODES]
+
+    def test_kubernetes_draws_the_kills_plus_pod_deletion_for_a_trainer_cell(self) -> None:
+        """Trainer workers are served over rpc on k8s, so pod deletion joins the kills instead of replacing them."""
+        forms_of = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
+
+        forms = forms_of["actor"]
+
+        assert [form.name for form in forms] == [
+            *(f"inject_fault:{one.value}" for one in fi.FAILURE_MODES),
+            fi.DELETE_POD_FORM_NAME,
+        ]
+
+    def test_kubernetes_draws_pod_deletion_only_for_a_rollout_cell(self) -> None:
+        """A k8s engine pod runs sglang as its entrypoint with no rpc server, so a kill would blow up at runtime."""
+        forms_of = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
+
+        forms = forms_of["rollout"]
+
+        assert [form.name for form in forms] == [fi.DELETE_POD_FORM_NAME]
+
+    def test_every_kill_is_its_own_form_so_the_draw_stays_uniform(self) -> None:
+        """Folding the kills into one form would make pod deletion half of every trainer injection."""
+        forms_of = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
+
+        assert len(forms_of["actor"]) == len(fi.FAILURE_MODES) + 1
+
+    def test_a_kubernetes_run_without_a_namespace_fails_before_the_soak_starts(self) -> None:
+        """kubectl would otherwise delete pods in whatever namespace the kubeconfig happens to point at."""
+        with pytest.raises(AssertionError, match="needs the namespace"):
+            fi.create_cell_fault_forms(
+                base_url="http://control", config=_config(ClusterBackend.KUBERNETES, namespace="")
+            )
+
+    def test_an_inject_fault_form_posts_the_failure_mode_it_was_built_for(self, monkeypatch) -> None:
+        """The form's name must describe what it actually does, or a soak log explains nothing."""
+        posted: list[tuple[str, dict]] = []
+        requests = MagicMock()
+        requests.post.side_effect = lambda url, json, timeout: posted.append((url, json)) or MagicMock()
+        monkeypatch.setattr(fi, "requests", requests)
+
+        forms = _api_server_fault_forms()["actor"]
+        form = next(one for one in forms if one.name == f"inject_fault:{FailureMode.SEGFAULT.value}")
+        form.inject(_typed_cell("actor-0", "actor"), random.Random(0))
+
+        assert posted == [("http://control/api/v1/cells/actor-0/inject-fault", {"mode": "segfault", "sub_index": 0})]
+
+    def test_the_delete_pod_form_never_reaches_the_api_server(self, monkeypatch) -> None:
+        """Routing it through inject-fault would test the production path, not an outsider."""
+        seen: list[dict] = []
+        monkeypatch.setattr(fi, "delete_one_pod_of_cell", lambda **kwargs: seen.append(kwargs) or "pod")
+        requests = MagicMock()
+        monkeypatch.setattr(fi, "requests", requests)
+
+        forms_of = fi.create_cell_fault_forms(base_url="http://control", config=_config(ClusterBackend.KUBERNETES))
+        cell = _typed_cell("actor-0", "actor")
+        next(one for one in forms_of[fi.ROLLOUT_CELL_TYPE] if one.name == fi.DELETE_POD_FORM_NAME).inject(
+            cell, random.Random(0)
+        )
+
+        assert [one["cell_id"] for one in seen] == ["actor-0"]
+        assert [one["release"] for one in seen] == [RunNames.release(run_id=_RUN_ID)]
+        assert [one["namespace"] for one in seen] == [_NAMESPACE]
+        requests.post.assert_not_called()
+
+    def test_the_loop_injects_through_the_forms_of_the_cell_it_picked(self) -> None:
+        """A pod deletion drawn by the loop must reach kubectl, not the api server's inject-fault route."""
+        drawn: list[str] = []
+        stop_event = threading.Event()
+        polls = {"n": 0}
+
+        def fake_get(url: str, timeout: float) -> MagicMock:
+            polls["n"] += 1
+            if polls["n"] >= 6:
+                stop_event.set()
+            return _mock_response({"items": [_typed_cell(f"actor-{i}", "actor") for i in range(3)]})
+
+        with patch.object(fi, "requests") as mock_requests:
+            mock_requests.get.side_effect = fake_get
+            fi.run_fault_injection_loop(
+                base_url="http://control",
+                seed=0,
+                mean_interval_seconds=1e-12,
+                stop_event=stop_event,
+                on_successful_injection=lambda: None,
+                cell_type=None,
+                recovery_witness=fi.RecoveryWitness(),
+                cell_fault_forms=_fixed_fault_forms(
+                    [_StubFaultForm(fi.DELETE_POD_FORM_NAME, lambda cell, rng: drawn.append(fi.DELETE_POD_FORM_NAME))]
+                ),
+                poll_interval_seconds=1e-6,
+            )
+
+            assert drawn == [fi.DELETE_POD_FORM_NAME, fi.DELETE_POD_FORM_NAME], drawn
+            mock_requests.post.assert_not_called()

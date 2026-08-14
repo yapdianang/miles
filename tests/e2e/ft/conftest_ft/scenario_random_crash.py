@@ -18,6 +18,7 @@ from tests.e2e.ft.conftest_ft.fault_injection import (
     API_SERVER_PORT,
     MEAN_INTERVAL_SECONDS,
     FaultInjectorHandle,
+    create_cell_fault_forms,
     spawn_fault_injector,
 )
 from tests.e2e.ft.conftest_ft.modes import FTTestMode, resolve_mode
@@ -72,6 +73,7 @@ def run_ci(
         seed=seed,
         mean_interval_seconds=mean_interval,
         cell_type=compute_injected_cell_type(ft_mode),
+        cell_fault_forms=create_cell_fault_forms(base_url=base_url, config=config),
     )
 
     try:

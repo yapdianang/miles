@@ -1,5 +1,6 @@
 # NOTE: You MUST read tests/e2e/ft/README.md as source-of-truth and documentations
 
+import abc
 import dataclasses
 import enum
 import logging
@@ -11,7 +12,12 @@ from typing import Literal
 
 import requests
 
+from tests.e2e.ft.conftest_ft.pod_deletion import delete_one_pod_of_cell
+
+from miles.utils.external_utils import command_utils
+from miles.utils.external_utils.command_utils.helm_backend.naming import RunNames
 from miles.utils.test_utils.fault_injector import FailureMode
+from miles.utils.workers.types import ClusterBackend
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +28,72 @@ MEAN_INTERVAL_SECONDS: float = 60.0
 # random interval above.
 POLL_INTERVAL_SECONDS: float = 2.0
 FAILURE_MODES: list[FailureMode] = [FailureMode.SIGKILL, FailureMode.EXIT, FailureMode.SEGFAULT]
+
+DELETE_POD_FORM_NAME: str = "delete_pod"
+
+ACTOR_CELL_TYPE: str = "actor"
+ROLLOUT_CELL_TYPE: str = "rollout"
+
+
+class BaseFaultForm(abc.ABC):
+    @property
+    @abc.abstractmethod
+    def name(self) -> str: ...
+
+    @abc.abstractmethod
+    def inject(self, cell: dict, rng: random.Random) -> None: ...
+
+
+class InjectFaultForm(BaseFaultForm):
+    def __init__(self, *, base_url: str, failure_mode: FailureMode) -> None:
+        self._base_url = base_url
+        self._failure_mode = failure_mode
+
+    @property
+    def name(self) -> str:
+        return f"inject_fault:{self._failure_mode.value}"
+
+    def inject(self, cell: dict, rng: random.Random) -> None:
+        resp = requests.post(
+            f"{self._base_url}/api/v1/cells/{cell['metadata']['name']}/inject-fault",
+            json={"mode": self._failure_mode.value, "sub_index": 0},
+            timeout=5,
+        )
+        resp.raise_for_status()
+
+
+class DeletePodFaultForm(BaseFaultForm):
+    def __init__(self, *, namespace: str, run_id: str) -> None:
+        assert namespace, "Deleting a cell's pod needs the namespace the run was installed into"
+        assert run_id, "Deleting a cell's pod needs the run_id naming the release that owns it"
+
+        self._namespace = namespace
+        self._release = RunNames.release(run_id=run_id)
+
+    @property
+    def name(self) -> str:
+        return DELETE_POD_FORM_NAME
+
+    def inject(self, cell: dict, rng: random.Random) -> None:
+        delete_one_pod_of_cell(
+            namespace=self._namespace, release=self._release, cell_id=cell["metadata"]["name"], rng=rng
+        )
+
+
+CellFaultForms = dict[str, list[BaseFaultForm]]
+
+
+def create_cell_fault_forms(*, base_url: str, config: command_utils.ExecuteTrainConfig) -> CellFaultForms:
+    kill_forms: list[BaseFaultForm] = [
+        InjectFaultForm(base_url=base_url, failure_mode=failure_mode) for failure_mode in FAILURE_MODES
+    ]
+
+    match config.cluster_backend:
+        case ClusterBackend.RAY:
+            return {ACTOR_CELL_TYPE: kill_forms, ROLLOUT_CELL_TYPE: kill_forms}
+        case ClusterBackend.KUBERNETES:
+            delete_pod_form = DeletePodFaultForm(namespace=config.namespace, run_id=config.run_id)
+            return {ACTOR_CELL_TYPE: [*kill_forms, delete_pod_form], ROLLOUT_CELL_TYPE: [delete_pod_form]}
 
 
 def cell_is_alive(cell: dict) -> bool:
@@ -182,6 +254,7 @@ def run_fault_injection_loop(
     on_successful_injection: Callable[[], None],
     cell_type: str | None,
     recovery_witness: RecoveryWitness,
+    cell_fault_forms: CellFaultForms,
     poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
 ) -> None:
     rng = random.Random(seed)
@@ -219,20 +292,16 @@ def run_fault_injection_loop(
 
         target = rng.choice(alive_of_type[rng.choice(spare_types)])
         cell_name = target["metadata"]["name"]
-        mode = rng.choice(FAILURE_MODES)
+        form = rng.choice(cell_fault_forms[_cell_type_of(target)])
         try:
-            resp = requests.post(
-                f"{base_url}/api/v1/cells/{cell_name}/inject-fault",
-                json={"mode": mode.value, "sub_index": 0},
-                timeout=5,
-            )
-            resp.raise_for_status()
+            form.inject(target, rng)
             gate.note_injected(cell_name)
             recovery_witness.note_injected(cell_name)
             on_successful_injection()
             next_injection_time = _compute_next_injection_time(rng, mean_interval_seconds)
+            logger.info("Injected fault %s into %s", form.name, cell_name)
         except Exception:
-            logger.info("Failed to inject fault into %s", cell_name, exc_info=True)
+            logger.info("Failed to inject fault %s into %s", form.name, cell_name, exc_info=True)
 
 
 def list_cells(*, base_url: str, cell_type: str | None) -> list[dict] | None:
@@ -254,7 +323,15 @@ def _matches_cell_type(cell: dict, cell_type: str | None) -> bool:
 
 
 class FaultInjectorHandle:
-    def __init__(self, *, base_url: str, seed: int, mean_interval_seconds: float, cell_type: str | None) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        seed: int,
+        mean_interval_seconds: float,
+        cell_type: str | None,
+        cell_fault_forms: CellFaultForms,
+    ) -> None:
         self.num_successful_injections: int = 0
         self.recovery_witness = RecoveryWitness()
         self._base_url = base_url
@@ -270,6 +347,7 @@ class FaultInjectorHandle:
                 "on_successful_injection": self._on_successful_injection,
                 "cell_type": cell_type,
                 "recovery_witness": self.recovery_witness,
+                "cell_fault_forms": cell_fault_forms,
             },
             daemon=True,
             name="ft-random-fault-injector",
@@ -294,10 +372,19 @@ class FaultInjectorHandle:
 
 
 def spawn_fault_injector(
-    *, base_url: str, seed: int, mean_interval_seconds: float, cell_type: str | None
+    *,
+    base_url: str,
+    seed: int,
+    mean_interval_seconds: float,
+    cell_type: str | None,
+    cell_fault_forms: CellFaultForms,
 ) -> FaultInjectorHandle:
     handle = FaultInjectorHandle(
-        base_url=base_url, seed=seed, mean_interval_seconds=mean_interval_seconds, cell_type=cell_type
+        base_url=base_url,
+        seed=seed,
+        mean_interval_seconds=mean_interval_seconds,
+        cell_type=cell_type,
+        cell_fault_forms=cell_fault_forms,
     )
     handle.start()
     return handle

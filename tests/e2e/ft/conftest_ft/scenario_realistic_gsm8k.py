@@ -9,8 +9,13 @@ from typing import Annotated
 import typer
 
 from tests.e2e.ft.conftest_ft.app import resolve_dump_dir
+from tests.e2e.ft.conftest_ft.fault_injection import (
+    API_SERVER_PORT,
+    MEAN_INTERVAL_SECONDS,
+    create_cell_fault_forms,
+    spawn_fault_injector,
+)
 from tests.fast.cluster_backends import create_backend_for_run
-from tests.e2e.ft.conftest_ft.fault_injection import API_SERVER_PORT, MEAN_INTERVAL_SECONDS, spawn_fault_injector
 
 from miles.utils.external_utils import command_utils
 from miles.utils.external_utils.command_utils.base_backend import BaseCommandBackend
@@ -63,6 +68,7 @@ def run_ci(
         seed=seed,
         mean_interval_seconds=mean_interval,
         cell_type="actor",
+        cell_fault_forms=create_cell_fault_forms(base_url=base_url, config=config),
     )
 
     try:
