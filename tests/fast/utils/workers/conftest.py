@@ -36,6 +36,8 @@ def patch_ray_get_failure(monkeypatch):
         raise RuntimeError("free port probe failed")
 
     monkeypatch.setattr(mod.ray, "get", _raise)
+
+
 def worker_manager_args(**overrides) -> SimpleNamespace:
     """The slice of a training run's args the worker manager reads when it configures its logger."""
     return SimpleNamespace(**{"save_debug_event_data": None, "env_report": "", **overrides})

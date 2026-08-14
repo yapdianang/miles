@@ -6,10 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from tests.fast.fixtures.capability_fixtures import FakeBackendCapability
-from tests.fast.fixtures.megatron_config_fixtures import (
-    write_megatron_config,
-    write_megatron_config_trainers,
-)
+from tests.fast.fixtures.megatron_config_fixtures import write_megatron_config, write_megatron_config_trainers
 
 from miles.backends.megatron_utils.megatron_config import compute_trainer_args
 from miles.ray.placement_group import _get_placement_group_layout

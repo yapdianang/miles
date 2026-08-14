@@ -6,6 +6,7 @@ import pytest
 from miles.ray import train_actor
 from miles.ray.train_actor import TrainRayActor
 
+
 class TestConstructorSignature:
     def test_positional_constructor_arguments_are_rejected(self):
         """Workers are built from a spec's kwargs, so silently shifted positional args must not construct one."""

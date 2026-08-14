@@ -270,6 +270,7 @@ class TestRunAfterStep:
     @pytest.mark.asyncio
     async def test_a_rejected_stop_propagates_and_the_later_action_never_fires(self):
         """Carrying on after the requested transition failed turns a broken scenario into a green run."""
+
         class _RejectingOperations(FakeCellOperations):
             async def suspend(self, cell_id: str) -> None:
                 raise RuntimeError("worker manager rejected the stop")

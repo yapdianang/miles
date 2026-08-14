@@ -139,6 +139,7 @@ class TestComputeNodesPerEngine:
         """A multi-node engine is launched once per node it covers, so the count must scale with it."""
         assert compute_nodes_per_engine(num_gpus_per_engine=32, num_gpus_per_node=8) == 4
 
+
 class TestTheApiClientOfACell:
     def test_carries_the_engine_api_key(self, stub_provider) -> None:
         """A protected /server_info answers 401 without it, so the engine env would never be recorded."""

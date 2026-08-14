@@ -617,6 +617,7 @@ class TestRequestValidation:
         assert (cell.suspend_calls, cell.resume_calls) == (0, 0)
         assert rollout_handler.injected == []
 
+
 class TestOperationsSelection:
     def test_every_handler_gets_the_operations_of_the_process_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Under Kubernetes the api server must act on pods, not on a Ray worker manager."""

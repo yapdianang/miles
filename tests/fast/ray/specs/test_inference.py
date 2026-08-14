@@ -10,8 +10,8 @@ from tests.fast.ray.rollout.conftest import make_args, make_sglang_config_yaml
 
 from miles.backends.sglang_utils.router_args_utils import parse_router_args_argv
 from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig
-from miles.ray.rollout.inference_controller import InferenceController
 from miles.ray.rollout import external_engine_provider as external_engine_provider_module
+from miles.ray.rollout.inference_controller import InferenceController
 from miles.ray.specs import inference as inference_specs
 from miles.ray.specs.inference import (
     INFERENCE_CONTROLLER_POOL_ID,

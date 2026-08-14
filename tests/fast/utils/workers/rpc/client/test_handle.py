@@ -866,6 +866,7 @@ class TestWaitReady:
         assert transport.requests >= 3
         assert transport.request_times[-1] - started >= timeout - 0.1
 
+
 class TestWaitDead:
     async def test_wait_dead_returns_once_the_server_stops_answering(self):
         """A cell is healed only after its ranks are gone, and a refused connection is that proof."""
