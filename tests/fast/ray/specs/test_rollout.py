@@ -113,5 +113,6 @@ class TestRolloutExecutorSpec:
         assert SECTION_OF_CATEGORY[spec.category] == "staticWorkers"
         assert entry["name"] == ROLLOUT_EXECUTOR_POOL_ID
         assert entry["ports"] == [{"name": "rpc", "port": 8000}]
-        assert ROLLOUT_EXECUTOR_WORKER_CLASS in entry["command"]
+        assert entry["command"][entry["command"].index("--pool-id") + 1] == ROLLOUT_EXECUTOR_POOL_ID
+        assert spec.worker_class == ROLLOUT_EXECUTOR_WORKER_CLASS
         assert "resources" not in entry

@@ -80,6 +80,7 @@ def make_args(**overrides: Any) -> Namespace:
         critic_num_nodes=0,
         critic_num_gpus_per_node=0,
         use_critic=False,
+        megatron_config=None,
         critic_train_only=False,
         # sglang router
         sglang_router_ip=None,

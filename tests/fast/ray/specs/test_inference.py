@@ -721,7 +721,8 @@ class TestSpecInferenceController:
         assert SECTION_OF_CATEGORY[spec.category] == "staticWorkers"
         assert entry["name"] == INFERENCE_CONTROLLER_POOL_ID
         assert entry["ports"] == [{"name": "rpc", "port": 8000}]
-        assert INFERENCE_CONTROLLER_WORKER_CLASS in entry["command"]
+        assert entry["command"][entry["command"].index("--pool-id") + 1] == INFERENCE_CONTROLLER_POOL_ID
+        assert spec.worker_class == INFERENCE_CONTROLLER_WORKER_CLASS
         assert "resources" not in entry
 
     def test_it_asks_for_a_provider_over_the_engine_pools_it_will_observe(self, tmp_path):
