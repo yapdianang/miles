@@ -24,8 +24,19 @@ def _make_args(**overrides) -> Namespace:
         sglang_router_port=None,
         cluster_backend="ray",
         eval_num_gpus=0,
+        eval_num_gpus_per_engine=1,
         debug_train_only=False,
+        debug_rollout_only=False,
         use_session_server=False,
+        sglang_config=None,
+        prefill_num_servers=None,
+        rollout_num_gpus=2,
+        rollout_num_gpus_per_engine=1,
+        offload_rollout=False,
+        colocate=False,
+        hf_checkpoint="/models/fake",
+        actor_num_nodes=1,
+        actor_num_gpus_per_node=8,
     )
     defaults.update(overrides)
     return Namespace(**defaults)
