@@ -8,6 +8,7 @@ import ray
 from tests.fast.ray.train.fake_worker_manager import FakeWorkerManager
 
 import miles.ray.train.group as group_module
+from miles.ray.specs.train import compute_trainer_pool_id
 from miles.ray.train.cell import TrainerCell
 from miles.utils import object_store
 from miles.utils.ft_utils.api_server.models import TriState
@@ -86,8 +87,10 @@ class RecordingHealthChecker(BaseHealthChecker):
         self.task_started = True
 
 
-def make_provider() -> BaseWorkerProvider:
-    return RayWorkerProvider(worker_manager_handle=fake_worker_manager)
+def make_provider(trainer_id: str = "actor") -> BaseWorkerProvider:
+    return RayWorkerProvider(
+        worker_manager_handle=fake_worker_manager, pool_ids=[compute_trainer_pool_id(trainer_id)]
+    )
 
 
 def get_raw_actor_handles(cell: TrainerCell) -> list[ray.actor.ActorHandle]:

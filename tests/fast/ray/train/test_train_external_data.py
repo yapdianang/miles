@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
 import pytest
+
+from miles.utils.data import RolloutDataPack
+from miles.utils.object_store import _MooncakeStoreObjectRef
 import ray
 from tests.fast.ray.train.conftest import get_raw_actor_handles, make_alive_cell
 
@@ -15,7 +18,7 @@ async def _noop_run_after_step(**kwargs) -> None:
 
 pytestmark = pytest.mark.asyncio
 
-_DUMMY_DATA_PACK = {"data_ref": "data", "sample_indices": [0]}
+_DUMMY_DATA_PACK = RolloutDataPack(sample_indices=[0], data_ref=_MooncakeStoreObjectRef(payload="data"))
 
 
 def _make_controller(cells: list) -> TrainerController:

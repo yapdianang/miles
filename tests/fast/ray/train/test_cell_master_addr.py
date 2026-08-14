@@ -43,7 +43,7 @@ class TestMasterAddrConfiguration:
         ]
         cell = make_cell(0, actor_count=2)
 
-        await cell.init(indep_dp_info=make_indep_dp_info(quorum_id=0))
+        await cell.init(indep_dp_info=make_indep_dp_info(quorum_id=0), indep_dp_store_addr=None)
 
         for [call] in _calls_of(cell, "configure_master_addr_and_port"):
             assert call[2] == {"master_addr": "fe80::a", "master_port": 21001}
@@ -80,7 +80,7 @@ class TestMasterAddrConfigurationFailure:
         monkeypatch.setattr(cell, "_get_worker_handles", lambda: handles)
 
         with pytest.raises(WorkerUnreachableError):
-            await cell.init(indep_dp_info=make_indep_dp_info(quorum_id=0))
+            await cell.init(indep_dp_info=make_indep_dp_info(quorum_id=0), indep_dp_store_addr=None)
 
         assert [handle.calls for handle in handles] == [["configure_master_addr_and_port"]] * 2
         assert [handle.kill_self_count for handle in handles] == [1, 1]

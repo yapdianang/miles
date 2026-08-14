@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from tests.fast.ray.rollout.conftest import make_args
 
 from miles.ray.rollout.rollout_server import RolloutServer
 from miles.utils.context_lock import ContextLock
@@ -41,7 +42,7 @@ class _StubProvider:
 def _make_server(cells: list[_RecordingCell], **overrides) -> RolloutServer:
     return RolloutServer(
         server_cells={cell.meta.cell_id: cell for cell in cells},
-        args=SimpleNamespace(colocate=True),
+        args=make_args(colocate=True),
         context_lock=ContextLock("InferenceController"),
         engine_provider=_StubProvider(),
         **overrides,

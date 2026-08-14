@@ -169,42 +169,25 @@ class TestWaitRouterReady:
 
         waited: list[tuple[str, int]] = []
         monkeypatch.setattr(
-            "miles.ray.rollout.router_manager.RayWorkerProvider",
-            SimpleNamespace(create=lambda: _FakeProvider()),
-        )
-        monkeypatch.setattr(
             "miles.ray.rollout.router_manager.wait_tcp_ready",
             lambda host, port, timeout: waited.append((host, port)),
         )
 
         with pytest.raises(RuntimeError, match="not registered"):
-            await wait_router_ready(model_idx=1)
+            await wait_router_ready(model_idx=1, provider=_FakeProvider())
         assert waited == []
 
 
 class TestWaitSessionServerReady:
     async def test_disabled_session_server_does_not_create_a_provider_or_publish_addresses(self, monkeypatch):
         """Disabling the session server publishes no addr / instance-id fields and resolves no addrs."""
-        created: list[object] = []
-
         class _FakeProvider:
             async def get_addrs(self, worker_name: str) -> NamedHostAndPorts:
                 raise AssertionError("the disabled branch must not resolve any addrs")
 
-        def _create() -> _FakeProvider:
-            provider = _FakeProvider()
-            created.append(provider)
-            return provider
-
-        monkeypatch.setattr(
-            "miles.ray.rollout.router_manager.RayWorkerProvider",
-            SimpleNamespace(create=_create),
-        )
-
         args = make_args(use_session_server=False)
-        await wait_session_server_ready(args, provider=None)
+        await wait_session_server_ready(args, provider=_FakeProvider())
 
-        assert created == []
         assert not hasattr(args, "session_server_addrs")
         assert not hasattr(args, "session_server_instance_ids")
 
@@ -312,15 +295,11 @@ class TestWaitSessionServerReady:
 
         waited: list[tuple[str, int]] = []
         monkeypatch.setattr(
-            "miles.ray.rollout.router_manager.RayWorkerProvider",
-            SimpleNamespace(create=lambda: _FakeProvider()),
-        )
-        monkeypatch.setattr(
             "miles.ray.rollout.router_manager.wait_tcp_ready",
             lambda host, port, timeout: waited.append((host, port)),
         )
 
         args = make_args(use_session_server=True, hf_checkpoint="/fake/model", num_session_servers=2)
         with pytest.raises(RuntimeError, match="not registered"):
-            await wait_session_server_ready(args)
+            await wait_session_server_ready(args, provider=_FakeProvider())
         assert waited == []

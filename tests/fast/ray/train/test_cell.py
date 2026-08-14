@@ -201,7 +201,7 @@ class TestAsyncInit:
         cell = make_cell(actor_count=1, health_checker=checker)
         checker.observe_alive = lambda: cell.is_alive
 
-        await cell.init(indep_dp_info=make_indep_dp_info())
+        await cell.init(indep_dp_info=make_indep_dp_info(), indep_dp_store_addr=None)
 
         assert checker.start_count == 1
         assert checker.alive_when_started is True

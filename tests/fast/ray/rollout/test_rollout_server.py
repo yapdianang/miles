@@ -296,7 +296,7 @@ class TestAddCellRollback:
         """The cell is committed before init runs, so a failing init cannot orphan its health checker task."""
         srv = RolloutServer(
             server_cells={},
-            args=SimpleNamespace(colocate=False, ft_components=[]),
+            args=make_args(colocate=False, ft_components=[]),
             context_lock=_make_lock(),
             engine_provider=_StubProvider(),
         )
@@ -314,7 +314,7 @@ class TestAddCellRollback:
         """Controller teardown must reach each cell so its health checker task stops with it."""
         srv = RolloutServer(
             server_cells={},
-            args=SimpleNamespace(colocate=True, ft_components=[]),
+            args=make_args(colocate=True, ft_components=[]),
             context_lock=_make_lock(),
             engine_provider=_StubProvider(),
         )
@@ -331,7 +331,7 @@ class TestAddCellRollback:
         """After the failure is gone the same cell id can be added normally."""
         srv = RolloutServer(
             server_cells={},
-            args=SimpleNamespace(colocate=False, ft_components=[]),
+            args=make_args(colocate=False, ft_components=[]),
             context_lock=_make_lock(),
             engine_provider=_StubProvider(),
         )
@@ -349,7 +349,7 @@ class TestDuplicateCellId:
     async def test_adding_a_duplicate_cell_id_preserves_the_original_cell(self, monkeypatch):
         """Overwriting the entry would drop the first cell's health checker task and router registration on the floor."""
         srv = RolloutServer(
-            server_cells={}, args=SimpleNamespace(colocate=True, ft_components=[]), context_lock=_make_lock()
+            server_cells={}, args=make_args(colocate=True, ft_components=[]), context_lock=_make_lock()
         )
         monkeypatch.setattr(ServerCell, "init", _noop_async)
 
@@ -378,7 +378,7 @@ class TestRemoveCellDisposal:
             await real_dispose(cell)
 
         srv = RolloutServer(
-            server_cells={}, args=SimpleNamespace(colocate=True, ft_components=[]), context_lock=_make_lock()
+            server_cells={}, args=make_args(colocate=True, ft_components=[]), context_lock=_make_lock()
         )
         monkeypatch.setattr(ServerCell, "init", _noop_async)
         monkeypatch.setattr(ServerCell, "dispose", _blocking_dispose)
@@ -408,7 +408,7 @@ class TestAddCellInitTiming:
 
         srv = RolloutServer(
             server_cells={},
-            args=SimpleNamespace(colocate=False, ft_components=[]),
+            args=make_args(colocate=False, ft_components=[]),
             context_lock=_make_lock(),
             engine_provider=_StubProvider(),
         )
@@ -430,7 +430,7 @@ class TestAddCellInitTiming:
 
         srv = RolloutServer(
             server_cells={},
-            args=SimpleNamespace(colocate=True, ft_components=[]),
+            args=make_args(colocate=True, ft_components=[]),
             context_lock=_make_lock(),
             engine_provider=_StubProvider(),
         )
@@ -456,7 +456,7 @@ async def _make_serving_server(monkeypatch, *, num_cells: int) -> RolloutServer:
 
     srv = RolloutServer(
         server_cells={},
-        args=SimpleNamespace(colocate=True, ft_components=[], use_miles_router=False),
+        args=make_args(colocate=True, ft_components=[], use_miles_router=False),
         context_lock=_make_lock(),
     )
     async with srv.context_lock:
