@@ -187,6 +187,7 @@ class InferenceController(NodeProbeMixin):
             async with self.context_lock.with_released():
                 await asyncio.sleep(CELLS_READY_POLL_INTERVAL_SECONDS)
 
+    @requires_lock
     def _get_servers_of_model_id(self, model_id: str | None) -> list[RolloutServer]:
         if model_id is None:
             return list(self.servers.values())
