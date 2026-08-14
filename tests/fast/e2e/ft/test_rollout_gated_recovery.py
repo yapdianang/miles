@@ -60,8 +60,9 @@ class _FakeHealthChecker:
 
 
 class _FakeEngineApiClient:
-    def __init__(self, server_url: str) -> None:
+    def __init__(self, server_url: str, api_key: str | None = None) -> None:
         self.server_url = server_url
+        self.api_key = api_key
 
     async def release_memory_occupation(self, tags: list[str] | None = None) -> None:
         return None

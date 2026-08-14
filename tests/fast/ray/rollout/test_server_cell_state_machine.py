@@ -75,8 +75,9 @@ class _RecordingRouterApiClient:
 class _RecordingApiClient:
     calls: list[tuple[str, dict]] = []
 
-    def __init__(self, server_url: str):
+    def __init__(self, server_url: str, api_key: str | None = None):
         self.server_url = server_url
+        self.api_key = api_key
 
     async def release_memory_occupation(self, tags=None):
         _RecordingApiClient.calls.append(("release", dict(tags=tags)))
@@ -93,8 +94,9 @@ class _ResultApiClient:
     results: dict[str, dict] = {}
     errors: dict[str, Exception] = {}
 
-    def __init__(self, server_url: str):
+    def __init__(self, server_url: str, api_key: str | None = None):
         self.server_url = server_url
+        self.api_key = api_key
 
     async def release_memory_occupation(self, tags=None):
         return await self._record("release_memory_occupation", dict(tags=tags))

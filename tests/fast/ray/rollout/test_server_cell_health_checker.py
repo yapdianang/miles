@@ -68,8 +68,9 @@ def _addr_info() -> CellAddrInfo:
 
 
 class _RecordingApiClient:
-    def __init__(self, server_url: str) -> None:
+    def __init__(self, server_url: str, api_key: str | None = None) -> None:
         self.server_url = server_url
+        self.api_key = api_key
 
     async def health_generate(self, timeout: float = 5.0) -> bool:
         _ENDPOINT_CALLS.append(("health_generate", self.server_url))
