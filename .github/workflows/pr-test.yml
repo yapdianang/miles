@@ -42,9 +42,10 @@ concurrency:
   cancel-in-progress: true
 
 # `resolve-ci-policy` passes trigger-specific facts to `ci_policy.py`, which
-# owns the explicit cadence, raw labels, test scope, and fast-fail policy.
+# owns the explicit cadence, raw labels, test scope, stage selection, and
+# fast-fail policy.
 # `run_suite.py` consumes that shared policy; GPU jobs consume the shared
-# bypass output for their cross-stage gate.
+# skip list and bypass output for their job-level gates.
 #
 # Trigger type is not policy: each scheduled cron maps to an explicit cadence,
 # while workflow_dispatch remains a regular manual operation with no implicit
@@ -58,17 +59,28 @@ jobs:
       cadence: ${{ steps.resolve.outputs.cadence }}
       raw_labels: ${{ steps.resolve.outputs.raw_labels }}
       bypass_fastfail: ${{ steps.resolve.outputs.bypass_fastfail }}
+      skipped_stages: ${{ steps.resolve.outputs.skipped_stages }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          fetch-depth: 2
           persist-credentials: false
+      - name: Collect PR changed files
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          if ! git diff --name-status -z -M HEAD^1 HEAD > "$RUNNER_TEMP/changed-files.z"; then
+            rm -f "$RUNNER_TEMP/changed-files.z"
+            echo "::warning::Unable to compute PR diff; all GPU stages remain eligible."
+          fi
       - name: Resolve CI policy inputs
         id: resolve
         env:
           EVENT_NAME: ${{ github.event_name }}
           SCHEDULE: ${{ github.event.schedule || '' }}
           PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          CHANGED_FILES_PATH: ${{ runner.temp }}/changed-files.z
         run: python -m tests.ci.ci_policy
 
   # Resolve and build a PR image only after the fast CPU gate completes.
@@ -151,6 +163,7 @@ jobs:
       always() && !cancelled() &&
       needs.resolve-ci-policy.result == 'success' &&
       needs.resolve-ci-image.result == 'success' &&
+      !contains(fromJSON(needs.resolve-ci-policy.outputs.skipped_stages || '[]'), 'stage-b-2-gpu-h200') &&
       (needs.stage-a-cpu.result == 'success' ||
         (needs.stage-a-cpu.result == 'failure' && needs.resolve-ci-policy.outputs.bypass_fastfail == 'true'))
     uses: ./.github/workflows/_run-ci.yml
@@ -169,6 +182,7 @@ jobs:
       always() && !cancelled() &&
       needs.resolve-ci-policy.result == 'success' &&
       needs.resolve-ci-image.result == 'success' &&
+      !contains(fromJSON(needs.resolve-ci-policy.outputs.skipped_stages || '[]'), 'stage-c-8-gpu-h100') &&
       (needs.stage-a-cpu.result == 'success' ||
         (needs.stage-a-cpu.result == 'failure' && needs.resolve-ci-policy.outputs.bypass_fastfail == 'true'))
     strategy:
@@ -193,6 +207,7 @@ jobs:
       always() && !cancelled() &&
       needs.resolve-ci-policy.result == 'success' &&
       needs.resolve-ci-image.result == 'success' &&
+      !contains(fromJSON(needs.resolve-ci-policy.outputs.skipped_stages || '[]'), 'stage-c-8-gpu-h200') &&
       (needs.stage-a-cpu.result == 'success' ||
         (needs.stage-a-cpu.result == 'failure' && needs.resolve-ci-policy.outputs.bypass_fastfail == 'true'))
     strategy:
@@ -217,6 +232,7 @@ jobs:
       always() && !cancelled() &&
       needs.resolve-ci-policy.result == 'success' &&
       needs.resolve-ci-image.result == 'success' &&
+      !contains(fromJSON(needs.resolve-ci-policy.outputs.skipped_stages || '[]'), 'stage-c-4-gpu-h200') &&
       (needs.stage-a-cpu.result == 'success' ||
         (needs.stage-a-cpu.result == 'failure' && needs.resolve-ci-policy.outputs.bypass_fastfail == 'true'))
     strategy:
@@ -241,6 +257,7 @@ jobs:
       always() && !cancelled() &&
       needs.resolve-ci-policy.result == 'success' &&
       needs.resolve-ci-image.result == 'success' &&
+      !contains(fromJSON(needs.resolve-ci-policy.outputs.skipped_stages || '[]'), 'stage-c-2-gpu-h200') &&
       (needs.stage-a-cpu.result == 'success' ||
         (needs.stage-a-cpu.result == 'failure' && needs.resolve-ci-policy.outputs.bypass_fastfail == 'true'))
     strategy:
