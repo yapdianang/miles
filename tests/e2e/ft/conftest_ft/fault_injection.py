@@ -22,7 +22,6 @@ from miles.utils.workers.types import ClusterBackend
 logger = logging.getLogger(__name__)
 
 API_SERVER_PORT: int = 18080
-MEAN_INTERVAL_SECONDS: float = 60.0
 # Poll cell liveness this often so the gate tracks a crash->detect->heal cycle even when it
 # happens entirely between two (much sparser) injections; injections still fire on the long
 # random interval above.
