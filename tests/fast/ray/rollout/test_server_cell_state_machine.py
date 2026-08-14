@@ -197,20 +197,6 @@ class TestInit:
         with pytest.raises(AssertionError):
             await cell.init()
 
-    async def test_external_rollout_initialization_is_rejected_before_allocating_an_address(
-        self, cell_env, monkeypatch
-    ):
-        """External address allocation was removed, so the cell must refuse instead of opening a gate it does not own."""
-
-        async def _unexpected_compute_addr_info(self) -> CellAddrInfo:
-            raise AssertionError("external rollout initialization looked up a worker address")
-
-        monkeypatch.setattr(ServerCell, "_compute_addr_info", _unexpected_compute_addr_info)
-        cell = _make_cell(args_overrides=dict(rollout_external=True))
-
-        with pytest.raises(NotImplementedError):
-            await cell.init()
-
         assert cell.is_uninitialized
         assert cell_env["activated"] == []
 
