@@ -274,6 +274,9 @@ def run_fault_injection_loop(
         gate.observe({c["metadata"]["name"]: c for c in cells})
         recovery_witness.observe(cells)
 
+        if stop_event.is_set():
+            break
+
         if time.monotonic() < next_injection_time:
             continue
 
