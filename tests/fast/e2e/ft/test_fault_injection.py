@@ -43,11 +43,14 @@ def _fixed_fault_forms(forms: list[fi.BaseFaultForm]) -> fi.CellFaultForms:
     return {fi.ACTOR_CELL_TYPE: forms, fi.ROLLOUT_CELL_TYPE: forms}
 
 
-def _cell(name: str, *, healthy: bool, cell_type: str = "actor", phase: str = "Running") -> dict:
+def _cell(name: str, *, healthy: bool, cell_type: str = "actor", phase: str = "Running", serving: bool = True) -> dict:
     status = "True" if healthy else "False"
+    conditions = [{"type": "Healthy", "status": status}]
+    if cell_type == "rollout":
+        conditions.append({"type": "Serving", "status": "True" if serving else "False"})
     return {
         "metadata": {"name": name, "labels": {"miles.io/cell-type": cell_type}},
-        "status": {"phase": phase, "conditions": [{"type": "Healthy", "status": status}]},
+        "status": {"phase": phase, "conditions": conditions},
     }
 
 
@@ -210,8 +213,8 @@ def test_loop_injects_again_after_an_injected_cell_recovers() -> None:
     assert len(injected) >= 2, f"expected a second injection after recovery, got {injected}"
 
 
-def _typed_cell(name: str, cell_type: str, *, healthy: bool = True) -> dict:
-    return _cell(name, healthy=healthy, cell_type=cell_type)
+def _typed_cell(name: str, cell_type: str, *, healthy: bool = True, serving: bool = True) -> dict:
+    return _cell(name, healthy=healthy, cell_type=cell_type, serving=serving)
 
 
 def _run_typed_injection_loop(cells: list[dict], *, cell_type: str | None) -> list[str]:
@@ -727,3 +730,76 @@ class TestFaultFormsOfBackendAndCellType:
 
             assert drawn == [fi.DELETE_POD_FORM_NAME, fi.DELETE_POD_FORM_NAME], drawn
             mock_requests.post.assert_not_called()
+
+
+class TestRolloutSpareReadiness:
+    def test_a_healthy_engine_that_is_not_in_the_router_is_not_a_spare(self) -> None:
+        """Regression: a relaunched engine reads Healthy long before it can answer, so it is no replacement."""
+        injected = _run_typed_injection_loop(
+            [
+                _typed_cell("rollout-engine-0", "rollout"),
+                _typed_cell("rollout-engine-1", "rollout", serving=False),
+            ],
+            cell_type="rollout",
+        )
+
+        assert injected == []
+
+    def test_two_serving_engines_still_leave_one_of_them_injectable(self) -> None:
+        """The readiness rule must not block the case it was never meant to block."""
+        injected = _run_typed_injection_loop(
+            [
+                _typed_cell("rollout-engine-0", "rollout"),
+                _typed_cell("rollout-engine-1", "rollout"),
+            ],
+            cell_type="rollout",
+        )
+
+        assert injected
+
+    def test_a_trainer_cell_is_judged_by_liveness_alone(self) -> None:
+        """Trainer cells carry no Serving condition, so requiring one would stop every trainer soak."""
+        assert fi._cell_can_serve(_typed_cell("actor-0", "actor"))
+
+    def test_an_engine_that_cannot_serve_yet_is_still_injectable(self) -> None:
+        """Crashing an engine mid-relaunch is a real fault window, and only the replica count needs it to serve."""
+        injected = _run_typed_injection_loop(
+            [
+                _typed_cell("rollout-engine-0", "rollout"),
+                _typed_cell("rollout-engine-1", "rollout"),
+                _typed_cell("rollout-engine-2", "rollout", serving=False),
+            ],
+            cell_type="rollout",
+        )
+
+        assert injected
+
+    def test_an_injector_that_outlives_the_join_fails_instead_of_racing_the_witness(self) -> None:
+        """Reading the witness beside a still-running injector would assert on a half-updated tally."""
+        released = threading.Event()
+        entered = threading.Event()
+
+        def slow_inject(cell: dict, rng: random.Random) -> None:
+            entered.set()
+            released.wait(timeout=30)
+
+        handle = fi.FaultInjectorHandle(
+            base_url="http://control",
+            seed=0,
+            mean_interval_seconds=1e-12,
+            cell_type=None,
+            cell_fault_forms=_fixed_fault_forms([_StubFaultForm("slow", slow_inject)]),
+        )
+
+        with patch.object(fi, "requests") as mock_requests:
+            mock_requests.get.side_effect = lambda url, timeout: _mock_response(
+                {"items": [_typed_cell(f"actor-{i}", "actor") for i in range(3)]}
+            )
+            handle.start()
+            try:
+                assert entered.wait(timeout=30)
+                with pytest.raises(AssertionError, match="still mid-injection"):
+                    handle.stop_and_join(timeout_seconds=0.2)
+            finally:
+                released.set()
+                handle._thread.join(timeout=30)

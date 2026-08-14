@@ -2,6 +2,7 @@
 # WARNING: Do NOT relax any assert logic in this file. All assertions must remain strict.
 
 
+from collections import Counter
 from pathlib import Path
 from typing import Annotated
 
@@ -15,8 +16,10 @@ from tests.e2e.ft.conftest_ft.execution import (
     run_training,
 )
 from tests.e2e.ft.conftest_ft.fault_injection import (
+    ACTOR_CELL_TYPE,
     API_SERVER_PORT,
     MEAN_INTERVAL_SECONDS,
+    ROLLOUT_CELL_TYPE,
     FaultInjectorHandle,
     create_cell_fault_forms,
     spawn_fault_injector,
@@ -24,7 +27,12 @@ from tests.e2e.ft.conftest_ft.fault_injection import (
 from tests.e2e.ft.conftest_ft.modes import FTTestMode, resolve_mode
 
 from miles.utils.external_utils import command_utils
-from miles.utils.test_utils.reconfigure_assertions import assert_min_soak_injections, assert_soak_reconfigure_events
+from miles.utils.test_utils.reconfigure_assertions import (
+    assert_min_soak_injections,
+    assert_soak_reconfigure_events,
+    load_reconfigure_events,
+)
+from miles.utils.workers.naming import parse_cell_id
 
 app: typer.Typer = typer.Typer()
 
@@ -51,7 +59,7 @@ def run_ci(
     config = command_utils.default_config()
     dump_dir: str = resolve_dump_dir(f"{TEST_NAME}_{mode}")
     print(f"Dump directory: {dump_dir}")
-    mean_interval: float = MEAN_INTERVAL_SECONDS / max(crash_probability, 0.01)
+    mean_interval: float = MEAN_INTERVAL_SECONDS / max(crash_probability, 0.01) / len(ft_mode.ft_components)
     print(f"Seed: {seed}, Steps: {num_steps}, Mean injection interval: {mean_interval:.1f}s")
     print(f"FT components: {ft_mode.ft_components}, cluster backend: {config.cluster_backend.value}")
 
@@ -89,24 +97,49 @@ def run_ci(
 def compute_injected_cell_type(ft_mode: FTTestMode) -> str | None:
     match tuple(sorted(ft_mode.ft_components)):
         case ("train",):
-            return "actor"
+            return ACTOR_CELL_TYPE
         case ("rollout",):
-            return "rollout"
+            return ROLLOUT_CELL_TYPE
         case _:
             return None
 
 
 def assert_healing(ft_mode: FTTestMode, *, injector: FaultInjectorHandle, dump_dir: str) -> None:
-    assert_min_soak_injections(injector.num_successful_injections, context=f"{TEST_NAME} {ft_mode.ft_components}")
+    witness = injector.recovery_witness
+    event_dir = Path(dump_dir) / "events"
 
     if "train" in ft_mode.ft_components:
         assert_soak_reconfigure_events(
-            Path(dump_dir) / "events",
-            num_successful_injections=injector.num_successful_injections,
+            event_dir, num_successful_injections=witness.num_injections(cell_type=ACTOR_CELL_TYPE)
         )
+        assert_every_trainer_injection_healed(injector, event_dir=event_dir)
 
     if "rollout" in ft_mode.ft_components:
+        assert_min_soak_injections(
+            witness.num_injections(cell_type=ROLLOUT_CELL_TYPE), context=f"{TEST_NAME} rollout cells"
+        )
         assert_every_rollout_injection_recovered(injector)
+
+
+def assert_every_trainer_injection_healed(injector: FaultInjectorHandle, *, event_dir: Path) -> None:
+    injected: Counter[int] = Counter(
+        parse_cell_id(name).cell_index
+        for name in injector.recovery_witness.injected_cell_names(cell_type=ACTOR_CELL_TYPE)
+    )
+    healed: Counter[int] = Counter(
+        cell_index for event in load_reconfigure_events(event_dir) for cell_index in event.healed_cell_indices
+    )
+    debt: Counter[int] = injected - healed
+
+    assert not debt, (
+        f"Trainer recovery witness failed: cell index -> accepted injection(s) never healed {dict(debt)} when "
+        f"training ended (injected {dict(injected)}, healed {dict(healed)} across the events in {event_dir})"
+    )
+
+    print(
+        f"Trainer recovery witness assertion passed: every one of {sum(injected.values())} accepted injection(s) "
+        f"is paired with a healing of the same cell ({dict(healed)})"
+    )
 
 
 def assert_every_rollout_injection_recovered(injector: FaultInjectorHandle) -> None:

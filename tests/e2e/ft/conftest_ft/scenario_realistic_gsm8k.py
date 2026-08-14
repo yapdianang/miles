@@ -10,6 +10,7 @@ import typer
 
 from tests.e2e.ft.conftest_ft.app import resolve_dump_dir
 from tests.e2e.ft.conftest_ft.fault_injection import (
+    ACTOR_CELL_TYPE,
     API_SERVER_PORT,
     MEAN_INTERVAL_SECONDS,
     create_cell_fault_forms,
@@ -67,7 +68,7 @@ def run_ci(
         base_url=base_url,
         seed=seed,
         mean_interval_seconds=mean_interval,
-        cell_type="actor",
+        cell_type=ACTOR_CELL_TYPE,
         cell_fault_forms=create_cell_fault_forms(base_url=base_url, config=config),
     )
 
