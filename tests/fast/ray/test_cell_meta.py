@@ -12,6 +12,7 @@ from tests.fast.utils.workers.worker_provider.kubernetes.core.test_pod_view impo
 
 from miles.ray import wiring
 from miles.ray.specs import train as specs_train
+from miles.ray.specs.inference import POOL_CATEGORY_INFERENCE_ENGINE
 from miles.ray.specs.train import compute_trainer_pool_id, specs_trainer
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.builder import build_values
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc import LaunchPlan
@@ -71,6 +72,7 @@ def engine_spec(*, num_cells: int = 2, gpu_offset: int = 0) -> CommandWorkerSpec
     )
     return CommandWorkerSpec(
         name=ENGINE_POOL_ID,
+        category=POOL_CATEGORY_INFERENCE_ENGINE,
         port_infos=[PortInfo(name="primary", static_port=8000)],
         env_var=lambda context: {},
         scheduling=scheduling,
@@ -79,7 +81,7 @@ def engine_spec(*, num_cells: int = 2, gpu_offset: int = 0) -> CommandWorkerSpec
             model_id="qwen3-4b",
             worker_type="decode",
             num_gpus_per_engine=GPUS_PER_NODE,
-            gpu_offset=gpu_offset,
+            gpu_offset=gpu_offset + context.cell_index * scheduling.num_workers_per_cell * GPUS_PER_NODE,
             sglang_api_key=None,
             needs_offload=False,
             update_weights=True,
@@ -120,7 +122,7 @@ def observed_meta(
         candidate
         for section in ("inferenceEngines", "trainerEngines")
         for candidate in values["run"][section]
-        if candidate["pool_id"] == pool_id
+        if (candidate.get("poolId") or candidate["name"]) == pool_id
     )
 
     pods = [
@@ -128,7 +130,7 @@ def observed_meta(
             name=f"{pool_id}-{cell_id_suffix}-{worker_index}",
             pool_id=pool_id,
             cell_id_suffix=str(cell_id_suffix),
-            pod_index=str(worker_index),
+            pod_in_cell_index=str(worker_index),
             annotations={f"miles.radixark.io/meta-{key}": value for key, value in entry.get("meta", {}).items()},
         )
         for worker_index in range(entry.get("size", 1))
@@ -210,11 +212,14 @@ class TestWhatATrainerCellReports:
         assert indexed_meta_keys(TRAIN_GROUP, attribute="meta") <= set(meta)
 
     def test_carries_the_same_facts_for_every_cell_of_the_pool(self):
-        """Cells of one indep-dp pool_id are told apart by their id, so their meta may agree."""
+        """Cells of one indep-dp pool_id share every fact but the index that tells them apart."""
         first = observed_meta(pool_id=TRAINER_POOL_ID, cell_id_suffix=0, trainer_cells=2)
         second = observed_meta(pool_id=TRAINER_POOL_ID, cell_id_suffix=1, trainer_cells=2)
 
-        assert first == second
+        assert (first["cell_index"], second["cell_index"]) == (0, 1)
+        assert {k: v for k, v in first.items() if k != "cell_index"} == {
+            k: v for k, v in second.items() if k != "cell_index"
+        }
 
     def test_reports_the_role_the_spec_was_built_for(self):
         """A critic pool_id observes the same way, and the role is how a consumer tells the two apart."""
