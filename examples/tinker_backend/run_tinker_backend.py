@@ -75,10 +75,7 @@ def _serve(args: ScriptArgs, service: bool):
     print(f"[run] tinker backend ({mode}): {args.actor_num_gpus} train + {args.rollout_num_gpus} rollout GPUs")
 
     ckpt_args = f"--hf-checkpoint {args.hf_checkpoint} --megatron-to-hf-mode bridge "
-    lora_args = (
-        f"--lora-rank {args.lora_rank} --lora-alpha {args.lora_alpha} "
-        f'--lora-dropout 0.0 --target-modules "{args.target_modules}" '
-    )
+    lora_args = f'--lora-rank {args.lora_rank} --lora-alpha {args.lora_alpha} --lora-dropout 0.0 --target-modules "{args.target_modules}" '
     tinker_args = f"--tinker-backend --multi-lora-n-adapters {args.n_adapters} --multi-lora-idle-poll-s 5 "
     if service:
         tinker_args += f"--multi-lora-api-port {args.api_port} "
@@ -90,49 +87,22 @@ def _serve(args: ScriptArgs, service: bool):
     # in_place pause + upsert push: adapters publish without unloading.
     sync_args = "--pause-generation-mode in_place "
 
-    rollout_args = (
-        f"--rollout-batch-size {args.rollout_batch_size} "
-        f"--n-samples-per-prompt {args.n_samples_per_prompt} "
-        f"--global-batch-size {args.global_batch_size} "
-        "--num-rollout 1000000 "
-    )
+    rollout_args = f"--rollout-batch-size {args.rollout_batch_size} --n-samples-per-prompt {args.n_samples_per_prompt} --global-batch-size {args.global_batch_size} --num-rollout 1000000 "
 
     optimizer_args = "--optimizer adam --lr 1e-4 --lr-decay-style constant "
 
-    dynamic_batch_args = (
-        f"--use-dynamic-batch-size --max-tokens-per-gpu {args.max_tokens_per_gpu} "
-        if args.use_dynamic_batch_size
-        else ""
-    )
-    perf_args = (
-        f"--tensor-model-parallel-size {args.tp} --sequence-parallel "
-        "--pipeline-model-parallel-size 1 --context-parallel-size 1 "
-        "--expert-model-parallel-size 1 --expert-tensor-parallel-size 1 "
-        f"{dynamic_batch_args}"
-    )
+    dynamic_batch_args = f"--use-dynamic-batch-size --max-tokens-per-gpu {args.max_tokens_per_gpu} " if args.use_dynamic_batch_size else ""
+    perf_args = f"--tensor-model-parallel-size {args.tp} --sequence-parallel --pipeline-model-parallel-size 1 --context-parallel-size 1 --expert-model-parallel-size 1 --expert-tensor-parallel-size 1 {dynamic_batch_args}"
 
-    sglang_args = (
-        "--rollout-num-gpus-per-engine 1 "
-        f"--sglang-mem-fraction-static {args.sglang_mem_fraction_static} "
-    )
-    topology_args = (
-        f"--actor-num-nodes 1 --actor-num-gpus-per-node {args.actor_num_gpus} "
-        f"--rollout-num-gpus {args.rollout_num_gpus} "
-    )
+    sglang_args = f"--rollout-num-gpus-per-engine 1 --sglang-mem-fraction-static {args.sglang_mem_fraction_static} "
+    topology_args = f"--actor-num-nodes 1 --actor-num-gpus-per-node {args.actor_num_gpus} --rollout-num-gpus {args.rollout_num_gpus} "
     # Tinker checkpoints move only through save_state operations, but megatron
     # arg validation requires a save interval whenever --save is set.
     save_args = f"--save {args.save_dir} --save-interval 1000000 "
-    misc_args = (
-        "--attention-dropout 0.0 --hidden-dropout 0.0 --accumulate-allreduce-grads-in-fp32 "
-        "--attention-softmax-in-fp32 --attention-backend flash "
-    )
+    misc_args = "--attention-dropout 0.0 --hidden-dropout 0.0 --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 --attention-backend flash "
     wandb_args = U.get_default_wandb_args(__file__, run_id=args.run_id) if args.enable_wandb else ""
 
-    train_args = (
-        f"{ckpt_args} {lora_args} {tinker_args} {sync_args} {rollout_args} "
-        f"{optimizer_args} {perf_args} {sglang_args} {topology_args} {save_args} {misc_args} "
-        f"{wandb_args} {args.extra_args} "
-    )
+    train_args = f"{ckpt_args} {lora_args} {tinker_args} {sync_args} {rollout_args} {optimizer_args} {perf_args} {sglang_args} {topology_args} {save_args} {misc_args} {wandb_args} {args.extra_args} "
 
     U.execute_train(
         train_args=train_args,
@@ -141,10 +111,6 @@ def _serve(args: ScriptArgs, service: bool):
         megatron_model_type=args.megatron_model_type,
         train_script="train_tinker_backend.py",
         megatron_path=args.megatron_path,
-        extra_env_vars={
-            # TinkerRolloutFn is class-based: it needs the experimental rollout API.
-            "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1",
-        },
     )
 
 

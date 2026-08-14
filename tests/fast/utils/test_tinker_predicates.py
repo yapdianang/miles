@@ -71,8 +71,12 @@ class TestValidationClosesTheGap:
         with pytest.raises(AssertionError, match="--multi-lora-n-adapters"):
             self._validate(_args(True, 0))
 
-    def test_predicates_agree_on_every_validated_config(self, monkeypatch):
-        monkeypatch.setenv("MILES_EXPERIMENTAL_ROLLOUT_REFACTOR", "1")
+    def test_tinker_rejects_legacy_rollout(self, monkeypatch):
+        monkeypatch.setenv("MILES_USE_LEGACY_ROLLOUT_V1", "1")
+        with pytest.raises(AssertionError, match="class-based rollout API"):
+            self._validate(_full_args(True, 4))
+
+    def test_predicates_agree_on_every_validated_config(self):
         for tinker, n in [(True, 4), (True, 0), (False, 4), (False, 0)]:
             args = _full_args(tinker, n)
             try:
