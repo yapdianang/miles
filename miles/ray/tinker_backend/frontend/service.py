@@ -143,7 +143,10 @@ class TinkerFrontend:
     def capabilities(self) -> dict:
         info = self.backend.service_info()
         model = {"model_name": info.get("base_model"), "max_context_length": None}
-        return {"supported_models": [model]}
+        return {
+            "supported_models": [model],
+            "supported_loss_fns": info.get("supported_loss_fns", []),
+        }
 
     def create_session(self, request: wire.CreateSessionRequest) -> dict:
         self._check_sdk_version(request.sdk_version)
