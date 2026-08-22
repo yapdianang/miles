@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from shlex import quote
 
 import typer
 
@@ -18,14 +19,18 @@ class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = U.create_run_id()
 
     hf_checkpoint: str | None = None
+    tinker_base_model: str = "Qwen/Qwen3-4B"
+    megatron_model_type: str = "qwen3-4B"
     model_dir: str = "/root/models"
     save_dir: str = "/tmp/multi_lora_operations"
     megatron_path: str = "/root/Megatron-LM"
 
     # Disaggregated split (the operation backend forbids colocate).
     num_gpus_per_node: int = 8
-    actor_num_gpus: int = 4
+    actor_num_nodes: int = 1
+    actor_num_gpus_per_node: int = 4
     rollout_num_gpus: int = 4
+    rollout_num_gpus_per_engine: int = 1
     tp: int = 2
 
     # Deployment-wide LoRA slot constraints.
@@ -36,6 +41,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     # Soft coalescing target for one train call (whole client batches only).
     backend_batch_size: int = 32
+    max_tokens_per_gpu: int = 9216
+    sglang_mem_fraction_static: float = 0.8
 
     api_port: int = 8068
     enable_wandb: bool = False
@@ -57,7 +64,8 @@ def prepare(args: ScriptArgs):
 def _serve(args: ScriptArgs):
     print(
         f"[run] Multi-LoRA operations (service): "
-        f"{args.actor_num_gpus} train + {args.rollout_num_gpus} rollout GPUs"
+        f"{args.actor_num_nodes * args.actor_num_gpus_per_node} train + "
+        f"{args.rollout_num_gpus} rollout GPUs"
     )
 
     ckpt_args = f"--hf-checkpoint {args.hf_checkpoint} --megatron-to-hf-mode bridge "
@@ -66,7 +74,8 @@ def _serve(args: ScriptArgs):
         f'--lora-dropout 0.0 --target-modules "{args.backend_target_modules}" '
     )
     tinker_args = (
-        f"--tinker-backend --multi-lora-n-adapters {args.max_adapters} "
+        f"--tinker-backend --tinker-base-model {quote(args.tinker_base_model)} "
+        f"--multi-lora-n-adapters {args.max_adapters} "
         f"--multi-lora-idle-poll-s 5 --multi-lora-api-port {args.api_port} "
     )
 
@@ -85,12 +94,16 @@ def _serve(args: ScriptArgs):
         f"--tensor-model-parallel-size {args.tp} --sequence-parallel "
         "--pipeline-model-parallel-size 1 --context-parallel-size 1 "
         "--expert-model-parallel-size 1 --expert-tensor-parallel-size 1 "
-        "--use-dynamic-batch-size --max-tokens-per-gpu 9216 "
+        f"--use-dynamic-batch-size --max-tokens-per-gpu {args.max_tokens_per_gpu} "
     )
 
-    sglang_args = "--rollout-num-gpus-per-engine 1 --sglang-mem-fraction-static 0.8 "
+    sglang_args = (
+        f"--rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine} "
+        f"--sglang-mem-fraction-static {args.sglang_mem_fraction_static} "
+    )
     topology_args = (
-        f"--actor-num-nodes 1 --actor-num-gpus-per-node {args.actor_num_gpus} "
+        f"--actor-num-nodes {args.actor_num_nodes} "
+        f"--actor-num-gpus-per-node {args.actor_num_gpus_per_node} "
         f"--rollout-num-gpus {args.rollout_num_gpus} "
     )
     # Tinker checkpoints move only through save_state operations, but megatron
@@ -112,7 +125,7 @@ def _serve(args: ScriptArgs):
         train_args=train_args,
         config=args,
         num_gpus_per_node=args.num_gpus_per_node,
-        megatron_model_type="qwen3-4B",
+        megatron_model_type=args.megatron_model_type,
         train_script="train_multi_lora_operations.py",
         megatron_path=args.megatron_path,
     )

@@ -401,8 +401,9 @@ class TestFailTinkerBatch:
 
 def test_service_info_reports_the_v1_matrix():
     backend = ready_backend()
+    backend.args.tinker_base_model = "Qwen/Qwen3.8-27B"
     info = backend.service_info()
-    assert info["base_model"] == "Qwen/Qwen3-0.6B"
+    assert info["base_model"] == "Qwen/Qwen3.8-27B"
     assert info["lora_rank_max"] == 32 and info["n_adapters"] == 4
     assert info["occupied_slots"] == [0] and info["ready_adapters"] == ["X"]
     assert info["supported_loss_fns"] == ["cross_entropy", "importance_sampling", "ppo", "gspo"]

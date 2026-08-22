@@ -461,7 +461,7 @@ class MultiLoraOperationBackend:
         self.sweep_operation_timeouts()
         args = self.args
         return dict(
-            base_model=getattr(args, "hf_checkpoint", None),
+            base_model=getattr(args, "tinker_base_model", None) or getattr(args, "hf_checkpoint", None),
             lora_rank_max=getattr(args, "lora_rank", None),
             n_adapters=getattr(args, "multi_lora_n_adapters", None),
             occupied_slots=self.registry.slot_pool.occupied_slot_ids(),
