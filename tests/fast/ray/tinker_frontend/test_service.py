@@ -604,8 +604,8 @@ class TestLifecycle:
     def test_unsupported_sdk_version_is_rejected_at_bootstrap(self):
         async def scenario(stack):
             for request in (
-                lambda: stack.frontend.client_config(wire.ClientConfigRequest(sdk_version="0.25.0")),
-                lambda: stack.frontend.create_session(wire.CreateSessionRequest(sdk_version="0.25.0")),
+                lambda: stack.frontend.client_config(wire.ClientConfigRequest(sdk_version="0.26.0")),
+                lambda: stack.frontend.create_session(wire.CreateSessionRequest(sdk_version="0.26.0")),
                 lambda: stack.frontend.create_session(wire.CreateSessionRequest()),  # unknown client
             ):
                 with pytest.raises(ApiError) as excinfo:

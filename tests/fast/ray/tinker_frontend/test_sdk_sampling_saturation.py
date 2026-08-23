@@ -12,7 +12,7 @@ never retries. Now the frontend 429s the overflow BEFORE the request
 consumes its seq identity, the SDK retries on the same seq ids with backoff,
 and all 128 complete exactly once inside the configured bound.
 
-Skipped when the ``tinker`` wheel is not installed; install tinker==0.24.1
+Skipped when the ``tinker`` wheel is not installed; install tinker==0.25.0
 (pinned in tests/ci/requirements-ci-cpu.txt) to run."""
 
 from tests.ci.ci_register import register_cpu_ci

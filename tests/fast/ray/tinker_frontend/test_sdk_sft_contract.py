@@ -1,4 +1,4 @@
-"""SFT-only contract probes: the REAL, unmodified ``tinker==0.24.1`` SDK
+"""SFT-only contract probes: the real, unmodified ``tinker==0.25.0`` SDK
 drives the live HTTP stack through the teacher-forced cross-entropy path —
 accumulation windows, prompt masking, checkpoint gating, rejected-Adam
 recovery — plus the two verified pre-HTTP SDK failure modes and what the

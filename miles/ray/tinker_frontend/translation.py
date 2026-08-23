@@ -24,6 +24,8 @@ terminal FAILED(user) operation so the client's ordinal is still consumed.
 
 import math
 
+import numpy as np
+
 from miles.ray.tinker_frontend import wire
 
 SUPPORTED_LOSS_FNS = ("cross_entropy", "importance_sampling", "ppo", "gspo")
@@ -52,6 +54,140 @@ _ACTIVE_CHANNEL = {
 
 class UserInputError(ValueError):
     """Typed client-payload rejection (never a server fault)."""
+
+
+def _decode_proto_tensor(tensor, public_pb) -> wire.TensorData:
+    dtype_by_proto = {
+        public_pb.DTYPE_FLOAT32: ("float32", np.dtype(np.float32)),
+        public_pb.DTYPE_INT64: ("int64", np.dtype(np.int64)),
+    }
+    dtype_spec = dtype_by_proto.get(tensor.dtype)
+    if dtype_spec is None:
+        raise UserInputError(f"unsupported protobuf tensor dtype {tensor.dtype}")
+    dtype_name, numpy_dtype = dtype_spec
+    encoding = tensor.WhichOneof("encoding")
+    if encoding == "dense":
+        data = np.frombuffer(tensor.dense, dtype=numpy_dtype).tolist()
+        crow_indices = col_indices = None
+    elif encoding == "sparse_csr":
+        data = np.frombuffer(tensor.sparse_csr.values, dtype=numpy_dtype).tolist()
+        crow_indices = np.frombuffer(tensor.sparse_csr.crow_indices, dtype=np.int64).tolist()
+        col_indices = np.frombuffer(tensor.sparse_csr.col_indices, dtype=np.int64).tolist()
+    else:
+        raise UserInputError("protobuf tensor must contain dense or sparse_csr data")
+    return wire.TensorData(
+        data=data,
+        dtype=dtype_name,
+        shape=list(tensor.shape) or None,
+        sparse_crow_indices=crow_indices,
+        sparse_col_indices=col_indices,
+    )
+
+
+def decode_forward_backward_proto(body: bytes) -> tuple[wire.ForwardBackwardRequest | wire.ForwardRequest, bool]:
+    from google.protobuf.message import DecodeError
+    from tinker.proto import tinker_public_pb2 as public_pb
+
+    request = public_pb.ForwardBackwardRequest()
+    try:
+        request.ParseFromString(body)
+    except DecodeError as exc:
+        raise UserInputError(f"invalid forward_backward protobuf: {exc}") from exc
+
+    data = []
+    for datum in request.data:
+        chunks = []
+        for chunk in datum.model_input:
+            chunk_type = chunk.WhichOneof("chunk")
+            if chunk_type != "encoded_text":
+                raise UserInputError(f"protobuf model_input chunk type '{chunk_type}' is not supported in v1")
+            tokens = np.frombuffer(chunk.encoded_text.tokens, dtype=np.int32).tolist()
+            chunks.append(wire.ModelInputChunk(type="encoded_text", tokens=tokens))
+        data.append(
+            wire.Datum(
+                model_input=wire.ModelInput(chunks=chunks),
+                loss_fn_inputs={
+                    name: _decode_proto_tensor(tensor, public_pb) for name, tensor in datum.loss_fn_inputs.items()
+                },
+            )
+        )
+    fb_input = wire.ForwardBackwardInput(
+        data=data,
+        loss_fn=request.loss_fn,
+        loss_fn_config=dict(request.loss_fn_config) or None,
+    )
+    if request.forward_only:
+        return (
+            wire.ForwardRequest(forward_input=fb_input, model_id=request.model_id, seq_id=request.seq_id),
+            True,
+        )
+    return (
+        wire.ForwardBackwardRequest(
+            forward_backward_input=fb_input,
+            model_id=request.model_id,
+            seq_id=request.seq_id,
+        ),
+        False,
+    )
+
+
+def _encode_batched_tensor(tensors: list[dict], public_pb):
+    dtype_by_name = {
+        "float32": (public_pb.DTYPE_FLOAT32, np.dtype(np.float32)),
+        "int64": (public_pb.DTYPE_INT64, np.dtype(np.int64)),
+    }
+    dtype_name = tensors[0]["dtype"]
+    dtype_spec = dtype_by_name.get(dtype_name)
+    if dtype_spec is None or any(tensor["dtype"] != dtype_name for tensor in tensors):
+        raise RuntimeError("forward_backward result tensors must use one supported dtype per field")
+    proto_dtype, numpy_dtype = dtype_spec
+    arrays = [np.asarray(tensor["data"], dtype=numpy_dtype) for tensor in tensors]
+    trailing_shape = list(tensors[0].get("shape") or [])[1:]
+    if any(list(tensor.get("shape") or [])[1:] != trailing_shape for tensor in tensors):
+        raise RuntimeError("forward_backward result tensors must have one trailing shape per field")
+
+    batched = public_pb.BatchedTensor(dtype=proto_dtype, trailing_shape=trailing_shape)
+    batched.data = b"".join(array.tobytes() for array in arrays)
+    byte_offsets = np.asarray([0, *np.cumsum([array.nbytes for array in arrays])], dtype=np.int64)
+    batched.offsets = byte_offsets.tobytes()
+    return batched
+
+
+def encode_future_response_proto(body: dict) -> bytes | None:
+    from tinker.proto import tinker_public_pb2 as public_pb
+
+    if body.get("type") == "forward_backward":
+        response = public_pb.ForwardBackwardOutput(loss_fn_output_type=body["loss_fn_output_type"])
+        response.metrics.update({name: float(value) for name, value in body.get("metrics", {}).items()})
+        outputs = body.get("loss_fn_outputs", [])
+        if outputs:
+            fields = set(outputs[0])
+            if any(set(output) != fields for output in outputs):
+                raise RuntimeError("forward_backward result rows must contain the same fields")
+            record = response.loss_fn_outputs.add(type_tag=body["loss_fn_output_type"], num_datums=len(outputs))
+            for name in fields:
+                record.fields[name].CopyFrom(_encode_batched_tensor([output[name] for output in outputs], public_pb))
+        return response.SerializeToString()
+
+    if body.get("type") == "sample":
+        response = public_pb.SampleResponse(prompt_cache_hit_tokens=body.get("prompt_cache_hit_tokens", 0))
+        stop_reason = {
+            "stop": public_pb.STOP_REASON_STOP,
+            "length": public_pb.STOP_REASON_LENGTH,
+        }
+        for sequence in body["sequences"]:
+            sequence_proto = response.sequences.add(
+                stop_reason=stop_reason[sequence["stop_reason"]],
+                tokens=np.asarray(sequence["tokens"], dtype=np.int32).tobytes(),
+            )
+            if sequence.get("logprobs") is not None:
+                sequence_proto.logprobs = np.asarray(sequence["logprobs"], dtype=np.float32).tobytes()
+        if body.get("prompt_logprobs") is not None:
+            prompt_logprobs = [np.nan if value is None else value for value in body["prompt_logprobs"]]
+            response.prompt_logprobs = np.asarray(prompt_logprobs, dtype=np.float32).tobytes()
+        return response.SerializeToString()
+
+    return None
 
 
 def _decode_1d(name: str, where: str, tensor: wire.TensorData, expect_len: int, integer: bool) -> list:

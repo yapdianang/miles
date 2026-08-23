@@ -1,7 +1,7 @@
 """Wire models of the tinker SDK's REST protocol (server side).
 
-Mirrors the request shapes ``tinker==0.24.1`` actually POSTs (verified from
-the wheel source and captured traffic, not from documentation). Requests are
+Mirrors the JSON request shapes ``tinker==0.24.1`` POSTs and the protobuf
+request shape ``tinker==0.25.0`` POSTs. Requests are
 parsed permissively (``extra="ignore"``) so additive SDK fields never break
 the server; everything the backend relies on is validated explicitly in the
 translation layer. Responses are plain dicts built by the service — the SDK
@@ -13,24 +13,21 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-TINKER_SDK_VERSION_PIN = "0.24.1"
+TINKER_SDK_VERSIONS = ("0.24.1", "0.25.0")
 
-# Flags returned from /api/v1/client/config. They steer the 0.24.1 SDK onto
-# the pure-JSON protocol this frontend implements:
-# - proto_write_fwdbwd=False keeps forward_backward on JSON (the wheel's own
-#   default) and forward on the legacy JSON /api/v1/forward route;
-# - fwd_via_fwdbwd must then also be False (the SDK asserts forward_only
-#   requires the proto path);
-# - parallel_fwdbwd_chunks=True lets the SDK post fwdbwd chunks concurrently,
-#   first chunk last — exactly the out-of-order arrival the backend ledger
-#   gap-buffers by design;
-# - use_pyqwest_transport=False keeps the SDK on the plain httpx transport.
+# Flags returned from /api/v1/client/config. The 0.24.1 SDK uses JSON and
+# ignores the 0.25.0 byte limits. The 0.25.0 SDK uses protobuf and bounds the
+# concurrent request bytes. Both post chunks out of order for the backend's
+# ordinal buffer to reassemble. Plain httpx is the tested transport.
 CLIENT_CONFIG_FLAGS = {
     "pjwt_auth_enabled": False,
     "credential_default_source": "api_key",
     "parallel_fwdbwd_chunks": True,
     "proto_write_fwdbwd": False,
     "proto_compress_fwdbwd": False,
+    "fwdbwd_max_chunk_len": 1024,
+    "fwdbwd_max_chunk_bytes_count": 5_000_000,
+    "fwdbwd_dispatch_bytes_semaphore_size": 50_000_000,
     "fwd_via_fwdbwd": False,
     "use_pyqwest_transport": False,
     "create_model_via_load_weights": False,

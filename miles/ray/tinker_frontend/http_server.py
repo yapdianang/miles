@@ -1,4 +1,4 @@
-"""HTTP surface for the tinker frontend: /api/v1 as ``tinker==0.24.1`` speaks it.
+"""HTTP surface for the tinker frontend: /api/v1 as the supported SDKs speak it.
 
 Extends the controller's registration server (selected via
 ``--tinker-frontend`` / ``--multi-lora-http-server-path``), so the SDK
@@ -11,7 +11,7 @@ caller. When a key is configured, every route except the health probes
 additionally requires it; a non-loopback bind without a key refuses to
 start (fail closed).
 
-Error mapping (what the 0.24.1 SDK does with each status, observed):
+Error mapping (observed with the supported SDKs):
 - 429 + Retry-After  <- backend backpressure (SDK retries with backoff)
 - 422                <- same-identity/different-payload conflicts (fatal to
                         the SDK; 409 must never be used — the SDK retries it)
@@ -31,11 +31,11 @@ import os
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from miles.ray.multi_lora.http_server import AdapterRunControlServer
 from miles.ray.multi_lora.operations import OperationBackpressure
-from miles.ray.tinker_frontend import wire
+from miles.ray.tinker_frontend import translation, wire
 from miles.ray.tinker_frontend.service import ApiError, TinkerFrontend
 
 AUTH_EXEMPT_PATHS = ("/health", "/api/v1/healthz")
@@ -182,8 +182,15 @@ class TinkerFrontendHTTPServer(AdapterRunControlServer):
 
         # -------- training --------
         @app.post("/api/v1/forward_backward")
-        async def forward_backward(request: wire.ForwardBackwardRequest) -> dict:
-            return frontend.forward_backward(request)
+        async def forward_backward(request: Request) -> dict:
+            content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+            body = await request.body()
+            if content_type == "application/x-protobuf":
+                decoded, forward_only = translation.decode_forward_backward_proto(body)
+                return frontend.forward(decoded) if forward_only else frontend.forward_backward(decoded)
+            if content_type == "application/json":
+                return frontend.forward_backward(wire.ForwardBackwardRequest.model_validate_json(body))
+            raise ApiError(415, f"unsupported forward_backward content type '{content_type}'")
 
         @app.post("/api/v1/forward")
         async def forward(request: wire.ForwardRequest) -> dict:
@@ -225,5 +232,10 @@ class TinkerFrontendHTTPServer(AdapterRunControlServer):
 
         # -------- futures --------
         @app.post("/api/v1/retrieve_future")
-        async def retrieve_future(request: wire.FutureRetrieveRequest) -> dict:
-            return await frontend.retrieve_future(request)
+        async def retrieve_future(request: wire.FutureRetrieveRequest, http_request: Request):
+            body = await frontend.retrieve_future(request)
+            if "application/x-protobuf" in http_request.headers.get("accept", ""):
+                encoded = translation.encode_future_response_proto(body)
+                if encoded is not None:
+                    return Response(content=encoded, media_type="application/x-protobuf")
+            return body

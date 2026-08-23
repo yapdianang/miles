@@ -1,6 +1,6 @@
 """The tinker frontend service: official SDK verbs -> backend operations.
 
-Request -> ordinal mapping (the D5 note in operations.py): the 0.24.1 SDK
+Request -> ordinal mapping (the D5 note in operations.py): the supported SDKs
 holds one per-model counter — every training verb (each forward_backward
 chunk, forward chunk, optim_step, save/load, sampler publish) consumes one
 ``seq_id``, consecutive from 1 — which is exactly the backend ledger's
@@ -370,15 +370,11 @@ class TinkerFrontend:
         return {"status": "ok"}
 
     def _check_sdk_version(self, sdk_version: str) -> None:
-        # Exact pin: this frontend mirrors the request shapes tinker==0.24.1
-        # actually POSTs. A different patch of 0.24.x is untested wire surface
-        # (and 0.25+ switches forward_backward to protobuf mid-run) — reject
-        # at bootstrap, where the version travels with the request.
-        if sdk_version != wire.TINKER_SDK_VERSION_PIN:
+        if sdk_version not in wire.TINKER_SDK_VERSIONS:
+            versions = ", ".join(f"tinker=={version}" for version in wire.TINKER_SDK_VERSIONS)
             raise ApiError(
                 400,
-                f"unsupported tinker SDK version '{sdk_version}': this deployment serves exactly "
-                f"tinker=={wire.TINKER_SDK_VERSION_PIN}. Pin tinker=={wire.TINKER_SDK_VERSION_PIN}.",
+                f"unsupported tinker SDK version '{sdk_version}': this deployment supports {versions}.",
             )
 
     def client_config(self, request: wire.ClientConfigRequest) -> dict:

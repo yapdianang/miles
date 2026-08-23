@@ -142,19 +142,15 @@ the slot's gradient sum), terminal-fails `FAILED(user)`, and moves neither
 the step clock nor the serving version. The consumed poison resets the
 window; resubmit the batch and step again.
 
-## Tinker SDK frontend (tinker==0.24.1 JSON subset)
+## Tinker SDK frontend
 
 With `--tinker-frontend` the controller's HTTP server also speaks the REST
-protocol of the official [`tinker`](https://pypi.org/project/tinker/) SDK —
-exactly the **`tinker==0.24.1` JSON core-loop subset** (wheel source and
-captured traffic; pure JSON, no protobuf: `/api/v1/client/config` pins the
-SDK to its own default JSON path). Other SDK versions are rejected at
-bootstrap (`/client/config` and `create_session` fail fast on the reported
-`sdk_version`): 0.25+ switches `forward_backward` to protobuf, and the
-current cookbook's canonical final checkpoint needs named sampler
-checkpoints — neither is served here, so this is NOT "current
-Tinker/cookbook compatible". An unmodified 0.24.1 client drives training
-and sampling:
+protocol of the official [`tinker`](https://pypi.org/project/tinker/) SDK.
+It supports the `tinker==0.24.1` JSON requests and the `tinker==0.25.0`
+protobuf requests and responses. The 0.25 client bounds concurrent
+forward/backward upload bytes. Other SDK versions fail during startup.
+Named sampler checkpoints are not supported. An unmodified supported client
+drives training and sampling:
 
 ```python
 import tinker
@@ -192,7 +188,7 @@ and delivery is a documented residual race). Frontend rejections on a spent
 consumed — bounded by the same unacked-results budget as every other record
 (429 past it).
 
-Frontend-level v1 rejections (beyond the backend matrix): non-0.24.x SDK
+Frontend-level v1 rejections (beyond the backend matrix): unsupported SDK
 versions, LoRA `seed` and per-module `train_*` flags (deployment-wide),
 weights-only restore (`load_state` / `create_training_client_from_state` —
 the backend restores the full training state; use the `_with_optimizer`

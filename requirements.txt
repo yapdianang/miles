@@ -25,6 +25,7 @@ ring_flash_attn; platform_system == "Linux"
 safetensors>=0.8.0  # samples-reply wire codec; malformed-payload exception contract validated on 0.8.0
 sglang-router>=0.2.3
 tensorboard
+tinker==0.25.0  # official protobuf request and response schema for the Tinker frontend
 torchft-nightly==2026.4.3; platform_system == "Linux" and platform_machine == "x86_64"
 tqdm
 transformers==5.12.1  # Required by HF-native weight conversion; also avoids SGLang's qwen3_asr collision in 5.13.

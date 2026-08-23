@@ -1,5 +1,5 @@
-"""Contract tests: the REAL, unmodified ``tinker`` SDK (pinned wire behavior
-of 0.24.1) drives the frontend over a live localhost HTTP server.
+"""Contract tests: the real, unmodified ``tinker==0.25.0`` SDK drives the
+frontend over a live localhost HTTP server.
 
 The stack is the production one minus GPUs and Ray: TinkerFrontendHTTPServer
 -> TinkerFrontend -> real MultiLoraOperationBackend (registry + ledger + validation),
@@ -9,7 +9,7 @@ below its public surface (the one exception: models.unload is a low-level
 ``AsyncTinker`` resource because no high-level client exposes it).
 
 Skipped when the ``tinker`` wheel is not installed (hosted CPU CI); install
-``tinker==0.24.1`` to run.
+``tinker==0.25.0`` to run.
 """
 
 from tests.ci.ci_register import register_cpu_ci
@@ -141,7 +141,7 @@ class TestTrainingChain:
         assert optim.metrics["grad_norm"] == pytest.approx(0.125)
 
         # After the optim step the weights moved; forward sees the new step
-        # and (JSON legacy /forward path) recomputed metrics come back.
+        # and recomputed metrics come back.
         forward = client.forward([make_datum([1, 2, 3])], "cross_entropy").result()
         assert forward.loss_fn_outputs[0]["logprobs"].tolist() == pytest.approx([-0.51] * 3)
         assert forward.metrics["loss:sum"] == pytest.approx(1.53)
@@ -316,7 +316,7 @@ class TestSampling:
         sent = stack.router.requests[-1]
         assert sent["input_ids"] == prompt
         assert sent["logprob_start_len"] == 0 and sent["return_logprob"] is True
-        # The 0.24.1 SDK's compute_logprobs wire form is a 1-sample, 1-token generation.
+        # The SDK's compute_logprobs wire form is a 1-sample, 1-token generation.
         assert sent["sampling_params"]["max_new_tokens"] == 1
 
     def test_sample_with_prompt_logprobs_returns_both(self, service_client):
