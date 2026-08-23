@@ -91,6 +91,7 @@ class TestExecuteControls:
         results = harness.run([control_op("save_weights_for_sampler")])
         assert results["op1"] == dict(ok=True, deferred="publish")
         assert harness.pending == {"X"}
+        assert harness.loaded["X"].version == 1
 
     def test_non_resident_adapter_is_a_server_error(self, harness):
         results = harness.run([control_op("save_state", name="ghost", slot=2)])

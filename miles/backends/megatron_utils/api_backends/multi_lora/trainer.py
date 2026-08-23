@@ -240,6 +240,8 @@ def _execute_state_op(op: dict, lease, args, model, optimizer, loaded_adapters, 
     run = dataclass_replace(run, step=op.get("step", run.step), version=op.get("serving_version", run.version))
 
     if kind == "save_weights_for_sampler":
+        # The weight updater reads this view after control execution to name the next serving version.
+        loaded_adapters[name] = run
         pending_push.add(name)
         return dict(ok=True, deferred="publish")
 
