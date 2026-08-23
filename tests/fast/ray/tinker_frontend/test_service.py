@@ -95,6 +95,7 @@ def run(scenario, poll_window_s=5.0, **backend_overrides):
             poll_window_s=poll_window_s,
             poll_interval_s=0.002,
             sampling_transport=RouterSamplingTransport(router),
+            sampler_snapshot_limit=getattr(backend.args, "tinker_sampler_snapshot_limit", 1),
         )
         stack = Stack(frontend, driver, router)
         driver_task = asyncio.create_task(driver.run(interval=0.002))
@@ -400,7 +401,7 @@ class TestSampling:
             await self.publish(stack, model_id, seq_id=2, sampling_session_seq_id=1)
             future = stack.frontend.sample(self.sample_request(old))
             body = await stack.retrieve(future["request_id"])
-            assert body["category"] == "user" and "republished" in body["error"]
+            assert body["category"] == "user" and "stale ephemeral sampler" in body["error"]
 
         run(scenario)
 
@@ -427,9 +428,46 @@ class TestSampling:
             stack.frontend.backend.registry.record_weight_update([name])  # republish lands mid-flight
             gate.set()
             body = await stack.retrieve(future["request_id"])
-            assert body["category"] == "user" and "republished while this sample was in flight" in body["error"]
+            assert body["category"] == "user" and "changed while this sample was in flight" in body["error"]
 
         run(scenario)
+
+    def test_retained_sampler_snapshot_survives_republish(self):
+        async def scenario(stack):
+            model_id = await stack.create_model()
+            old = await self.publish(stack, model_id, seq_id=1, sampling_session_seq_id=0)
+
+            gate = asyncio.Event()
+            transport = stack.frontend.sampling_transport
+            original = transport.generate
+
+            async def delayed(payload):
+                await gate.wait()
+                return await original(payload)
+
+            transport.generate = delayed
+            old_future = stack.frontend.sample(self.sample_request(old))
+            await asyncio.sleep(0.02)
+            new = await self.publish(stack, model_id, seq_id=2, sampling_session_seq_id=1)
+            gate.set()
+            old_body = await stack.retrieve(old_future["request_id"])
+            assert old_body["type"] == "sample"
+            assert stack.router.requests[-1]["lora_path"].endswith("_v1")
+
+            transport.generate = original
+            new_future = stack.frontend.sample(self.sample_request(new, seq_id=1))
+            new_body = await stack.retrieve(new_future["request_id"])
+            assert new_body["type"] == "sample"
+            assert stack.router.requests[-1]["lora_path"].endswith("_v2")
+
+            for seq_id in range(3, 6):
+                await self.publish(stack, model_id, seq_id=seq_id, sampling_session_seq_id=seq_id - 1)
+            expired = stack.frontend.sample(self.sample_request(old, seq_id=2))
+            expired_body = await stack.retrieve(expired["request_id"])
+            assert expired_body["category"] == "user"
+            assert "retention window" in expired_body["error"]
+
+        run(scenario, tinker_sampler_snapshot_limit=4)
 
     def test_named_sampler_path_is_a_typed_rejection(self):
         async def scenario(stack):
@@ -438,7 +476,7 @@ class TestSampling:
                 wire.SaveWeightsForSamplerRequest(model_id=model_id, seq_id=1, path="final")
             )
             body = await stack.retrieve(publish["request_id"])
-            assert body["category"] == "user" and "latest-only" in body["error"]
+            assert body["category"] == "user" and "named persistent" in body["error"]
 
         run(scenario)
 

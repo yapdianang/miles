@@ -300,9 +300,15 @@ class DistBucketedWeightUpdateMixin:
                 "likely an incompatible Megatron-Bridge or SGLang version."
             )
 
+        serving_name = getattr(adapter, "serving_name", None) or slot_lora_name(adapter.slot)
+        if getattr(self.args, "tinker_sampler_snapshot_limit", 1) > 1:
+            from miles.ray.multi_lora.identity import serving_lora_name
+
+            serving_name = serving_lora_name(adapter.name, adapter.registration_id, adapter.version + 1)
+
         self._update_multi_lora_weight_implementation(
             accumulated_named_tensors,
-            lora_name=getattr(adapter, "serving_name", None) or slot_lora_name(adapter.slot),
+            lora_name=serving_name,
             lora_config=lora_config,
         )
 

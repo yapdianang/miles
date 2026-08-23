@@ -1928,6 +1928,14 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "set, else discovered from the router's /get_server_info on the first sample",
             )
             parser.add_argument(
+                "--tinker-sampler-snapshot-limit",
+                type=int,
+                default=1,
+                help="Maximum serving versions retained per Tinker LoRA registration. Values above 1 "
+                "keep bounded historical adapters so asynchronous clients can finish in-flight "
+                "trajectories after a newer version is published (default: 1, latest only)",
+            )
+            parser.add_argument(
                 "--tinker-session-idle-ttl",
                 type=float,
                 default=3600.0,

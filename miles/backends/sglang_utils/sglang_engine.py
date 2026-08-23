@@ -765,7 +765,15 @@ def _compute_server_args(
 
     if is_multi_lora_enabled(args):
         kwargs["enable_lora"] = True
-        kwargs["max_loras_per_batch"] = args.multi_lora_n_adapters
+        sampler_snapshot_limit = (
+            getattr(args, "tinker_sampler_snapshot_limit", 1)
+            if getattr(args, "tinker_backend", False)
+            else 1
+        )
+        max_serving_loras = args.multi_lora_n_adapters * sampler_snapshot_limit
+        kwargs["max_loras_per_batch"] = max_serving_loras
+        if sampler_snapshot_limit > 1:
+            kwargs["max_loaded_loras"] = max_serving_loras
         kwargs["max_lora_rank"] = max(getattr(args, "lora_rank", 0), 1)
         kwargs["lora_target_modules"] = convert_target_modules_to_hf(args.target_modules)
     elif lora_rollout_enabled(args):

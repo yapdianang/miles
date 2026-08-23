@@ -76,3 +76,17 @@ class TestSglangOverridePrecedence:
         assert server_args["dtype"] == "float16"
         assert server_args["enable_lora"] is True
         assert server_args["mem_fraction_static"] == 0.7
+
+    def test_tinker_snapshot_limit_sizes_lora_memory(self):
+        args = make_args(
+            lora_rank=8,
+            multi_lora=True,
+            multi_lora_n_adapters=2,
+            tinker_backend=True,
+            tinker_sampler_snapshot_limit=4,
+        )
+
+        server_args = compute(args)
+
+        assert server_args["max_loras_per_batch"] == 8
+        assert server_args["max_loaded_loras"] == 8

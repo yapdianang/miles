@@ -74,6 +74,7 @@ class TinkerFrontendHTTPServer(AdapterRunControlServer):
             # units (the per-client SDK limit of 64 never bounded the sum).
             sampling_max_active_subgenerations=getattr(args, "tinker_sampling_max_active_subgenerations", 64),
             sampling_max_context=resolve_sampling_max_context(args),
+            sampler_snapshot_limit=getattr(args, "tinker_sampler_snapshot_limit", 1),
             session_idle_ttl_s=getattr(args, "tinker_session_idle_ttl", 3600.0),
             future_unpolled_ttl_s=getattr(args, "tinker_future_unpolled_ttl", 900.0),
             future_undelivered_ttl_s=getattr(args, "tinker_future_undelivered_ttl", 3600.0),

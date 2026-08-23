@@ -24,6 +24,9 @@ def validate_tinker_args(args) -> None:
     from miles.utils.environ import use_legacy_rollout_v1
 
     assert getattr(args, "multi_lora_n_adapters", 0) > 0, "--tinker-backend requires --multi-lora-n-adapters > 0"
+    assert getattr(args, "tinker_sampler_snapshot_limit", 1) >= 1, (
+        "--tinker-sampler-snapshot-limit must be at least 1"
+    )
     assert (
         not use_legacy_rollout_v1()
     ), "--tinker-backend needs the class-based rollout API (the default); unset MILES_USE_LEGACY_ROLLOUT_V1"

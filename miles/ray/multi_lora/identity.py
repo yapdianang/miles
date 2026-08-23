@@ -15,9 +15,12 @@ def rid_prefix(adapter_name: str, registration_id: str) -> str:
     return f"{adapter_name}{RID_SEPARATOR}{registration_id}{RID_SEPARATOR}"
 
 
-def serving_lora_name(adapter_name: str, registration_id: str) -> str:
-    """Return the engine-side name for one exact adapter registration."""
-    return f"__miles_adapter_{adapter_name}_{registration_id}"
+def serving_lora_name(
+    adapter_name: str, registration_id: str, serving_version: int | None = None
+) -> str:
+    """Return the engine-side name for one adapter registration and version."""
+    name = f"__miles_adapter_{adapter_name}_{registration_id}"
+    return f"{name}_v{serving_version}" if serving_version is not None else name
 
 
 def cache_extra_key(adapter_name: str, registration_id: str, serving_version: int) -> str:

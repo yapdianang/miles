@@ -360,9 +360,11 @@ operation API in #2273.
 
 The v1 scope in the PR is deliberately narrow: text-only synchronous training,
 one shared base model, shifted 1-D targets, `cross_entropy`, importance-sampling,
-and PPO losses, per-call Adam, and latest-only sampler weights. Multimodal,
-top-K/SDFT targets, CISPO/DRO, asynchronous or pinned-snapshot off-policy
-training, and cross-world-size restore are outside v1.
+and PPO losses, per-call Adam, and bounded ephemeral sampler snapshots. Set
+`--tinker-sampler-snapshot-limit` above 1 when asynchronous clients need
+in-flight trajectories to finish against their original adapter version.
+Multimodal, top-K/SDFT targets, CISPO/DRO, named persistent sampler
+checkpoints, and cross-world-size restore are outside v1.
 
 <Warning>
 This backend is implemented in an open PR, not released on `main`; the PR

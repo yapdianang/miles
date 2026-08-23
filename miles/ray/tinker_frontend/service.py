@@ -180,6 +180,7 @@ class TinkerFrontend:
         sampling_transport: SamplingTransport | None = None,
         sampling_max_active_subgenerations: int = 64,
         sampling_max_context: int | None = None,
+        sampler_snapshot_limit: int = 1,
         session_idle_ttl_s: float = 3600.0,
         future_unpolled_ttl_s: float = 900.0,
         future_undelivered_ttl_s: float = 3600.0,
@@ -203,6 +204,9 @@ class TinkerFrontend:
         self._context_limit_source = "configured" if sampling_max_context is not None else None
         self._context_discovery_task: asyncio.Task | None = None
         self._context_discovery_attempts = 0
+        if sampler_snapshot_limit < 1:
+            raise ValueError("sampler_snapshot_limit must be at least 1")
+        self.sampler_snapshot_limit = sampler_snapshot_limit
         # Orphan reaping TTLs (<= 0 disables that class of reaping).
         self.session_idle_ttl_s = session_idle_ttl_s
         self.future_unpolled_ttl_s = future_unpolled_ttl_s
@@ -578,7 +582,7 @@ class TinkerFrontend:
                 raise UserInputError("the parent session expired; create a new session before publishing a sampler")
             if request.path is not None:
                 raise UserInputError(
-                    "named sampler checkpoints are not supported in v1 (latest-only serving); use "
+                    "named persistent sampler checkpoints are not supported in v1; use "
                     "save_weights_and_get_sampling_client for ephemeral sampling"
                 )
             if request.sampling_session_seq_id is None:
@@ -719,7 +723,7 @@ class TinkerFrontend:
         if request.model_path is not None:
             raise ApiError(
                 400,
-                "sampling from saved checkpoints is not supported in v1 (latest-only serving); use "
+                "sampling from named persistent checkpoints is not supported in v1; use "
                 "save_weights_and_get_sampling_client on the training client, or a base_model session",
             )
         base_model = self._base_model()
@@ -993,11 +997,11 @@ class TinkerFrontend:
                     wire.terminal_failure("sampler weights are no longer live (registration retired)", "user")
                 )
                 return
-            if live["serving_version"] != sampler.serving_version:
+            if not self._sampler_version_is_live(live["serving_version"], sampler.serving_version):
                 record.resolve(
                     wire.terminal_failure(
-                        "stale ephemeral sampler: the model was republished and this backend serves the "
-                        "latest weights only — create a new sampling client after each publish",
+                        "stale ephemeral sampler: its serving version is outside this deployment's "
+                        f"{self.sampler_snapshot_limit}-version retention window",
                         "user",
                     )
                 )
@@ -1032,17 +1036,11 @@ class TinkerFrontend:
             await asyncio.gather(*generation_tasks, return_exceptions=True)
             raise
         if sampler.name is not None and not self._sampler_still_live(sampler):
-            # Re-checked AFTER generation: a republish that landed while
-            # the request was in flight swapped the engine-side weights
-            # under the same serving name (latest-only serving), so the
-            # output cannot be attributed to the pinned version. Fail loud
-            # rather than return cross-version samples. (A publish
-            # committing between this check and delivery remains possible
-            # — the serving identity is versioned, not leased; see README.)
+            # Re-check after generation so retirement or bounded snapshot
+            # eviction cannot race response delivery.
             record.resolve(
                 wire.terminal_failure(
-                    "the model was republished while this sample was in flight; create a new sampling "
-                    "client after each publish and resample",
+                    "the sampler registration or retained serving version changed while this sample was in flight",
                     "user",
                 )
             )
@@ -1088,8 +1086,11 @@ class TinkerFrontend:
         return (
             live is not None
             and live["registration_id"] == sampler.registration_id
-            and live["serving_version"] == sampler.serving_version
+            and self._sampler_version_is_live(live["serving_version"], sampler.serving_version)
         )
+
+    def _sampler_version_is_live(self, current_version: int, sampler_version: int) -> bool:
+        return 0 <= current_version - sampler_version < self.sampler_snapshot_limit
 
     # ---------------- future retrieval ----------------
 
@@ -1211,7 +1212,12 @@ class TinkerFrontend:
                     base_model=model.base_model,
                     name=model.name,
                     registration_id=model.registration_id,
-                    serving_name=result.get("serving_name") or serving_lora_name(model.name, model.registration_id),
+                    serving_name=result.get("serving_name")
+                    or serving_lora_name(
+                        model.name,
+                        model.registration_id,
+                        result.get("serving_version") if self.sampler_snapshot_limit > 1 else None,
+                    ),
                     serving_version=result.get("serving_version"),
                 )
             )

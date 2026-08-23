@@ -351,7 +351,7 @@ class TestSampling:
             num_samples=1,
             sampling_params=types.SamplingParams(max_tokens=2),
         )
-        with pytest.raises(tinker.RequestFailedError, match="republished"):
+        with pytest.raises(tinker.RequestFailedError, match="stale ephemeral sampler"):
             future.result()
 
     def test_oversized_context_is_a_typed_rejection_not_silent_truncation(self, stack, service_client):

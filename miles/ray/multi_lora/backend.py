@@ -353,10 +353,16 @@ class MultiLoraOperationBackend:
                     # Completing after the push landed (the publish barrier):
                     # stamp the authoritative post-push serving identity.
                     record = self.registry.find(operation["name"])
+                    snapshot_limit = getattr(self.args, "tinker_sampler_snapshot_limit", 1)
+                    serving_version = record.serving_version if record else None
                     result = {
                         **(result or {}),
-                        "serving_version": record.serving_version if record else None,
-                        "serving_name": serving_lora_name(operation["name"], operation["registration_id"]),
+                        "serving_version": serving_version,
+                        "serving_name": serving_lora_name(
+                            operation["name"],
+                            operation["registration_id"],
+                            serving_version if snapshot_limit > 1 else None,
+                        ),
                     }
                 self.operations.complete(operation_id, result)
                 key = (operation["name"], operation["registration_id"])
