@@ -6,18 +6,21 @@ from argparse import Namespace
 
 import httpx
 import pytest
-
 from examples.multi_lora.tools import dflash_support_check as probe
+from transformers import BatchEncoding
 
 VOCAB_TEXT = {" the": [42]}
 
 
 class FakeTokenizer:
+    """Chat templates tokenize to a BatchEncoding, as in the MiMo image's transformers."""
+
     def apply_chat_template(self, messages, add_generation_prompt, tokenize):
-        return [1, 2, len(messages[0]["content"]) % 50 + 3]
+        rendered = f"<user>{messages[0]['content']}<assistant>"
+        return BatchEncoding({"input_ids": self.encode(rendered, False)}) if tokenize else rendered
 
     def encode(self, text, add_special_tokens):
-        return VOCAB_TEXT.get(text, [5, 6])
+        return VOCAB_TEXT.get(text, [len(text) % 50 + 3, 5, 6])
 
 
 def fake_engine(breakage: str | None = None):
@@ -84,6 +87,7 @@ def run_probe(monkeypatch, breakage=None) -> tuple[dict, list[str]]:
 def test_a_consistent_engine_passes(monkeypatch):
     report, failures = run_probe(monkeypatch)
     assert failures == []
+    json.dumps(report)  # prompts are plain token ids, not a BatchEncoding
     assert report["cases"]["stopped_on_stop_token"] == 4
     assert report["throughput"]["on"]["accept_length"] == report["throughput"]["off"]["accept_length"] == 4.0
 
