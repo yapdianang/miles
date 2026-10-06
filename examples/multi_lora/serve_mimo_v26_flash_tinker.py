@@ -1,14 +1,17 @@
 """Serve MiMo-V2.6-Flash-RL through Miles' Tinker-compatible multi-LoRA gateway on B300.
 
-The SGLang engines serve the official checkpoint (FP8 attention, MXFP4 experts) with the
-SGLang cookbook kernels. The trainer loads its BF16 conversion (tools/convert_mimo_v2_to_bf16.py,
-passed as ``--ref-load``). Adapters train the attention projections only: the experts and the
-router stay frozen, and the engine applies each adapter without re-quantizing base weights.
+The SGLang engines serve the official checkpoint with its FP8 linears dequantized to BF16
+(tools/convert_mimo_v2_to_bf16.py --keep-quant --bf16-linears) and run the MXFP4 experts on BF16
+activations: FP8 activations in the linears and DeepGEMM W4A8 experts raise the sampler/trainer
+k3 KL on Tau3 turns from 0.0009 to 0.0060. The trainer loads the full BF16 conversion
+(tools/convert_mimo_v2_to_bf16.py, passed as ``--ref-load``). Adapters train the attention
+projections only: the experts and the router stay frozen, and the engine applies each adapter
+without re-quantizing base weights.
 
 One node: 4 trainer GPUs (EP4) and one TP4/EP4 engine. Two nodes: 8 trainer GPUs (EP8) and two
 engines; start the Ray cluster first and set ``MILES_SCRIPT_EXTERNAL_RAY=1`` on its head.
 
-python examples/multi_lora/serve_mimo_v26_flash_tinker.py serve --hf-checkpoint <official> --ref-load <bf16>
+python examples/multi_lora/serve_mimo_v26_flash_tinker.py serve --hf-checkpoint <bf16 linears> --ref-load <bf16>
 """
 
 import os
@@ -28,10 +31,7 @@ _ENGINE_GPUS = 4
 class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = field(default_factory=U.create_run_id)
     base_model: str = "XiaomiMiMo/MiMo-V2.6-Flash-RL"
-    hf_checkpoint: str = (
-        "/data/model-cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-RL/snapshots/"
-        "5711b268169967567844e1e560e8a3966da959b1"
-    )
+    hf_checkpoint: str = "/data/model-cache/mimo-v26/MiMo-V2.6-Flash-RL-w4a16-linear"
     ref_load: str = "/data/model-cache/mimo-v26/MiMo-V2.6-Flash-RL-bf16"
     # The 4-layer partial (mimo26-p4-bf16 + mimo26-p4-native) uses the same flags with fewer layers.
     megatron_model_type: str = "mimo-v2.6-flash"
@@ -56,18 +56,19 @@ class ScriptArgs(U.ExecuteTrainConfig):
     max_tokens_per_gpu: int = 131072
     # DFlash speculative decoding with the drafter shipped in the checkpoint's dflash/ directory.
     dflash: bool = True
-    # The cookbook's MoE all-to-all; sglang#41041 measures "none" faster on B300 TP4/EP4.
-    moe_a2a_backend: str = "deepep"
-    # deep_gemm runs the MXFP4 experts; a BF16 engine checkpoint needs another MoE runner (e.g. triton).
-    moe_runner_backend: str = "deep_gemm"
+    # flashinfer_mxfp4 (TRT-LLM on SM100) runs the MXFP4 experts on BF16 activations without an all-to-all;
+    # the cookbook's deep_gemm + deepep quantizes expert activations to FP8. A BF16 checkpoint needs triton.
+    moe_a2a_backend: str = "none"
+    moe_runner_backend: str = "flashinfer_mxfp4"
+    flashinfer_mxfp4_moe_precision: str = "bf16"
     sglang_mem_fraction_static: float = 0.6
     # R3 (MiMo-V2.6 section 6.4): the trainer replays the experts the engine routed each sampled token to.
     routing_replay: bool = True
     # Section 6.4: no routes for a cached prefix on later turns; the gateway rebuilds them from earlier samples.
-    routed_expert_deltas: bool = False
+    routed_expert_deltas: bool = True
     # Top-p candidate-set replay (section 6.4): the trainer renormalizes within each sampled token's support.
     # Clients sampling with top_p < 1 must also pass a top_k bound (at most --sglang-sampling-mask-max-tokens).
-    sampling_support_replay: bool = False
+    sampling_support_replay: bool = True
     extra_args: str = ""
 
     def __post_init__(self) -> None:
@@ -111,8 +112,8 @@ def _serve(args: ScriptArgs) -> None:
         "--qkv-format thd "
     )
     # Xiaomi's verified B300 Flash launch from the SGLang MiMo-V2.6 cookbook (sglang 983e6438, PR #40448),
-    # flag for flag. SGLang itself turns FA4 page size 1 into 128 and drops the DP LM head at dp 1.
-    # Miles adds LoRA, routed-expert capture (R3), and its own host/port/seed arguments.
+    # except the MoE runner and all-to-all above. SGLang itself turns FA4 page size 1 into 128 and drops
+    # the DP LM head at dp 1. Miles adds LoRA, routed-expert capture (R3), and its own host/port/seed arguments.
     sglang_args = (
         f"--rollout-num-gpus-per-engine {_ENGINE_GPUS} --sglang-ep-size {_ENGINE_GPUS} "
         "--sglang-dp-size 1 --sglang-pp-size 1 "
@@ -129,6 +130,8 @@ def _serve(args: ScriptArgs) -> None:
         "--sglang-mm-enable-dp-encoder --sglang-mm-attention-backend fa4 "
         "--sglang-lora-backend triton "
     )
+    if args.moe_runner_backend == "flashinfer_mxfp4":
+        sglang_args += f"--sglang-flashinfer-mxfp4-moe-precision {args.flashinfer_mxfp4_moe_precision} "
     if args.dflash:
         sglang_args += (
             "--sglang-speculative-algorithm DFLASH "
