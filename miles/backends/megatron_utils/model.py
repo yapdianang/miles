@@ -21,6 +21,11 @@ from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.tensor_parallel import (
+    ColumnParallelLinear,
+    copy_to_tensor_model_parallel_region,
+    gather_from_sequence_parallel_region,
+)
 from megatron.core.utils import get_model_config
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
@@ -432,6 +437,22 @@ def _zero_grads(model: Sequence[DDP], optimizer: MegatronOptimizer | None, disab
         optimizer.zero_grad()
 
 
+def _output_layer_input(
+    *, hidden_states: torch.Tensor, output_layer, output_weight: torch.Tensor | None, context: dict, config, **_
+) -> torch.Tensor:
+    """GPTModel output processor: return the output layer's ``[1, T, H]`` input and put its weight in the batch."""
+    assert (
+        isinstance(output_layer, ColumnParallelLinear) and output_layer.bias is None and not config.use_mup
+    ), "--tinker-fused-loss computes logits as hidden @ weight.T; this output layer does more"
+    # the communication the output layer's own matmul applies to its input
+    if output_layer.sequence_parallel:
+        hidden_states = gather_from_sequence_parallel_region(hidden_states, group=output_layer.tp_group)
+    else:
+        hidden_states = copy_to_tensor_model_parallel_region(hidden_states, group=output_layer.tp_group)
+    context["output_weight"] = output_layer.weight if output_weight is None else output_weight
+    return hidden_states.transpose(0, 1).contiguous()
+
+
 def run_forward_backward_pass(
     args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts, forward_only=False
 ):
@@ -538,9 +559,17 @@ def run_forward_backward_pass(
             if (x := batch["multimodal_train_inputs"]) is not None:
                 forward_kwargs.update(x)
 
-            output_tensor = model(
-                **forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "sft_loss", "score_centering")
-            )
+            if getattr(args, "tinker_fused_loss", False):
+                output_tensor = model(
+                    **forward_kwargs,
+                    output_processor=_output_layer_input,
+                    output_processor_context=batch,
+                    fp32_output=False,
+                )
+            else:
+                output_tensor = model(
+                    **forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "sft_loss", "score_centering")
+                )
 
         for m, old_stage in zip(all_replay_managers, old_stages, strict=True):
             m.stage = old_stage
