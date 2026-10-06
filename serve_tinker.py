@@ -26,7 +26,10 @@ logger = logging.getLogger(__name__)
 
 async def serve(args, *, disposer: Disposer):
     assert args.multi_lora, "serve_tinker requires --multi-lora-n-adapters > 0"
-    assert args.load == args.hf_checkpoint, "Tinker trainers and engines must load the same frozen HF base"
+    # The trainer can load a BF16 conversion (--ref-load) of a quantized engine checkpoint.
+    assert args.load in (args.hf_checkpoint, args.ref_load), (
+        "Tinker trainers must load the engine's frozen HF base or its --ref-load conversion"
+    )
     checkpoint_root = args.tinker_checkpoint_root or (args.save and f"{args.save}/tinker")
     assert checkpoint_root, "set --tinker-checkpoint-root (or --save to derive <save>/tinker)"
     hf_config = load_hf_config(args.hf_checkpoint).get_text_config()

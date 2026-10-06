@@ -1,0 +1,32 @@
+# MiMo-V2.6-Flash-RL Tinker gateway on B300. The base image already carries sglang-miles with the
+# MiMo-V2.6 picks (sglang#40977: MXFP4 experts, TopK layer_id for routing replay, SWA memory saver),
+# Megatron-Core fd15ee20a and Megatron-Bridge 8cd3466d (mimo_v2_flash), all at Miles 7890b298.
+FROM radixark/miles:dev-202610052107@sha256:b625f82472c7dac836565241cd827c25b560400120b5139d27d41a94dc523728 AS runtime
+
+RUN pip install --no-cache-dir "tinker==0.26.2"
+
+# TE's cuDNN attention needs cuDNN >= 9.26 for the backward of learnable-sink SWA layers on
+# packed (thd) sequences on SM100.
+RUN pip install --no-cache-dir "nvidia-cudnn-cu13==9.27.0.42"
+
+COPY docker/compat/patch_sglang_mimo_v2_lora.py /tmp/patch_sglang_mimo_v2_lora.py
+RUN python3 /tmp/patch_sglang_mimo_v2_lora.py
+
+COPY miles /root/miles/miles
+COPY miles_plugins /root/miles/miles_plugins
+COPY examples/multi_lora /root/miles/examples/multi_lora
+COPY scripts /root/miles/scripts
+COPY tools /root/miles/tools
+COPY serve_tinker.py /root/miles/serve_tinker.py
+COPY train.py /root/miles/train.py
+
+RUN python3 -m py_compile \
+      /root/miles/serve_tinker.py \
+      /root/miles/examples/multi_lora/serve_mimo_v26_flash_tinker.py \
+      /root/miles/miles_plugins/megatron_bridge/mimo_v2.py \
+      /root/miles/miles/utils/lora/hf_lora_targets.py
+
+LABEL org.opencontainers.image.source="https://github.com/yapdianang/miles" \
+      org.opencontainers.image.revision="dydx/mimo-v26-tinker"
+
+FROM runtime AS final

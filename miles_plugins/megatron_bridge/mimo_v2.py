@@ -265,6 +265,20 @@ class MiMoV2Bridge(MegatronModelBridge):
         provider.mtp_num_layers = None
         return provider
 
+    def _split_qkv_linear_out_weight(self, megatron_model, linear_out_weight):
+        """Split a ``linear_qkv`` LoRA-B into q/k/v; its row count tells SWA layers from global ones."""
+        config = (megatron_model[0] if isinstance(megatron_model, list) else megatron_model).config
+        assert linear_out_weight.ndim == 2, f"expected a 2-D LoRA-B, got {tuple(linear_out_weight.shape)}"
+        heads, qk_dim, v_dim = config.num_attention_heads, config.kv_channels, config.v_head_dim
+        for groups in (config.swa_num_query_groups, config.full_attn_num_query_groups):
+            q_rows = heads // groups * qk_dim
+            group_rows = q_rows + qk_dim + v_dim
+            if linear_out_weight.shape[0] == groups * group_rows:
+                grouped = linear_out_weight.reshape(groups, group_rows, linear_out_weight.shape[1])
+                q, k, v = (part.reshape(-1, part.shape[-1]) for part in grouped.split([q_rows, qk_dim, v_dim], dim=1))
+                return {"q_proj": q, "k_proj": k, "v_proj": v}
+        raise ValueError(f"linear_qkv LoRA-B rows {linear_out_weight.shape[0]} match no MiMo-V2 attention layer")
+
     def maybe_modify_loaded_hf_weight(self, hf_param, hf_state_dict):
         hf_weights = super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
         for weight in hf_weights.values() if isinstance(hf_weights, dict) else (hf_weights,):

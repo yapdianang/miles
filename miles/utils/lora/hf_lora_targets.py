@@ -194,6 +194,16 @@ def _qwen3_5_moe_targets(config):
     return _hybrid_attention_targets(config, _GDN_35), mlp
 
 
+def _mimo_v2_targets(config):
+    # moe_layer_freq marks MoE layers with 1 and dense layers with 0.
+    mlp = []
+    if 0 in config["moe_layer_freq"]:
+        mlp.extend(_DENSE_MLP)
+    if 1 in config["moe_layer_freq"]:
+        mlp.extend(_ROUTED_EXPERTS)
+    return _QKVO_ATTENTION, tuple(mlp)
+
+
 def _inkling_targets(config):
     attention = _prefix_paths("self_attn", "q_proj", "k_proj", "v_proj", "r_proj", "o_proj")
     # Older Inkling configs encode leading dense layers instead of mlp_layer_types.
@@ -252,6 +262,7 @@ _HF_LORA_MODELS = {
         unembed="lm_head",
         unwrap_text_config=True,
     ),
+    "mimo_v2": _HfLoraModelSpec(_mimo_v2_targets),
     "inkling_text": _HfLoraModelSpec(_inkling_targets, default_train_unembed=True),
     "inkling_model": _HfLoraModelSpec(_inkling_targets, default_train_unembed=True),
     "inkling_mm_model": _HfLoraModelSpec(
