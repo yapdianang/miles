@@ -121,3 +121,25 @@ def test_check_response_rejects_unnormalized_support_and_non_singleton_greedy():
     greedy = {"mode": "selected", "top_k": 1, "greedy": True}
     meta |= {"output_token_sampling_mask": [[7]], "output_token_sampling_logprobs": [-0.1]}
     assert "greedy mask" in probe.check_response(meta, greedy, 1e-5)[0]
+
+
+@pytest.mark.parametrize(
+    "probabilities, passes",
+    [
+        ([0.4, 0.3, 0.1, 0.1, 0.1], True),  # top_k 3: the third probability is tied twice past the cutoff
+        ([0.4, 0.3, 0.12, 0.1, 0.08], False),  # top_k 3 with two smaller ids: a real overflow
+    ],
+)
+def test_masks_past_top_k_pass_only_for_cutoff_ties(probabilities, passes):
+    case = {"mode": "support", "top_k": 3}
+    meta = {
+        "output_token_logprobs": [(math.log(0.4), 7, None)],
+        "completion_tokens": 1,
+        "finish_reason": {"type": "length"},
+        "output_token_sampling_mask": [[7, 8, 9, 10, 11]],
+        "output_token_sampling_logprobs": [[math.log(value) for value in probabilities]],
+    }
+    failures = probe.check_response(meta, case, 1e-5)
+    assert (failures == []) is passes, failures
+    selected = meta | {"output_token_sampling_logprobs": [math.log(0.4)]}
+    assert probe.check_response(selected, {"mode": "selected", "top_k": 3}, 1e-5), "selected mode has no tie evidence"

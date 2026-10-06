@@ -12,7 +12,8 @@ Runs against one SGLang ``/generate`` endpoint with DFLASH speculative decoding:
    and then on: decode tok/s, and the DFLASH accept length from each response's ``spec_verify_ct``.
 
 Token checks: mask count == output_token_logprobs count == completion tokens; every token is in
-its mask; masks have no duplicates and at most top_k ids; support-mode rows sum to one within
+its mask; masks have no duplicates and at most top_k ids, except support-mode masks whose ids from
+rank top_k on tie the top_k-th log-prob (the samplers keep cutoff ties); support-mode rows sum to one within
 ``--tolerance``; selected-mode values are at least the full-vocabulary log-probability; greedy rows
 are singletons with log-probability 0. Exits non-zero if any check fails or the accept lengths
 with and without masks differ by more than ``--accept-z`` standard errors.
@@ -43,6 +44,7 @@ PROMPTS = (
     "Write a haiku about debugging at midnight, then a limerick about the same thing.",
     "Given the SQL table orders(id, customer, total, created_at), write a query for monthly revenue.",
 )
+TIE_TOLERANCE = 1e-6
 ABORT_KINDS = (
     ("OVERFLOW", "exceeds --sampling-mask-max-tokens"),
     ("INVALID", "outside its captured sampling support"),
@@ -75,6 +77,15 @@ def abort_kind(message: str) -> str:
     return next((kind for kind, text in ABORT_KINDS if text in message), "OTHER")
 
 
+def _tied_at_top_k(value, case: dict) -> bool:
+    """A support row past top_k is a cutoff tie: every id ranked at or beyond top_k shares the top_k-th log-prob."""
+    if case["mode"] != "support":
+        return False
+    ranked = sorted((float(entry) for entry in value), reverse=True)
+    cutoff = ranked[case["top_k"] - 1]
+    return all(abs(entry - cutoff) <= TIE_TOLERANCE for entry in ranked[case["top_k"] - 1 :])
+
+
 def check_response(meta: dict, case: dict, tolerance: float) -> list[str]:
     """Token-level checks of one finished /generate response with return_sampling_mask."""
     logprobs = meta["output_token_logprobs"]
@@ -93,7 +104,7 @@ def check_response(meta: dict, case: dict, tolerance: float) -> list[str]:
         if token not in mask:
             failures.append(f"{where} is not in its mask of {len(mask)}")
             continue
-        if len(set(mask)) != len(mask) or len(mask) > case["top_k"]:
+        if len(set(mask)) != len(mask) or (len(mask) > case["top_k"] and not _tied_at_top_k(value, case)):
             failures.append(f"{where}: mask of {len(mask)} ids, {len(set(mask))} distinct, top_k {case['top_k']}")
         if case["mode"] == "support":
             if len(value) != len(mask) or abs(_logsumexp([float(entry) for entry in value])) > tolerance:
