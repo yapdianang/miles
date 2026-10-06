@@ -9,25 +9,35 @@ from collections.abc import Callable
 
 import torch
 
-from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy
+from miles.backends.training_utils.loss.hub.logit_processors import _iter_response_chunks, get_log_probs_and_entropy
+from miles.backends.training_utils.loss.hub.score_centering import (
+    ScoreCenteringInputs,
+    score_centering_loss,
+    selected_log_probs,
+)
+from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.sampling_mask import PartialSamplingMask
 from miles.utils.types import RolloutBatch
 
 PPO_DEFAULTS = {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2}
 CISPO_DEFAULTS = {"clip_low_threshold": 0.0, "clip_high_threshold": 4.0}
 DRO_DEFAULTS = {"beta": 0.05}
+SCORE_CENTERING_DEFAULTS = {"importance_sampling": "none", "tis_clip": 2.0, "mis_low": 0.5, "mis_high": 5.0}
 
 
-def _target_logprobs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> list[torch.Tensor]:
+def _label_tokens(batch: RolloutBatch) -> list[torch.Tensor]:
     # Tinker targets are explicit labels: splice them over the response region of the gather sequence
-    label_tokens = [
+    return [
         torch.cat([tokens[: len(tokens) - len(targets)], _as_tensor_like(targets, tokens)])
         for tokens, targets in zip(batch["unconcat_tokens"], batch["target_tokens"], strict=True)
     ]
+
+
+def _target_logprobs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> list[torch.Tensor]:
     outputs = get_log_probs_and_entropy(
         logits,
         args=args,
-        unconcat_tokens=label_tokens,
+        unconcat_tokens=_label_tokens(batch),
         total_lengths=batch["total_lengths"],
         response_lengths=batch["response_lengths"],
         with_entropy=False,
@@ -47,6 +57,27 @@ def _sampling_supports(batch: RolloutBatch) -> list[PartialSamplingMask] | None:
             batch["rollout_sampling_mask_ids"], batch["rollout_sampling_mask_offsets"], strict=True
         )
     ]
+
+
+def _support_head(batch: RolloutBatch, index: int, rows: range) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recorded supports of these target rows as ``[rows, width]`` ids (-1 padding) and sampler log-probs."""
+    if batch.get("rollout_sampling_mask_ids") is None:
+        return torch.full((len(rows), 0), -1, dtype=torch.long), torch.empty(len(rows), 0)
+    offsets = torch.as_tensor(batch["rollout_sampling_mask_offsets"][index])[rows.start : rows.stop + 1]
+    begin, end = int(offsets[0]), int(offsets[-1])
+    lengths = offsets[1:] - offsets[:-1]
+    row = torch.repeat_interleave(torch.arange(len(rows)), lengths)
+    column = torch.arange(end - begin) - torch.repeat_interleave(offsets[:-1] - begin, lengths)
+    width = int(lengths.max()) if len(rows) else 0
+    head_ids = torch.full((len(rows), width), -1, dtype=torch.long)
+    head_ids[row, column] = torch.as_tensor(batch["rollout_sampling_mask_ids"][index])[begin:end].long()
+    head_log_probs = torch.full((len(rows), width), -torch.inf)
+    head_log_probs[row, column] = torch.as_tensor(batch["rollout_sampling_mask_log_probs"][index])[begin:end].float()
+    return head_ids, head_log_probs
+
+
+def _logsumexp_where(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return torch.logsumexp(values.masked_fill(~mask, -torch.inf), dim=-1, keepdim=True)
 
 
 def _as_tensor_like(values, reference: torch.Tensor) -> torch.Tensor:
@@ -168,10 +199,75 @@ def dro_loss_function(
     return _sum_loss_and_outputs(batch, logits, log_probs, per_datum_losses)
 
 
+def score_centering_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict]:
+    """Score centering (arXiv:2609.20807) against the sampler's recorded support of each target.
+
+    The trainer renormalizes over the support as the sampler did, so the head is the whole sampling
+    distribution. A target without a recorded support has an empty head: no correction term.
+    """
+    config = SCORE_CENTERING_DEFAULTS | (batch.get("loss_fn_config") or {})
+    parallel = get_parallel_state()
+    chunks = _iter_response_chunks(
+        logits,
+        args=args,
+        unconcat_tokens=_label_tokens(batch),
+        total_lengths=batch["total_lengths"],
+        response_lengths=batch["response_lengths"],
+        max_seq_lens=batch.get("max_seq_lens", None),
+        include_response_indices=True,
+    )
+    log_probs, per_datum_losses = [], []
+    for index, (chunk, labels, rows) in enumerate(chunks):
+        if not isinstance(rows, range):
+            raise NotImplementedError("score_centering needs every target row of a datum on one rank")
+        head_ids, head_log_probs = _support_head(batch, index, rows)
+        head_ids = head_ids.to(labels.device)
+        selected = selected_log_probs(
+            chunk,
+            torch.cat([labels.unsqueeze(-1).long(), head_ids], dim=-1),
+            group=parallel.tp.group if parallel.tp.size > 1 else None,
+            vocab_size=getattr(args, "vocab_size", None),
+            temperature=1.0 if args.true_on_policy_mode else args.rollout_temperature,
+            chunk_size=args.log_probs_chunk_size,
+        )
+        head = head_ids >= 0
+        has_head = head.any(-1, keepdim=True)
+        # A recorded support leaves no tail: both distributions are renormalized on it in float64 so that
+        # the estimator's tail-mass ratio stays exactly one instead of amplifying float32 rounding.
+        selected = selected.double()
+        selected = selected - torch.where(has_head, _logsumexp_where(selected[:, 1:], head), 0.0)
+        rollout_head = head_log_probs.to(selected)
+        rollout_head = rollout_head - torch.where(has_head, _logsumexp_where(rollout_head, head), 0.0)
+        mask = _as_tensor_like(batch["loss_masks"][index], selected)
+        token_losses, _ = score_centering_loss(
+            ScoreCenteringInputs(
+                train_log_probs=selected[:, 0],
+                train_head_log_probs=selected[:, 1:],
+                rollout_log_probs=_as_tensor_like(batch["rollout_log_probs"][index], selected),
+                rollout_head_log_probs=rollout_head,
+                head_mask=head & mask.bool().unsqueeze(-1),
+                advantages=_as_tensor_like(batch["advantages"][index], selected) * mask,
+                mode=config["importance_sampling"],
+                tis_clip=config["tis_clip"],
+                mis_low=config["mis_low"],
+                mis_high=config["mis_high"],
+            )
+        )
+        log_probs.append(selected[:, 0].float())
+        per_datum_losses.append((token_losses * mask).sum().float())
+    return _sum_loss_and_outputs(batch, logits, log_probs, per_datum_losses)
+
+
 TINKER_LOSS_FUNCTIONS = {
     "cross_entropy": cross_entropy_loss_function,
     "importance_sampling": importance_sampling_loss_function,
     "ppo": ppo_loss_function,
     "cispo": cispo_loss_function,
     "dro": dro_loss_function,
+    "score_centering": score_centering_loss_function,
 }

@@ -52,7 +52,8 @@ def test_loss_passes_return_independent_detached_outputs(monkeypatch, recompute)
         assert not outputs[0]["logprobs"].requires_grad
 
 
-@pytest.mark.parametrize("loss_fn", sorted(tinker_losses.TINKER_LOSS_FUNCTIONS))
+# score_centering scores support logits beyond the target, so test_tinker_sampling_supports covers it
+@pytest.mark.parametrize("loss_fn", sorted(set(tinker_losses.TINKER_LOSS_FUNCTIONS) - {"score_centering"}))
 def test_a_zero_loss_mask_removes_the_datum_from_every_objective(monkeypatch, loss_fn):
     logprobs = torch.tensor([-0.5, -0.25], requires_grad=True)
     monkeypatch.setattr(tinker_losses, "_target_logprobs", lambda _args, _batch, logits: [logits])

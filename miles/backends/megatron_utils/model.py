@@ -437,13 +437,18 @@ def run_forward_backward_pass(
 ):
     """One pipeline forward/backward pass over the microbatches; no optimizer interaction."""
 
-    # Tinker batches carry sampling supports when the gateway recorded them for their datums.
     sampling_mask_keys = (
         ("rollout_sampling_mask_ids", "rollout_sampling_mask_offsets")
-        if (args.use_sampling_support_replay and args.loss_type in ("policy_loss", "score_centering"))
-        or is_multi_lora_enabled(args)
+        if args.use_sampling_support_replay and args.loss_type in ("policy_loss", "score_centering")
         else ()
     )
+    if is_multi_lora_enabled(args):
+        # Tinker batches carry sampling supports when the gateway recorded them for their datums.
+        sampling_mask_keys = (
+            "rollout_sampling_mask_ids",
+            "rollout_sampling_mask_offsets",
+            "rollout_sampling_mask_log_probs",
+        )
 
     @dumper_phase_util.wrap_forward_step
     def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[

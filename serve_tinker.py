@@ -13,7 +13,8 @@ from miles.ray.wiring import get_backend_capability
 from miles.tinker.arguments import add_tinker_arguments, configure_tinker_args
 from miles.tinker.core.service import TinkerService
 from miles.tinker.core.types import GatewayConfig
-from miles.tinker.runtime import MilesBackend, RoutedExpertsCache, SamplingSupportCache
+from miles.tinker.runtime import MilesBackend, RoutedExpertsCache
+from miles.tinker.sampler_records import SamplerRecordStore
 from miles.tinker.server.app import build_app
 from miles.utils.arguments import parse_args
 from miles.utils.async_utils import Disposer, with_disposer
@@ -72,12 +73,17 @@ async def serve(args, *, disposer: Disposer):
     dp_size = actor_world_size // (
         args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     )
+    route_deltas = args.use_rollout_routing_replay and args.tinker_routed_expert_deltas
     routed_experts = None
-    if args.use_rollout_routing_replay:
+    if args.use_rollout_routing_replay and not route_deltas:
         routed_experts = RoutedExpertsCache(max_bytes=int(args.tinker_routed_experts_cache_gb * 2**30))
-    sampling_supports = None
-    if args.tinker_sampling_support_replay:
-        sampling_supports = SamplingSupportCache(max_bytes=int(args.tinker_sampling_support_cache_gb * 2**30))
+    sampler_records = None
+    if args.tinker_sampling_support_replay or route_deltas:
+        sampler_records = SamplerRecordStore(
+            max_bytes=int(args.tinker_sampler_record_cache_gb * 2**30),
+            supports=args.tinker_sampling_support_replay,
+            routes=route_deltas,
+        )
     backend = MilesBackend(
         trainer,
         router_url,
@@ -85,7 +91,7 @@ async def serve(args, *, disposer: Disposer):
         inference_controller=inference_controller,
         routed_experts=routed_experts,
         num_layers=args.num_layers,
-        sampling_supports=sampling_supports,
+        sampler_records=sampler_records,
     )
     service = TinkerService(backend, config)
 

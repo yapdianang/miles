@@ -1,5 +1,6 @@
 """Tinker target log-probs renormalize within the engine's sampling support where a datum position has one."""
 
+import math
 import sys
 from argparse import Namespace
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ def single_rank(monkeypatch):
     )
     parallel = SimpleNamespace(tp=SimpleNamespace(rank=0, size=1, group=None), cp=SimpleNamespace(rank=0, size=1))
     monkeypatch.setattr(logit_processors, "get_parallel_state", lambda: parallel)
+    monkeypatch.setattr(tinker_losses, "get_parallel_state", lambda: parallel)
 
 
 def _args(chunk_size: int) -> Namespace:
@@ -135,3 +137,85 @@ def test_only_the_partial_mask_accepts_empty_rows():
         RolloutSamplingMask.from_mask_list([[], [2]])
     with pytest.raises(ValueError, match="non-decreasing"):
         PartialSamplingMask(ids=[1, 2], offsets=[0, 2, 1, 2])
+
+
+def _log_q(values: list[float], mass: float = 1.0) -> list[float]:
+    return (torch.log_softmax(torch.tensor(values, dtype=torch.float64), 0) + math.log(mass)).tolist()
+
+
+# the sampler's log-probabilities over each support, aligned with SUPPORTS; one row sums to 1 - 3e-6,
+# float32 rounding that the loss must not read as a tail mass
+SAMPLER_LOG_PROBS = [
+    [[], _log_q([0.4, -0.6, -1.3], mass=1 - 3e-6), [0.0], _log_q([1.1, -1.2])],
+    [[], _log_q([-0.2, 0.1, -0.2])],
+]
+ADVANTAGES = [[0.0, 1.5, -2.0, 0.7], [0.3, -1.0]]
+
+
+def _score_centering_batch(mode: str) -> dict:
+    batch = _batch(with_supports=True)
+    # the sampled token's log-probability; the first target has no support and takes any value
+    rollout = [
+        [-1.1]
+        + [row[support.index(token)] for row, support, token in zip(rows[1:], supports[1:], tokens[2:], strict=True)]
+        for rows, supports, tokens in zip(SAMPLER_LOG_PROBS, SUPPORTS, TOKENS, strict=True)
+    ]
+    return batch | {
+        "rollout_sampling_mask_log_probs": [
+            torch.tensor([v for row in rows for v in row]) for rows in SAMPLER_LOG_PROBS
+        ],
+        "rollout_log_probs": rollout,
+        "advantages": ADVANTAGES,
+        "loss_masks": [torch.ones(4), torch.ones(2)],
+        "sample_indices": [0, 1],
+        "loss_fn_config": {"importance_sampling": mode},
+    }
+
+
+def _reference_score_centering(logits: torch.Tensor, batch: dict, clip: float | None) -> torch.Tensor:
+    """Dense oracle: -A * (f(p_y/q_y) log p_y - sum_S (q f(p/q) - p) log p), coefficients detached, p renormalized on S."""
+    total, row = 0.0, 0
+    for tokens, supports, q_rows, q_tokens, advantages in zip(
+        TOKENS, SUPPORTS, SAMPLER_LOG_PROBS, batch["rollout_log_probs"], ADVANTAGES, strict=True
+    ):
+        for target, support, q_row, q_token, advantage in zip(
+            tokens[1:], supports, q_rows, q_tokens, advantages, strict=True
+        ):
+            scores = logits[0, row]
+            log_p = torch.log_softmax(scores[support] if support else scores, dim=-1)
+            log_p_target = log_p[support.index(target)] if support else log_p[target]
+            ratio = (log_p_target.detach() - q_token).exp()
+            weight = ratio.clamp(max=clip) if clip is not None else torch.ones(())
+            correction = 0.0
+            if support:
+                p, q = log_p.detach().exp(), torch.softmax(torch.tensor(q_row, dtype=torch.float64), 0)
+                coefficient = (torch.minimum(p, clip * q) if clip is not None else q) - p
+                correction = (coefficient * log_p).sum()
+            total = total - advantage * (weight * log_p_target - correction)
+            row += 1
+        row += 1
+    return total
+
+
+@pytest.mark.parametrize("mode, clip", [("none", None), ("tis", 2.0)])
+def test_score_centering_matches_a_dense_oracle_on_the_recorded_supports(mode, clip):
+    logits = torch.randn(1, sum(map(len, TOKENS)), VOCAB, dtype=torch.float64, requires_grad=True)
+    batch = _score_centering_batch(mode)
+    loss, outputs = tinker_losses.score_centering_loss_function(_args(-1), batch, logits.float(), None)
+    (gradient,) = torch.autograd.grad(loss, logits)
+    expected = _reference_score_centering(logits, batch, clip)
+    (expected_gradient,) = torch.autograd.grad(expected, logits)
+    torch.testing.assert_close(loss.double(), expected, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(gradient, expected_gradient, rtol=1e-4, atol=1e-5)
+    # per-datum logprobs are the support-renormalized target log-probs every other loss reports
+    for output, reference in zip(outputs["per_datum"], _reference_logprobs(logits.detach().float()), strict=True):
+        torch.testing.assert_close(output["logprobs"], reference)
+
+
+def test_a_zero_loss_mask_removes_the_datum_from_score_centering():
+    logits = torch.randn(1, sum(map(len, TOKENS)), VOCAB, requires_grad=True)
+    batch = _score_centering_batch("tis") | {"loss_masks": [torch.zeros(4), torch.ones(2)]}
+    loss, outputs = tinker_losses.score_centering_loss_function(_args(-1), batch, logits, None)
+    (gradient,) = torch.autograd.grad(loss, logits)
+    assert outputs["per_datum"][0]["loss"].item() == 0.0
+    assert gradient[0, :4].abs().max() == 0, "a DP-padding datum must contribute no gradient"

@@ -494,7 +494,7 @@ class TinkerService:
         lora_path: str | None = None,
     ) -> None:
         try:
-            result = await self.backend.sample(payload, lora_name, lora_path)
+            result = await self.backend.sample(payload, lora_name, lora_path, sequence_ids)
         except asyncio.CancelledError:
             self.futures.fail(request_id, "cancelled", "user")
         except UserInputError as error:

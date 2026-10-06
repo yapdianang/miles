@@ -89,8 +89,10 @@ class FakeBackend:
             write_checkpoint_dir(path, lambda _: None, metadata=metadata, overwrite=name == "save_slot")
         return failure
 
-    async def sample(self, payload, lora_name, lora_path=None):
-        failure = self._record("sample", payload=payload, lora_name=lora_name, lora_path=lora_path)
+    async def sample(self, payload, lora_name, lora_path=None, sequence_ids=None):
+        failure = self._record(
+            "sample", payload=payload, lora_name=lora_name, lora_path=lora_path, sequence_ids=sequence_ids
+        )
         if failure is not None:
             return failure
         return {

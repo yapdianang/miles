@@ -128,3 +128,45 @@ def test_content_errors_preserve_the_model_queue_envelope(forward_only, invalid)
     assert op == ("forward_only" if forward_only else "forward_backward")
     assert decoded["model_id"] == "model-x" and decoded["seq_id"] == 7
     assert decoded["validation_error"]
+
+
+def _provenance_request(model_input_spans: list, loss_fn_input_spans: list) -> bytes:
+    datum = types.Datum(
+        model_input=types.ModelInput.from_ints(TOKENS[:-1]),
+        loss_fn_inputs={"target_tokens": TOKENS[1:], "weights": [1.0] * 4},
+        model_input_spans=model_input_spans,
+        loss_fn_input_spans=loss_fn_input_spans,
+    )
+    request = types.ForwardBackwardRequest(
+        model_id="model-x",
+        seq_id=7,
+        forward_backward_input=types.ForwardBackwardInput(data=[datum], loss_fn="cross_entropy"),
+    )
+    return forward_backward_request_to_proto(request).SerializeToString()
+
+
+def test_provenance_spans_reach_the_datum_in_order():
+    body = _provenance_request(
+        [
+            types.PromptProvenanceSpan(sequence_id="seq-a", length=2),
+            types.SampledProvenanceSpan(sequence_id="seq-a", length=2),
+        ],
+        [
+            types.PromptProvenanceSpan(sequence_id="seq-a", offset=1, length=1),
+            types.SampledProvenanceSpan(sequence_id="seq-a", length=2),
+            types.SampledProvenanceSpan(sequence_id="seq-b", offset=3, length=1),
+        ],
+    )
+    (datum,) = decode_forward_backward_request(body)[1]["datums"]
+    assert datum["provenance"] == (
+        [("prompt", "seq-a", 0, 2), ("sampled", "seq-a", 0, 2)],
+        [("prompt", "seq-a", 1, 1), ("sampled", "seq-a", 0, 2), ("sampled", "seq-b", 3, 1)],
+    )
+
+
+def test_provenance_that_does_not_tile_its_field_is_rejected():
+    body = _provenance_request(
+        [types.PromptProvenanceSpan(sequence_id="seq-a", length=4)],
+        [types.PromptProvenanceSpan(sequence_id="seq-a", length=3)],
+    )
+    assert "must tile its 4 positions" in decode_forward_backward_request(body)[1]["validation_error"]

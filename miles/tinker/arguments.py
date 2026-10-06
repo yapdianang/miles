@@ -33,6 +33,14 @@ def add_tinker_arguments(parser):
         help="Host memory for engine-routed experts kept for --use-rollout-routing-replay",
     )
     add_argument(
+        "routed-expert-deltas",
+        action="store_true",
+        help=(
+            "With --use-rollout-routing-replay, request routes only past the prompt prefix that an earlier "
+            "sample of the same adapter recorded, and rebuild each datum's routes from that chain"
+        ),
+    )
+    add_argument(
         "sampling-support-replay",
         action="store_true",
         help=(
@@ -41,10 +49,10 @@ def add_tinker_arguments(parser):
         ),
     )
     add_argument(
-        "sampling-support-cache-gb",
+        "sampler-record-cache-gb",
         type=float,
-        default=16.0,
-        help="Host memory for sampling supports kept for --tinker-sampling-support-replay",
+        default=64.0,
+        help="Host memory for sampler records (supports and route deltas), evicted oldest chain first",
     )
     return parser
 

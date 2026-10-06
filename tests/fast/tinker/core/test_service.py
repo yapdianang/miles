@@ -158,6 +158,7 @@ async def test_sampling_resolves_against_the_saved_version(service):
     future = await await_settled(service, "tenant", request_id)
     assert len(future.result["sequences"]) == 2
     assert service.backend.named("sample")[0]["lora_name"] == f"{model_id}@1"
+    assert service.backend.named("sample")[0]["sequence_ids"] == sequence_ids, "sampler records key on these ids"
 
 
 async def test_sampler_requests_carry_the_published_checkpoint_path(service):

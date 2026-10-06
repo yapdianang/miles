@@ -34,6 +34,7 @@ LOSS_FN_INPUTS = {
     "ppo": ("logprobs", "advantages"),
     "cispo": ("logprobs", "advantages"),
     "dro": ("logprobs", "advantages"),
+    "score_centering": ("logprobs", "advantages"),
 }
 
 

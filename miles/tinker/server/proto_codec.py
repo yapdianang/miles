@@ -47,7 +47,10 @@ def _decode_forward_backward(message) -> dict:
                 raise UserInputError(f"unsupported model_input chunk type: {chunk.WhichOneof('chunk')}")
             tokens.extend(np.frombuffer(chunk.encoded_text.tokens, dtype=np.int32).tolist())
         inputs = {name: _decode_tensor(name, tensor) for name, tensor in datum.loss_fn_inputs.items()}
-        datums.append(build_datum(tokens, inputs, index))
+        decoded_datum = build_datum(tokens, inputs, index)
+        if datum.model_input_spans or datum.loss_fn_input_spans:
+            decoded_datum["provenance"] = _decode_provenance(datum, index, len(tokens), decoded_datum["target_len"])
+        datums.append(decoded_datum)
 
     loss_fn_config = dict(message.loss_fn_config)
     # Tinker SDK's v2 protobuf config supports both numeric and string values.
@@ -67,6 +70,26 @@ def _decode_forward_backward(message) -> dict:
         "loss_fn_config": loss_fn_config,
     }
     return decoded
+
+
+def _decode_provenance(datum, index: int, num_inputs: int, num_targets: int) -> tuple[list, list]:
+    """Both span lists as ``(kind, sequence_id, offset, length)`` runs, each tiling its field."""
+    tilings = []
+    for name, spans, size in (
+        ("model_input", datum.model_input_spans, num_inputs),
+        ("loss_fn_inputs", datum.loss_fn_input_spans, num_targets),
+    ):
+        runs = []
+        for span in spans:
+            kind = span.WhichOneof("span")
+            run = getattr(span, kind) if kind is not None else None
+            if run is None or run.length < 1 or run.offset < 0 or not run.sequence_id:
+                raise UserInputError(f"datum {index}: invalid {name} provenance span")
+            runs.append(("sampled" if kind == "sampled_tokens" else "prompt", run.sequence_id, run.offset, run.length))
+        if sum(run[3] for run in runs) != size:
+            raise UserInputError(f"datum {index}: {name} provenance spans must tile its {size} positions")
+        tilings.append(runs)
+    return tilings[0], tilings[1]
 
 
 def _decode_tensor(name: str, tensor) -> list:

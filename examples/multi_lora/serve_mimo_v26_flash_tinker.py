@@ -63,6 +63,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     sglang_mem_fraction_static: float = 0.6
     # R3 (MiMo-V2.6 section 6.4): the trainer replays the experts the engine routed each sampled token to.
     routing_replay: bool = True
+    # Section 6.4: no routes for a cached prefix on later turns; the gateway rebuilds them from earlier samples.
+    routed_expert_deltas: bool = False
     # Top-p candidate-set replay (section 6.4): the trainer renormalizes within each sampled token's support.
     # Clients sampling with top_p < 1 must also pass a top_k bound (at most --sglang-sampling-mask-max-tokens).
     sampling_support_replay: bool = False
@@ -75,6 +77,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
             raise ValueError("trainer TP must not exceed the 4 global-attention KV heads")
         if self.target_modules != "attn":
             raise ValueError("MXFP4 engine experts cannot take LoRA; train attention adapters only")
+        if self.sampling_support_replay and self.dflash:
+            raise ValueError("SGLang returns no sampling supports under speculative decoding; turn DFlash off")
 
 
 def _serve(args: ScriptArgs) -> None:
@@ -138,6 +142,8 @@ def _serve(args: ScriptArgs) -> None:
         "--accumulate-allreduce-grads-in-fp32 --optimizer adam --lr 1e-6 "
     )
     replay_args = "--use-rollout-routing-replay " if args.routing_replay else ""
+    if args.routing_replay and args.routed_expert_deltas:
+        replay_args += "--tinker-routed-expert-deltas "
     if args.sampling_support_replay:
         replay_args += "--tinker-sampling-support-replay "
     train_args = (
