@@ -7,13 +7,9 @@ back, release -- so GPU residency is bounded by one bucket rather than the whole
 state. For runs where the state does not fit the GPU *while the step runs*, which
 sleep-window offload cannot help with.
 
-The fp32 gradients the Adam step reads are bounded the same way: Megatron's
-``prepare_grads`` would copy every shard's reduced BF16 gradient into an fp32 ``.grad``
-up front, which for a model-parallel-only layout is 4 bytes per local parameter on top
-of the BF16 params and gradients. The streamed params skip that copy; ``step()`` converts
-one bucket's gradients (times the clip coefficient) right before its Adam step and drops
-them after, and the grad norm reads the BF16 shards directly (the fp32 conversion is
-exact, so the norm is the same).
+Their fp32 gradients follow the same pattern: streamed params have no fp32 ``.grad``
+outside ``step()``, which builds one bucket's at a time (clip applied) and drops it
+after that bucket's Adam step; the grad norm reads the BF16 grad buffer instead.
 
 ``setup_optimizer_state_streaming`` gives each ``DistributedOptimizer`` in the chain
 a store and routes the entry points that touch optimizer state or streamed gradients
