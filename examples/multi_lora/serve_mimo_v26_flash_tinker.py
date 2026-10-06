@@ -11,8 +11,10 @@ engines; start the Ray cluster first and set ``MILES_SCRIPT_EXTERNAL_RAY=1`` on 
 python examples/multi_lora/serve_mimo_v26_flash_tinker.py serve --hf-checkpoint <official> --ref-load <bf16>
 """
 
+import importlib.util
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import typer
 
@@ -77,8 +79,20 @@ class ScriptArgs(U.ExecuteTrainConfig):
             raise ValueError("trainer TP must not exceed the 4 global-attention KV heads")
         if self.target_modules != "attn":
             raise ValueError("MXFP4 engine experts cannot take LoRA; train attention adapters only")
-        if self.sampling_support_replay and self.dflash:
-            raise ValueError("SGLang returns no sampling supports under speculative decoding; turn DFlash off")
+        if self.sampling_support_replay and self.dflash and not _sglang_returns_dflash_supports():
+            raise ValueError(
+                "this SGLang returns no sampling supports under DFlash; build the image with "
+                "docker/compat/patch_sglang_dflash_sampling_mask.py or turn DFlash off"
+            )
+
+
+def _sglang_returns_dflash_supports() -> bool:
+    """docker/compat/patch_sglang_dflash_sampling_mask.py, which refuses other SGLang builds, marks its patch."""
+    spec = importlib.util.find_spec("sglang")
+    if spec is None or not spec.submodule_search_locations:
+        return False
+    dflash_utils = Path(next(iter(spec.submodule_search_locations))) / "srt/speculative/dflash_utils.py"
+    return dflash_utils.is_file() and "DFLASH_SAMPLING_MASK_PATCH" in dflash_utils.read_text()
 
 
 def _serve(args: ScriptArgs) -> None:
