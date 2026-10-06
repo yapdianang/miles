@@ -14,6 +14,8 @@ from miles.backends.megatron_utils.model import run_forward_backward_pass, setup
 from miles.backends.training_utils.data.rollout import get_data_iterator
 from miles.backends.training_utils.metrics.log_utils import aggregate_train_losses
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.backends.training_utils.replay.data import fill_replay_data
+from miles.utils.replay_base import routing_replay_manager
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
 from miles.utils.types import RolloutBatch
 
@@ -28,6 +30,21 @@ def run_forward_backward(
 ) -> dict:
     data_iterator, num_microbatches = get_data_iterator(args, model, rollout_data)
     assert len(num_microbatches) == 1, "a work unit is a single forward/backward pass"
+    # Replay the engine's expert choices (R3) when the gateway attached them to every datum.
+    replay = routing_replay_manager.enabled and "rollout_routed_experts" in rollout_data
+    if replay:
+        fill_replay_data(
+            args=args,
+            models=model,
+            data_iterator=data_iterator,
+            num_microbatches=num_microbatches,
+            rollout_data=rollout_data,
+            data_key=routing_replay_manager.data_key,
+            replay_list=routing_replay_manager.replays,
+            register_replay_list_func=routing_replay_manager.register_replay_list_func,
+            if_sp_region=routing_replay_manager.if_sp_region,
+        )
+    routing_replay_manager.stage = ("replay_forward" if forward_only else "replay_backward") if replay else "fallthrough"
 
     for iterator in data_iterator:
         iterator.reset()
@@ -50,6 +67,9 @@ def run_forward_backward(
     )
     per_datum_outputs = [output for microbatch in losses_reduced for output in microbatch["per_datum"]]
     dumper_phase_util.finalize(model)
+    if replay:
+        routing_replay_manager.clear_all()
+        routing_replay_manager.stage = "fallthrough"
 
     if get_parallel_state().is_pp_last_stage:
         return {"metrics": aggregate_train_losses(losses_reduced, None), "per_datum": per_datum_outputs}

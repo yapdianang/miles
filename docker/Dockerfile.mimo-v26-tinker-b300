@@ -27,6 +27,6 @@ RUN python3 -m py_compile \
       /root/miles/miles/utils/lora/hf_lora_targets.py
 
 LABEL org.opencontainers.image.source="https://github.com/yapdianang/miles" \
-      org.opencontainers.image.revision="dydx/mimo-v26-tinker"
+      org.opencontainers.image.revision="9a025d2bc975da78131f84fff1c6def1e8c0b056"
 
 FROM runtime AS final

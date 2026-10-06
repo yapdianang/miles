@@ -13,7 +13,7 @@ from miles.ray.wiring import get_backend_capability
 from miles.tinker.arguments import add_tinker_arguments, configure_tinker_args
 from miles.tinker.core.service import TinkerService
 from miles.tinker.core.types import GatewayConfig
-from miles.tinker.runtime import MilesBackend
+from miles.tinker.runtime import MilesBackend, RoutedExpertsCache
 from miles.tinker.server.app import build_app
 from miles.utils.arguments import parse_args
 from miles.utils.async_utils import Disposer, with_disposer
@@ -72,9 +72,18 @@ async def serve(args, *, disposer: Disposer):
     dp_size = actor_world_size // (
         args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     )
-    service = TinkerService(
-        MilesBackend(trainer, router_url, dp_size=dp_size, inference_controller=inference_controller), config
+    routed_experts = None
+    if args.use_rollout_routing_replay:
+        routed_experts = RoutedExpertsCache(max_bytes=int(args.tinker_routed_experts_cache_gb * 2**30))
+    backend = MilesBackend(
+        trainer,
+        router_url,
+        dp_size=dp_size,
+        inference_controller=inference_controller,
+        routed_experts=routed_experts,
+        num_layers=args.num_layers,
     )
+    service = TinkerService(backend, config)
 
     server = uvicorn.Server(
         uvicorn.Config(

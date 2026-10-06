@@ -26,6 +26,12 @@ def add_tinker_arguments(parser):
         "checkpoint-root",
         help="Directory for tinker:// checkpoints (default: <save>/tinker)",
     )
+    add_argument(
+        "routed-experts-cache-gb",
+        type=float,
+        default=64.0,
+        help="Host memory for engine-routed experts kept for --use-rollout-routing-replay",
+    )
     return parser
 
 

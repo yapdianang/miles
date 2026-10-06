@@ -50,6 +50,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     max_tokens_per_gpu: int = 65536
     sglang_mem_fraction_static: float = 0.8
     sglang_max_running_requests: int = 64
+    # R3 (MiMo-V2.6 section 6.4): the trainer replays the experts the engine routed each sampled token to.
+    routing_replay: bool = True
     extra_args: str = ""
 
     def __post_init__(self) -> None:
@@ -104,9 +106,10 @@ def _serve(args: ScriptArgs) -> None:
         "--attention-dropout 0.0 --hidden-dropout 0.0 --attention-softmax-in-fp32 --attention-backend fused "
         "--accumulate-allreduce-grads-in-fp32 --optimizer adam --lr 1e-6 "
     )
+    replay_args = "--use-rollout-routing-replay " if args.routing_replay else ""
     train_args = (
         f"{checkpoint_args}{lora_args}{tinker_args}{topology_args}{parallel_args}{batching_args}"
-        f"{sglang_args}{model_args}{args.extra_args}"
+        f"{sglang_args}{model_args}{replay_args}{args.extra_args}"
     )
     args.create_backend().execute_train(
         train_args=train_args,

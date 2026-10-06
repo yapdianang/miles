@@ -1,11 +1,16 @@
 """Translate gateway datums to trainer batches and sampling requests to SGLang."""
 
 import asyncio
+import hashlib
+import logging
 import os
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 
 import httpx
+import numpy as np
+import pybase64
 
 from miles.ray.rollout.train_data_conversion import ROLLOUT_DATA_VALUE_SPEC
 from miles.tinker.core.types import UserInputError
@@ -13,8 +18,40 @@ from miles.utils import object_store
 from miles.utils.http_utils import post
 from tinker.types.sample_response import MASK_LOGPROB
 
+logger = logging.getLogger(__name__)
+
 # internal datum key -> trainer batch key
 DATUM_TO_BATCH_KEYS = {"weights": "loss_weights", "advantages": "advantages", "sampling_logprobs": "rollout_log_probs"}
+
+
+def _tokens_key(tokens: list[int]) -> bytes:
+    return hashlib.blake2b(np.asarray(tokens, dtype=np.int32).tobytes(), digest_size=16).digest()
+
+
+class RoutedExpertsCache:
+    """Engine-routed experts of recent samples, keyed by the tokens a datum feeds the trainer.
+
+    A sample of ``prompt`` with output ``out`` routes ``prompt + out[:-1]``: the same tokens as the
+    datum that trains on it. Entries hold int16 expert ids (``[tokens, layers, topk]``); the oldest
+    are evicted first, so a multi-turn trajectory's earlier calls leave before its last one.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.num_bytes = 0
+        self._entries: OrderedDict[bytes, np.ndarray] = OrderedDict()
+
+    def put(self, tokens: list[int], routes: np.ndarray) -> None:
+        key = _tokens_key(tokens)
+        if key in self._entries:
+            self.num_bytes -= self._entries.pop(key).nbytes
+        self._entries[key] = routes
+        self.num_bytes += routes.nbytes
+        while self.num_bytes > self.max_bytes and len(self._entries) > 1:
+            self.num_bytes -= self._entries.popitem(last=False)[1].nbytes
+
+    def get(self, tokens: list[int]) -> np.ndarray | None:
+        return self._entries.get(_tokens_key(tokens))
 
 
 def _write_exported_checkpoint(path: str, checkpoint_files: dict[str, bytes]) -> None:
@@ -45,7 +82,7 @@ def _pad_to_dp_multiple(slot_datums: list, dp_size: int) -> list:
     return slot_datums + [(slot, filler)] * (dp_size - remainder)
 
 
-def _build_train_data(slot_datums: list) -> dict:
+def _build_train_data(slot_datums: list, routed_experts: RoutedExpertsCache | None = None) -> dict:
     """Miles response_lengths select label positions here, including prompt targets."""
     datums = [datum for _, datum in slot_datums]
     train_data = {
@@ -61,15 +98,33 @@ def _build_train_data(slot_datums: list) -> dict:
     for datum_key, batch_key in DATUM_TO_BATCH_KEYS.items():
         if datum_key in datums[0]:
             train_data[batch_key] = [datum[datum_key] for datum in datums]
+    if routed_experts is not None:
+        routes = [routed_experts.get(datum["tokens"]) for datum in datums]
+        missing = sum(route is None for route in routes)
+        if missing:
+            # Replay is all or nothing per pass; a datum the engine did not sample trains on its own routing.
+            logger.warning(f"routing replay skipped: {missing}/{len(routes)} datums have no engine routes")
+        else:
+            train_data["rollout_routed_experts"] = [route.astype(np.int32) for route in routes]
     return train_data
 
 
 class MilesBackend:
-    def __init__(self, trainer, router_url: str, dp_size: int = 1, inference_controller=None) -> None:
+    def __init__(
+        self,
+        trainer,
+        router_url: str,
+        dp_size: int = 1,
+        inference_controller=None,
+        routed_experts: RoutedExpertsCache | None = None,
+        num_layers: int | None = None,
+    ) -> None:
         self.trainer = trainer
         self.router_url = router_url
         self.dp_size = dp_size
         self.inference_controller = inference_controller
+        self.routed_experts = routed_experts
+        self.num_layers = num_layers
 
     async def trainer_dead(self) -> bool:
         return await self.trainer.has_errored_cell()
@@ -87,7 +142,7 @@ class MilesBackend:
         return await self._execute_batch("forward_only", batch_id, slot_datums, loss_fn, loss_fn_config)
 
     async def _execute_batch(self, method: str, batch_id: int, slot_datums: list, loss_fn: str, loss_fn_config: dict) -> list[dict] | dict:
-        train_data = _build_train_data(_pad_to_dp_multiple(slot_datums, self.dp_size))
+        train_data = _build_train_data(_pad_to_dp_multiple(slot_datums, self.dp_size), self.routed_experts)
         train_data["loss_fn"] = loss_fn
         train_data["loss_fn_config"] = loss_fn_config
         worker_results = await self._call_trainer(method, batch_id, train_data)
@@ -148,12 +203,22 @@ class MilesBackend:
         for sequence in sequences:
             if "error" in sequence:
                 return sequence
+        if self.routed_experts is not None:
+            for sequence, response in zip(sequences, responses, strict=True):
+                self._cache_routes(payload["prompt_tokens"], sequence["tokens"], response)
         result = {"sequences": sequences}
         if payload["prompt_logprobs"]:
             result["prompt_logprobs"] = _prompt_logprobs(responses[0])
         if payload["topk_prompt_logprobs"]:
             result["topk_prompt_logprobs"] = _topk_prompt_logprobs(responses[0], payload["topk_prompt_logprobs"])
         return result
+
+    def _cache_routes(self, prompt_tokens: list[int], output_tokens: list[int], response: dict) -> None:
+        tokens = prompt_tokens + output_tokens[:-1]
+        encoded = response["meta_info"]["routed_experts"]
+        routes = np.frombuffer(pybase64.b64decode(encoded.encode("ascii")), dtype=np.int32)
+        routes = routes.reshape(len(tokens), self.num_layers, -1)
+        self.routed_experts.put(tokens, routes.astype(np.int16))
 
     def _generate_request(self, payload: dict, lora_name: str | None, lora_path: str | None = None) -> dict:
         params = payload["sampling_params"]
@@ -178,6 +243,8 @@ class MilesBackend:
             else:
                 sampling_params["stop"] = stop
         request = {"input_ids": payload["prompt_tokens"], "sampling_params": sampling_params, "return_logprob": True}
+        if self.routed_experts is not None:
+            request["return_routed_experts"] = True
         if payload["prompt_logprobs"] or payload["topk_prompt_logprobs"]:
             request["logprob_start_len"] = 0
         if payload["topk_prompt_logprobs"]:
