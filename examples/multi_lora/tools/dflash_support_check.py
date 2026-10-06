@@ -194,7 +194,13 @@ def compare_accept_lengths(off: list[float], on: list[float]) -> dict:
 async def run(args) -> dict:
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, local_files_only=True, trust_remote_code=True)
     prompts = [
-        tokenizer.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True, tokenize=True)
+        # Render, then encode: some transformers return a BatchEncoding from tokenize=True.
+        tokenizer.encode(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}], add_generation_prompt=True, tokenize=False
+            ),
+            add_special_tokens=False,
+        )
         for text in PROMPTS
     ]
     stop_ids = tokenizer.encode(args.stop_text, add_special_tokens=False)
