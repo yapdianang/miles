@@ -41,7 +41,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     actor_num_nodes: int = 1
     actor_num_gpus_per_node: int = 4
     rollout_num_gpus: int = 4
-    tp: int = 2
+    tp: int = 4
 
     lora_rank: int = 32
     lora_alpha: int = 32
@@ -49,10 +49,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
     target_modules: str = "attn"
 
     tinker_port: int = 10613
-    context_length: int = 131072
-    max_tokens_per_gpu: int = 65536
-    sglang_mem_fraction_static: float = 0.8
-    sglang_max_running_requests: int = 64
+    # A datum may be as long as the client's context window (Model Endpoint default 262144 tokens).
+    context_length: int = 262144
+    max_tokens_per_gpu: int = 262144
+    # DFlash speculative decoding with the drafter shipped in the checkpoint's dflash/ directory.
+    dflash: bool = True
     # R3 (MiMo-V2.6 section 6.4): the trainer replays the experts the engine routed each sampled token to.
     routing_replay: bool = True
     extra_args: str = ""
@@ -96,15 +97,30 @@ def _serve(args: ScriptArgs) -> None:
         f"--max-tokens-per-gpu {args.max_tokens_per_gpu} --micro-batch-size 1 --use-dynamic-batch-size "
         "--qkv-format thd "
     )
-    # The SGLang cookbook launch for MiMo-V2.6 on B300 (sglang#40448), as in the Miles MXFP4 engine path.
+    # Xiaomi's verified B300 Flash launch from the SGLang MiMo-V2.6 cookbook (sglang 983e6438, PR #40448),
+    # flag for flag. SGLang itself turns FA4 page size 1 into 128 and drops the DP LM head at dp 1.
+    # Miles adds LoRA, routed-expert capture (R3), and its own host/port/seed arguments.
     sglang_args = (
         f"--rollout-num-gpus-per-engine {_ENGINE_GPUS} --sglang-ep-size {_ENGINE_GPUS} "
+        "--sglang-dp-size 1 --sglang-pp-size 1 "
         "--sglang-moe-runner-backend deep_gemm --sglang-moe-a2a-backend deepep --sglang-deepep-mode auto "
-        "--sglang-attention-backend fa4 --sglang-page-size 1 --sglang-moe-dense-tp-size 1 "
-        "--sglang-enable-dp-lm-head --sglang-swa-full-tokens-ratio 0.1 --sglang-chunked-prefill-size 32768 "
-        f"--sglang-max-running-requests {args.sglang_max_running_requests} "
-        f"--sglang-mem-fraction-static {args.sglang_mem_fraction_static} --sglang-lora-backend triton "
+        "--sglang-moe-dense-tp-size 1 --sglang-enable-dp-lm-head "
+        "--sglang-log-level-http warning --sglang-enable-cache-report "
+        "--sglang-page-size 1 --sglang-cuda-graph-max-bs-decode 64 --sglang-max-running-requests 64 "
+        "--sglang-mem-fraction-static 0.6 --sglang-swa-full-tokens-ratio 0.03 "
+        "--sglang-chunked-prefill-size 49152 --sglang-max-prefill-tokens 65536 "
+        "--sglang-reasoning-parser mimo --sglang-tool-call-parser mimo "
+        "--sglang-attention-backend fa4 --sglang-context-length 1048576 "
+        "--sglang-cuda-graph-backend-prefill disabled "
+        "--sglang-mm-enable-dp-encoder --sglang-mm-attention-backend fa4 "
+        "--sglang-lora-backend triton "
     )
+    if args.dflash:
+        sglang_args += (
+            "--sglang-speculative-algorithm DFLASH "
+            f"--sglang-speculative-draft-model-path {args.hf_checkpoint}/dflash "
+            "--sglang-speculative-num-draft-tokens 8 "
+        )
     model_args = (
         "--attention-dropout 0.0 --hidden-dropout 0.0 --attention-softmax-in-fp32 --attention-backend fused "
         "--accumulate-allreduce-grads-in-fp32 --optimizer adam --lr 1e-6 "
