@@ -50,10 +50,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     target_modules: str = "attn"
 
     tinker_port: int = 10613
-    # The client caps a trajectory's context at 128K (Tau3 MiMo configs); a 250K-token datum runs the TP4
-    # trainer out of memory in the unfused fp32 cross entropy.
-    context_length: int = 131072
-    max_tokens_per_gpu: int = 131072
+    # 256K needs fused_loss: the logits path runs the TP4 trainer out of memory on a 250K-token datum.
+    context_length: int = 262144
+    max_tokens_per_gpu: int = 262144
     # DFlash speculative decoding with the drafter shipped in the checkpoint's dflash/ directory.
     dflash: bool = True
     # flashinfer_mxfp4 (TRT-LLM on SM100) runs the MXFP4 experts on BF16 activations without an all-to-all;
