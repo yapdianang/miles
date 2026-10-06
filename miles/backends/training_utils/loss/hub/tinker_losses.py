@@ -10,6 +10,7 @@ from collections.abc import Callable
 import torch
 
 from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy
+from miles.utils.sampling_mask import PartialSamplingMask
 from miles.utils.types import RolloutBatch
 
 PPO_DEFAULTS = {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2}
@@ -31,8 +32,21 @@ def _target_logprobs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor)
         response_lengths=batch["response_lengths"],
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
+        rollout_sampling_mask=_sampling_supports(batch),
     )
     return outputs["log_probs"]
+
+
+def _sampling_supports(batch: RolloutBatch) -> list[PartialSamplingMask] | None:
+    """The engine's top-k/top-p supports: a position with one renormalizes within it, as the sampler did."""
+    if batch.get("rollout_sampling_mask_ids") is None:
+        return None
+    return [
+        PartialSamplingMask(ids=torch.as_tensor(ids), offsets=torch.as_tensor(offsets))
+        for ids, offsets in zip(
+            batch["rollout_sampling_mask_ids"], batch["rollout_sampling_mask_offsets"], strict=True
+        )
+    ]
 
 
 def _as_tensor_like(values, reference: torch.Tensor) -> torch.Tensor:

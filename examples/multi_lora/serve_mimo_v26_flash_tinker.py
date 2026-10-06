@@ -59,6 +59,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     moe_a2a_backend: str = "deepep"
     # R3 (MiMo-V2.6 section 6.4): the trainer replays the experts the engine routed each sampled token to.
     routing_replay: bool = True
+    # Top-p candidate-set replay (section 6.4): the trainer renormalizes within each sampled token's support.
+    # Clients sampling with top_p < 1 must also pass a top_k bound (at most --sglang-sampling-mask-max-tokens).
+    sampling_support_replay: bool = False
     extra_args: str = ""
 
     def __post_init__(self) -> None:
@@ -130,6 +133,8 @@ def _serve(args: ScriptArgs) -> None:
         "--accumulate-allreduce-grads-in-fp32 --optimizer adam --lr 1e-6 "
     )
     replay_args = "--use-rollout-routing-replay " if args.routing_replay else ""
+    if args.sampling_support_replay:
+        replay_args += "--tinker-sampling-support-replay "
     train_args = (
         f"{checkpoint_args}{lora_args}{tinker_args}{topology_args}{parallel_args}{batching_args}"
         f"{sglang_args}{model_args}{replay_args}{args.extra_args}"

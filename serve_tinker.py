@@ -13,7 +13,7 @@ from miles.ray.wiring import get_backend_capability
 from miles.tinker.arguments import add_tinker_arguments, configure_tinker_args
 from miles.tinker.core.service import TinkerService
 from miles.tinker.core.types import GatewayConfig
-from miles.tinker.runtime import MilesBackend, RoutedExpertsCache
+from miles.tinker.runtime import MilesBackend, RoutedExpertsCache, SamplingSupportCache
 from miles.tinker.server.app import build_app
 from miles.utils.arguments import parse_args
 from miles.utils.async_utils import Disposer, with_disposer
@@ -75,6 +75,9 @@ async def serve(args, *, disposer: Disposer):
     routed_experts = None
     if args.use_rollout_routing_replay:
         routed_experts = RoutedExpertsCache(max_bytes=int(args.tinker_routed_experts_cache_gb * 2**30))
+    sampling_supports = None
+    if args.tinker_sampling_support_replay:
+        sampling_supports = SamplingSupportCache(max_bytes=int(args.tinker_sampling_support_cache_gb * 2**30))
     backend = MilesBackend(
         trainer,
         router_url,
@@ -82,6 +85,7 @@ async def serve(args, *, disposer: Disposer):
         inference_controller=inference_controller,
         routed_experts=routed_experts,
         num_layers=args.num_layers,
+        sampling_supports=sampling_supports,
     )
     service = TinkerService(backend, config)
 

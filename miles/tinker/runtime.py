@@ -2,15 +2,18 @@
 
 import asyncio
 import hashlib
+import itertools
 import logging
 import os
 import tempfile
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 import numpy as np
 import pybase64
+import torch
 
 from miles.ray.rollout.train_data_conversion import ROLLOUT_DATA_VALUE_SPEC
 from miles.tinker.core.types import UserInputError
@@ -54,6 +57,145 @@ class RoutedExpertsCache:
         return self._entries.get(_tokens_key(tokens))
 
 
+_PREFIX_HASH_BASE = np.uint64(0x9E3779B97F4A7C15)
+
+
+def _prefix_hashes(tokens: np.ndarray) -> np.ndarray:
+    """``hashes[L - 1]`` hashes ``tokens[:L]``: a polynomial in a fixed odd base modulo 2**64."""
+    powers = np.full(len(tokens), _PREFIX_HASH_BASE, dtype=np.uint64)
+    powers[:1] = 1
+    return np.cumsum((tokens.astype(np.uint64) + np.uint64(1)) * np.cumprod(powers), dtype=np.uint64)
+
+
+@dataclass(frozen=True, eq=False)
+class _SampledSupports:
+    """One sample's output tokens and, per token, the support (CSR ``ids``/``offsets``) it was drawn from."""
+
+    prompt_len: int
+    tokens: np.ndarray
+    ids: np.ndarray
+    offsets: np.ndarray
+
+    @property
+    def nbytes(self) -> int:
+        return self.tokens.nbytes + self.ids.nbytes + self.offsets.nbytes
+
+
+class SamplingSupportCache:
+    """Engine sampling supports (top-k/top-p candidate sets) of recent samples, per sampled token.
+
+    A sample of ``prompt`` drew ``out[j]`` from the support recorded for ``prompt + out[:j]``. A
+    multi-turn datum spans several samples (each turn's prompt extends the previous prompt and
+    output), so samples are keyed by a hash of their prompt and a datum finds every sample whose
+    prompt is one of its prefixes in one pass. The oldest samples are evicted first.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.num_bytes = 0
+        self._entries: OrderedDict[_SampledSupports, int] = OrderedDict()
+        self._by_prompt: dict[int, list[_SampledSupports]] = {}
+        self._sorted_keys: np.ndarray | None = None
+
+    def put(self, prompt_tokens: list[int], samples: list[tuple[list[int], list[list[int]]]]) -> None:
+        """Record ``(output tokens, per-token supports)`` of each sample of one prompt."""
+        if not prompt_tokens:
+            return
+        key = int(_prefix_hashes(np.asarray(prompt_tokens, dtype=np.int64))[-1])
+        for output_tokens, supports in samples:
+            entry = _sampled_supports(len(prompt_tokens), output_tokens, supports)
+            self._by_prompt.setdefault(key, []).append(entry)
+            self._entries[entry] = key
+            self.num_bytes += entry.nbytes
+        self._sorted_keys = None
+        while self.num_bytes > self.max_bytes and len(self._entries) > 1:
+            entry, key = self._entries.popitem(last=False)
+            self.num_bytes -= entry.nbytes
+            bucket = self._by_prompt[key]
+            bucket.remove(entry)
+            if not bucket:
+                del self._by_prompt[key]
+
+    def lookup(self, tokens: list[int], target_tokens: list[int]) -> tuple[np.ndarray, np.ndarray]:
+        """A datum's supports as CSR ``(ids, offsets)`` over its targets; positions no sample covers are empty.
+
+        Target ``i`` scores ``tokens[i + 1]`` after ``tokens[: i + 1]``. A sample with prompt
+        ``tokens[:p]`` covers target ``p - 1 + j`` while its ``out[: j + 1]`` matches the datum's tokens and
+        targets; where samples overlap, the one with the longer prompt (the later call) wins.
+        """
+        num_targets = len(target_tokens)
+        tokens = np.asarray(tokens, dtype=np.int64)
+        targets = np.asarray(target_tokens, dtype=np.int64)
+        segments: list[tuple[int, _SampledSupports, int]] = []
+        if self._by_prompt:
+            hashes = _prefix_hashes(tokens[:num_targets])
+            keys = self._keys()
+            found = keys[np.minimum(np.searchsorted(keys, hashes), len(keys) - 1)] == hashes
+            for prompt_len in (np.flatnonzero(found) + 1).tolist():
+                entry, count = self._longest_match(int(hashes[prompt_len - 1]), prompt_len, tokens, targets)
+                if count == 0:
+                    continue
+                start = prompt_len - 1
+                if segments and segments[-1][0] + segments[-1][2] > start:
+                    first, previous, _ = segments[-1]
+                    segments[-1] = (first, previous, start - first)
+                segments.append((start, entry, count))
+        lengths = np.zeros(num_targets, dtype=np.int64)
+        for start, entry, count in segments:
+            lengths[start : start + count] = np.diff(entry.offsets[: count + 1])
+        offsets = np.zeros(num_targets + 1, dtype=np.int64)
+        np.cumsum(lengths, out=offsets[1:])
+        ids = np.empty(offsets[-1], dtype=np.int32)
+        for start, entry, count in segments:
+            ids[offsets[start] : offsets[start + count]] = entry.ids[: entry.offsets[count]]
+        return ids, offsets
+
+    def _keys(self) -> np.ndarray:
+        if self._sorted_keys is None:
+            self._sorted_keys = np.sort(np.fromiter(self._by_prompt, dtype=np.uint64, count=len(self._by_prompt)))
+        return self._sorted_keys
+
+    def _longest_match(
+        self, key: int, prompt_len: int, tokens: np.ndarray, targets: np.ndarray
+    ) -> tuple[_SampledSupports | None, int]:
+        """The sample of this prompt whose output agrees longest with the datum's tokens (ties go to the latest),
+        and how many of its targets it covers: coverage also stops where a target leaves the sampled output."""
+        best, best_count, available = None, 0, 0
+        for entry in self._by_prompt[key]:
+            if entry.prompt_len != prompt_len:
+                continue
+            entry_available = min(len(entry.tokens), len(targets) - prompt_len + 1)
+            count = _agreement(entry.tokens[:entry_available], tokens[prompt_len : prompt_len + entry_available])
+            if count >= best_count:
+                best, best_count, available = entry, count, entry_available
+        if best is None:
+            return None, 0
+        return best, min(
+            best_count, _agreement(best.tokens[:available], targets[prompt_len - 1 : prompt_len - 1 + available])
+        )
+
+
+def _agreement(first: np.ndarray, second: np.ndarray) -> int:
+    """Length of the common prefix of two equal-length arrays."""
+    differs = np.flatnonzero(first != second)
+    return int(differs[0]) if differs.size else len(first)
+
+
+def _sampled_supports(prompt_len: int, output_tokens: list[int], supports: list[list[int]]) -> _SampledSupports:
+    if len(supports) != len(output_tokens):
+        raise ValueError(f"{len(supports)} sampling supports for {len(output_tokens)} output tokens")
+    lengths = np.fromiter(map(len, supports), dtype=np.int64, count=len(supports))
+    if (lengths == 0).any():
+        raise ValueError("an empty sampling support")
+    offsets = np.zeros(len(supports) + 1, dtype=np.int64)
+    np.cumsum(lengths, out=offsets[1:])
+    ids = np.fromiter(itertools.chain.from_iterable(supports), dtype=np.int32, count=int(offsets[-1]))
+    tokens = np.asarray(output_tokens, dtype=np.int32)
+    if len(tokens) and not np.logical_or.reduceat(ids == np.repeat(tokens, lengths), offsets[:-1]).all():
+        raise ValueError("a sampled token is outside its sampling support")
+    return _SampledSupports(prompt_len, tokens, ids, offsets)
+
+
 def _write_exported_checkpoint(path: str, checkpoint_files: dict[str, bytes]) -> None:
     """Publish returned trainer files safely when the checkpoint mount is shared."""
     checkpoint = Path(path)
@@ -82,7 +224,11 @@ def _pad_to_dp_multiple(slot_datums: list, dp_size: int) -> list:
     return slot_datums + [(slot, filler)] * (dp_size - remainder)
 
 
-def _build_train_data(slot_datums: list, routed_experts: RoutedExpertsCache | None = None) -> dict:
+def _build_train_data(
+    slot_datums: list,
+    routed_experts: RoutedExpertsCache | None = None,
+    sampling_supports: SamplingSupportCache | None = None,
+) -> dict:
     """Miles response_lengths select label positions here, including prompt targets."""
     datums = [datum for _, datum in slot_datums]
     train_data = {
@@ -106,7 +252,34 @@ def _build_train_data(slot_datums: list, routed_experts: RoutedExpertsCache | No
             logger.warning(f"routing replay skipped: {missing}/{len(routes)} datums have no engine routes")
         else:
             train_data["rollout_routed_experts"] = [route.astype(np.int32) for route in routes]
+    if sampling_supports is not None:
+        supports = [sampling_supports.lookup(datum["tokens"], datum["target_tokens"]) for datum in datums]
+        _warn_unsupported_loss_positions(datums, supports)
+        if any(offsets[-1] for _, offsets in supports):
+            train_data["rollout_sampling_mask_ids"] = [torch.from_numpy(ids) for ids, _ in supports]
+            train_data["rollout_sampling_mask_offsets"] = [torch.from_numpy(offsets) for _, offsets in supports]
     return train_data
+
+
+def _warn_unsupported_loss_positions(datums: list[dict], supports: list[tuple[np.ndarray, np.ndarray]]) -> None:
+    """Loss positions without an engine support normalize over the full vocabulary; report how many."""
+    num_missing = num_loss = num_datums = 0
+    for datum, (_, offsets) in zip(datums, supports, strict=True):
+        if datum.get("padding"):
+            continue
+        loss = np.zeros(datum["target_len"], dtype=bool)
+        for key in ("weights", "advantages"):
+            if key in datum:
+                loss |= np.asarray(datum[key]) != 0
+        missing = int((loss & (np.diff(offsets) == 0)).sum())
+        num_missing += missing
+        num_loss += int(loss.sum())
+        num_datums += missing > 0
+    if num_missing:
+        logger.warning(
+            f"sampling-support replay: {num_missing}/{num_loss} loss positions in {num_datums} datums have no "
+            "engine support and normalize over the full vocabulary"
+        )
 
 
 class MilesBackend:
@@ -118,6 +291,7 @@ class MilesBackend:
         inference_controller=None,
         routed_experts: RoutedExpertsCache | None = None,
         num_layers: int | None = None,
+        sampling_supports: SamplingSupportCache | None = None,
     ) -> None:
         self.trainer = trainer
         self.router_url = router_url
@@ -125,6 +299,7 @@ class MilesBackend:
         self.inference_controller = inference_controller
         self.routed_experts = routed_experts
         self.num_layers = num_layers
+        self.sampling_supports = sampling_supports
 
     async def trainer_dead(self) -> bool:
         return await self.trainer.has_errored_cell()
@@ -142,7 +317,9 @@ class MilesBackend:
         return await self._execute_batch("forward_only", batch_id, slot_datums, loss_fn, loss_fn_config)
 
     async def _execute_batch(self, method: str, batch_id: int, slot_datums: list, loss_fn: str, loss_fn_config: dict) -> list[dict] | dict:
-        train_data = _build_train_data(_pad_to_dp_multiple(slot_datums, self.dp_size), self.routed_experts)
+        train_data = _build_train_data(
+            _pad_to_dp_multiple(slot_datums, self.dp_size), self.routed_experts, self.sampling_supports
+        )
         train_data["loss_fn"] = loss_fn
         train_data["loss_fn_config"] = loss_fn_config
         worker_results = await self._call_trainer(method, batch_id, train_data)
@@ -206,6 +383,11 @@ class MilesBackend:
         if self.routed_experts is not None:
             for sequence, response in zip(sequences, responses, strict=True):
                 self._cache_routes(payload["prompt_tokens"], sequence["tokens"], response)
+        if request.get("return_sampling_mask"):
+            try:
+                self._cache_supports(payload["prompt_tokens"], sequences, responses)
+            except (KeyError, ValueError) as error:
+                return {"error": f"the engine returned no valid sampling supports: {error!r}"}
         result = {"sequences": sequences}
         if payload["prompt_logprobs"]:
             result["prompt_logprobs"] = _prompt_logprobs(responses[0])
@@ -219,6 +401,18 @@ class MilesBackend:
         routes = np.frombuffer(pybase64.b64decode(encoded.encode("ascii")), dtype=np.int32)
         routes = routes.reshape(len(tokens), self.num_layers, -1)
         self.routed_experts.put(tokens, routes.astype(np.int16))
+
+    def _cache_supports(self, prompt_tokens: list[int], sequences: list[dict], responses: list[dict]) -> None:
+        """Record each sample's supports and return its logprobs renormalized within them, as the trainer scores them."""
+        samples = []
+        for sequence, response in zip(sequences, responses, strict=True):
+            meta = response["meta_info"]
+            logprobs = [float(logprob) for logprob in meta["output_token_sampling_logprobs"]]
+            if len(logprobs) != len(sequence["tokens"]):
+                raise ValueError(f"{len(logprobs)} sampling logprobs for {len(sequence['tokens'])} output tokens")
+            sequence["logprobs"] = logprobs
+            samples.append((sequence["tokens"], meta["output_token_sampling_mask"]))
+        self.sampling_supports.put(prompt_tokens, samples)
 
     def _generate_request(self, payload: dict, lora_name: str | None, lora_path: str | None = None) -> dict:
         params = payload["sampling_params"]
@@ -245,6 +439,8 @@ class MilesBackend:
         request = {"input_ids": payload["prompt_tokens"], "sampling_params": sampling_params, "return_logprob": True}
         if self.routed_experts is not None:
             request["return_routed_experts"] = True
+        if self.sampling_supports is not None and _draws_from_support(sampling_params):
+            request["return_sampling_mask"] = True
         if payload["prompt_logprobs"] or payload["topk_prompt_logprobs"]:
             request["logprob_start_len"] = 0
         if payload["topk_prompt_logprobs"]:
@@ -255,6 +451,20 @@ class MilesBackend:
                 # request-carried backfill source: the engine refills an evicted version itself
                 request["lora_backfill_paths"] = {lora_name: lora_path}
         return request
+
+
+def _draws_from_support(sampling_params: dict) -> bool:
+    """Whether the engine samples from a top-k/top-p support narrower than the vocabulary."""
+    top_k = sampling_params["top_k"]
+    if sampling_params["temperature"] <= 0 or top_k == 1:
+        return False
+    if top_k > 1:
+        return True
+    if sampling_params["top_p"] < 1:
+        raise UserInputError(
+            "top_p below 1 needs a top_k bound: the engine returns sampling supports only under a finite top_k"
+        )
+    return False
 
 
 def _slot_failure(worker_results: list) -> dict | None:

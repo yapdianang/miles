@@ -1,6 +1,7 @@
 from array import array
 from collections.abc import Sequence
 from dataclasses import InitVar, dataclass, field
+from typing import ClassVar
 
 import torch
 
@@ -21,13 +22,17 @@ class RolloutSamplingMask:
     offsets: InitVar[Sequence[int] | torch.Tensor]
     _ids: torch.Tensor = field(init=False, repr=False)
     _offsets: torch.Tensor = field(init=False, repr=False)
+    allows_empty_rows: ClassVar[bool] = False
 
     def __post_init__(self, ids: Sequence[int] | torch.Tensor, offsets: Sequence[int] | torch.Tensor):
         owned_ids = _to_owned_cpu_integer_tensor(ids, dtype=torch.int32)
         owned_offsets = _to_owned_cpu_integer_tensor(offsets, dtype=torch.long)
         if owned_offsets.numel() == 0 or owned_offsets[0] != 0 or owned_offsets[-1] != owned_ids.numel():
             raise ValueError("sampling-mask offsets must start at zero and end at the flattened id count")
-        if torch.any(owned_offsets[1:] <= owned_offsets[:-1]):
+        if self.allows_empty_rows:
+            if torch.any(owned_offsets[1:] < owned_offsets[:-1]):
+                raise ValueError("sampling-mask offsets must be non-decreasing")
+        elif torch.any(owned_offsets[1:] <= owned_offsets[:-1]):
             raise ValueError(
                 "sampling-mask offsets must be strictly increasing: "
                 "every response token needs a non-empty sampling mask"
@@ -121,6 +126,15 @@ class RolloutSamplingMask:
             for start, end in zip(run_starts[:-1], run_starts[1:], strict=True)
         ]
         return (parts[0] if len(parts) == 1 else torch.cat(parts)), lengths
+
+
+class PartialSamplingMask(RolloutSamplingMask):
+    """A sampling mask whose empty rows leave their positions on the full vocabulary.
+
+    Tinker datums score every position, but only engine-sampled positions have a support.
+    """
+
+    allows_empty_rows = True
 
 
 def _to_owned_cpu_integer_tensor(

@@ -32,6 +32,20 @@ def add_tinker_arguments(parser):
         default=64.0,
         help="Host memory for engine-routed experts kept for --use-rollout-routing-replay",
     )
+    add_argument(
+        "sampling-support-replay",
+        action="store_true",
+        help=(
+            "Record the engine's top-k/top-p sampling support of each sampled token and renormalize "
+            "training log-probs within it; sampled logprobs are returned renormalized the same way"
+        ),
+    )
+    add_argument(
+        "sampling-support-cache-gb",
+        type=float,
+        default=16.0,
+        help="Host memory for sampling supports kept for --tinker-sampling-support-replay",
+    )
     return parser
 
 

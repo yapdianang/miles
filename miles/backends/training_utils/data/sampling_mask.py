@@ -39,6 +39,8 @@ def build_local_sampling_mask(
 
     Returns:
         Bool mask shaped like ``logits``; True marks ids inside the support.
+        A row whose support is empty (a ``PartialSamplingMask`` position the
+        engine did not sample) is all True.
     """
     if isinstance(response_indices, torch.Tensor) and (
         response_indices.ndim != 1
@@ -69,4 +71,8 @@ def build_local_sampling_mask(
     flat_local_indices = row_indices[is_local] * local_vocab_size + selected_ids[is_local].to(torch.long) - vocab_start
     mask = torch.zeros(logits.numel(), dtype=torch.bool, device=logits.device)
     mask[flat_local_indices] = True
-    return mask.view_as(logits)
+    mask = mask.view_as(logits)
+    unrestricted = lengths == 0
+    if unrestricted.any():
+        mask[unrestricted.to(logits.device)] = True
+    return mask
