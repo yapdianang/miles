@@ -49,9 +49,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     target_modules: str = "attn"
 
     tinker_port: int = 10613
-    # A datum may be as long as the client's context window (Model Endpoint default 262144 tokens).
-    context_length: int = 262144
-    max_tokens_per_gpu: int = 262144
+    # The client caps a trajectory's context at 128K (Tau3 MiMo configs); a 250K-token datum runs the TP4
+    # trainer out of memory in the unfused fp32 cross entropy.
+    context_length: int = 131072
+    max_tokens_per_gpu: int = 131072
     # DFlash speculative decoding with the drafter shipped in the checkpoint's dflash/ directory.
     dflash: bool = True
     # R3 (MiMo-V2.6 section 6.4): the trainer replays the experts the engine routed each sampled token to.
