@@ -58,6 +58,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     dflash: bool = True
     # The cookbook's MoE all-to-all; sglang#41041 measures "none" faster on B300 TP4/EP4.
     moe_a2a_backend: str = "deepep"
+    # deep_gemm runs the MXFP4 experts; a BF16 engine checkpoint needs another MoE runner (e.g. triton).
+    moe_runner_backend: str = "deep_gemm"
+    sglang_mem_fraction_static: float = 0.6
     # R3 (MiMo-V2.6 section 6.4): the trainer replays the experts the engine routed each sampled token to.
     routing_replay: bool = True
     # Top-p candidate-set replay (section 6.4): the trainer renormalizes within each sampled token's support.
@@ -111,12 +114,12 @@ def _serve(args: ScriptArgs) -> None:
     sglang_args = (
         f"--rollout-num-gpus-per-engine {_ENGINE_GPUS} --sglang-ep-size {_ENGINE_GPUS} "
         "--sglang-dp-size 1 --sglang-pp-size 1 "
-        f"--sglang-moe-runner-backend deep_gemm --sglang-moe-a2a-backend {args.moe_a2a_backend} "
+        f"--sglang-moe-runner-backend {args.moe_runner_backend} --sglang-moe-a2a-backend {args.moe_a2a_backend} "
         "--sglang-deepep-mode auto "
         "--sglang-moe-dense-tp-size 1 --sglang-enable-dp-lm-head "
         "--sglang-log-level-http warning --sglang-enable-cache-report "
         "--sglang-page-size 1 --sglang-cuda-graph-max-bs-decode 64 --sglang-max-running-requests 64 "
-        "--sglang-mem-fraction-static 0.6 --sglang-swa-full-tokens-ratio 0.03 "
+        f"--sglang-mem-fraction-static {args.sglang_mem_fraction_static} --sglang-swa-full-tokens-ratio 0.03 "
         "--sglang-chunked-prefill-size 49152 --sglang-max-prefill-tokens 65536 "
         "--sglang-reasoning-parser mimo --sglang-tool-call-parser mimo "
         "--sglang-attention-backend fa4 --sglang-context-length 1048576 "
