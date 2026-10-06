@@ -9,6 +9,12 @@ RUN pip install --no-cache-dir "tinker==0.32.0"
 # packed (thd) sequences on SM100.
 RUN pip install --no-cache-dir "nvidia-cudnn-cu13==9.27.0.42"
 
+# sgl-project/sglang#34201 (merged upstream 2026-09-30, not in sglang-miles f19dcfb): record top-p/top-k
+# candidate sets under DFlash speculative decoding.
+COPY docker/compat/sglang_pr34201.patch /tmp/sglang_pr34201.patch
+RUN cd /sgl-workspace/sglang && \
+    (git apply --reverse --check /tmp/sglang_pr34201.patch 2>/dev/null || git apply /tmp/sglang_pr34201.patch)
+
 COPY docker/compat/patch_sglang_mimo_v2_lora.py /tmp/patch_sglang_mimo_v2_lora.py
 RUN python3 /tmp/patch_sglang_mimo_v2_lora.py
 

@@ -1,0 +1,856 @@
+diff --git a/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py b/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
+index 963f98ad3d40..0a229f001579 100644
+--- a/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
++++ b/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
+@@ -11,7 +11,7 @@
+ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+ from sglang.srt.speculative.dflash_utils import (
+     _get_or_create_chain_verify_buffers,
+-    build_dflash_verify_target_probs,
++    build_speculative_verify_target_probs,
+     compute_dflash_correct_drafts_and_bonus,
+ )
+ from sglang.srt.utils import is_npu
+@@ -104,7 +104,7 @@ def _accept_sampling_core(
+             rows_per_request=verify_num_draft_tokens,
+         ).view(bs, verify_num_draft_tokens, -1)
+     else:
+-        target_probs = build_dflash_verify_target_probs(
++        target_probs = build_speculative_verify_target_probs(
+             next_token_logits=target_logits,
+             sampling_info=sampling_info,
+             draft_token_num=verify_num_draft_tokens,
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 77b47df9c9d3..39f14bc9f9e0 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -106,6 +106,7 @@ class SamplingMaskOutput:
+     selected_logprobs: torch.Tensor
+     support_logprobs: Optional[torch.Tensor]
+     statuses: torch.Tensor
++    num_accept_tokens: Optional[torch.Tensor] = None
+ 
+     def map_device_tensors(self, fn) -> None:
+         self.token_ids = fn(self.token_ids)
+@@ -114,6 +115,8 @@ def map_device_tensors(self, fn) -> None:
+         if self.support_logprobs is not None:
+             self.support_logprobs = fn(self.support_logprobs)
+         self.statuses = fn(self.statuses)
++        if self.num_accept_tokens is not None:
++            self.num_accept_tokens = fn(self.num_accept_tokens)
+ 
+ 
+ def _trace_e2e_logits(stage: str, **fields) -> None:
+@@ -235,8 +238,12 @@ class LogitsProcessorOutput:
+     # Post-filter support IDs and requested behavior logprobs, bounded by server
+     # capacity. Logprobs are normalized over the full realized support.
+     sampling_mask_output: Optional[SamplingMaskOutput] = None
+-    next_token_sampling_mask_idx: Optional[List[Optional[np.ndarray]]] = None
+-    next_token_sampling_logprobs: Optional[List[Optional[np.ndarray]]] = None
++    next_token_sampling_mask_idx: Optional[
++        List[Optional[Union[np.ndarray, List[np.ndarray]]]]
++    ] = None
++    next_token_sampling_logprobs: Optional[
++        List[Optional[Union[np.ndarray, List[np.ndarray]]]]
++    ] = None
+     next_token_sampling_mask_status: Optional[List[Optional[int]]] = None
+ 
+     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index b35a56451c49..e5b4125f9049 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -329,6 +329,9 @@
+     get_draft_recurrent_hidden_state_spec_from_config,
+ )
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
++from sglang.srt.speculative.spec_sampling_mask import (
++    validate_spec_sampling_mask_request,
++)
+ from sglang.srt.speculative.uno_validation import validate_uno_request
+ from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
+ from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
+@@ -2964,14 +2967,10 @@ def handle_generate_request(
+                 return
+ 
+         if req.return_sampling_mask and not self.spec_algorithm.is_none():
+-            # Spec workers do not emit one sampling support per accepted token, so
+-            # the returned mask would not align 1:1 with generated tokens. Reject
+-            # the combination instead of silently returning a misaligned mask.
+-            error_msg = (
+-                "return_sampling_mask is not supported with speculative decoding."
+-            )
+-            self._reject_sampling_mask_request(req, error_msg)
+-            return
++            error_msg = validate_spec_sampling_mask_request(req, self.spec_algorithm)
++            if error_msg is not None:
++                self._reject_sampling_mask_request(req, error_msg)
++                return
+ 
+         if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
+             # The ascend backend samples from logits directly and never builds the
+@@ -5299,6 +5298,52 @@ def get_internal_state(self, recv_req: GetInternalStateReq):
+ 
+         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
+ 
++    def _has_active_sampling_mask_request(self) -> bool:
++        """Whether any unfinished request holding a sampling mask is queued or
++        running, including PP micro-batches and PD decode queues."""
++        active_batches = [self.running_batch, self.last_batch]
++        active_batches.extend(getattr(self, "running_mbs", ()))
++        active_batches.extend(getattr(self, "mbs", ()))
++        active_batches.extend(getattr(self, "last_mbs", ()))
++        has_active_mask_request = any(
++            req.return_sampling_mask and not req.finished()
++            for batch in active_batches
++            if batch is not None
++            for req in batch.reqs
++        )
++        has_active_mask_request |= any(
++            req.return_sampling_mask and not req.finished()
++            for req in self.waiting_queue
++        )
++        has_active_mask_request |= any(
++            req.return_sampling_mask and not req.finished()
++            for req in self.grammar_manager.grammar_queue
++        )
++        has_active_mask_request |= (
++            self.chunked_req is not None
++            and self.chunked_req.return_sampling_mask
++            and not self.chunked_req.finished()
++        )
++        if self.disaggregation_mode == DisaggregationMode.DECODE:
++            prealloc_queue = self.disagg_decode_prealloc_queue
++            decode_reqs = [
++                *prealloc_queue.queue,
++                *prealloc_queue.pending_reqs,
++                *self.disagg_decode_transfer_queue.queue,
++            ]
++            has_active_mask_request |= any(
++                decode_req.req.return_sampling_mask and not decode_req.req.finished()
++                for decode_req in decode_reqs
++            )
++            has_active_mask_request |= any(
++                req.return_sampling_mask and not req.finished()
++                for req in (
++                    *prealloc_queue.retracted_queue,
++                    *prealloc_queue.held_rebootstrap_reqs,
++                )
++            )
++        return has_active_mask_request
++
+     def set_internal_state(self, recv_req: SetInternalStateReq):
+         server_args_dict = recv_req.server_args
+         args_allow_update = set(
+@@ -5325,6 +5370,22 @@ def set_internal_state(self, recv_req: SetInternalStateReq):
+                 )
+                 if_success = False
+                 break
++            elif (
++                k
++                in (
++                    "speculative_accept_threshold_single",
++                    "speculative_accept_threshold_acc",
++                )
++                and self.spec_algorithm.is_dflash()
++                and float(v) != 1.0
++            ):
++                if self._has_active_sampling_mask_request():
++                    logging.warning(
++                        f"Updating {k} is rejected while DFlash sampling-mask "
++                        "requests are active."
++                    )
++                    if_success = False
++                    break
+             elif k == "dspark_force_budget_frac":
+                 if not self.spec_algorithm.is_dspark() or not hasattr(
+                     self.draft_worker, "set_dspark_forced_budget_frac"
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index e0f922fe8df6..5cc34fa91734 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -12,6 +12,7 @@
+     Union,
+ )
+ 
++import numpy as np
+ import torch
+ 
+ from sglang.srt.disaggregation.utils import DisaggregationMode
+@@ -1034,9 +1035,9 @@ def process_batch_result_decode(
+                 )
+ 
+             if req.return_sampling_mask:
+-                # return_sampling_mask + speculative decoding is rejected at
+-                # request entry, so this remains one support mask per token.
+-                self.add_sampling_mask_return_values(i, req, logits_output)
++                self.add_sampling_mask_return_values(
++                    i, req, logits_output, accept_len=new_accept_len
++                )
+ 
+             if req.return_hidden_states and logits_output.hidden_states is not None:
+                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
+@@ -1161,12 +1162,68 @@ def add_sampling_mask_return_values(
+         i: int,
+         req: Req,
+         output: LogitsProcessorOutput,
++        *,
++        accept_len: int = 1,
+     ) -> None:
+         """Attach sparse sampling support metadata to the return values."""
+-        req.sampling_mask_rows.append(
+-            output.next_token_sampling_mask_idx[i],
+-            output.next_token_sampling_logprobs[i],
++        masks = output.next_token_sampling_mask_idx[i]
++        logprobs = output.next_token_sampling_logprobs[i]
++        if not isinstance(masks, list):
++            req.sampling_mask_rows.append(masks, logprobs)
++            return
++        # Speculative rows carry one support per accepted token; drop the ones
++        # past finished_len, as output_ids is trimmed there.
++        step_start = len(req.output_ids) - accept_len
++        num_visible = max(
++            0, min(accept_len, self._visible_output_len(req) - step_start)
+         )
++        for token in range(num_visible):
++            req.sampling_mask_rows.append(masks[token], logprobs[token])
++
++    @staticmethod
++    def _fill_speculative_sampling_mask_rows(
++        *,
++        reqs: List[Req],
++        batch_indices: List[int],
++        num_accept_tokens: List[int],
++        lengths: List[List[int]],
++        statuses: List[List[int]],
++        token_ids: np.ndarray,
++        selected_logprobs: np.ndarray,
++        support_logprobs: Optional[np.ndarray],
++        masks: list,
++        logprobs: list,
++        status_by_batch: list,
++    ) -> None:
++        """Speculative rows carry one support per draft position; keep the
++        accepted prefix, as a list with one entry per accepted token."""
++        assert len(batch_indices) == len(num_accept_tokens)
++        support_row = 0
++        for row, batch_index in enumerate(batch_indices):
++            returns_support_logprobs = (
++                reqs[batch_index].sampling_logprobs_mode == "support"
++            )
++            num_tokens = num_accept_tokens[row]
++            status = max(statuses[row][:num_tokens])
++            status_by_batch[batch_index] = status
++            if status == SamplingMaskStatus.OK:
++                row_lengths = lengths[row][:num_tokens]
++                masks[batch_index] = [
++                    token_ids[row, token, :length]
++                    for token, length in enumerate(row_lengths)
++                ]
++                if returns_support_logprobs:
++                    logprobs[batch_index] = [
++                        support_logprobs[support_row, token, :length]
++                        for token, length in enumerate(row_lengths)
++                    ]
++                else:
++                    logprobs[batch_index] = [
++                        selected_logprobs[row, token : token + 1]
++                        for token in range(num_tokens)
++                    ]
++            if returns_support_logprobs:
++                support_row += 1
+ 
+     @staticmethod
+     def materialize_sampling_mask_output(
+@@ -1194,6 +1251,26 @@ def materialize_sampling_mask_output(
+             if sampling_output.support_logprobs is None
+             else sampling_output.support_logprobs.cpu().numpy()
+         )
++        if sampling_output.num_accept_tokens is not None:
++            SchedulerBatchResultProcessor._fill_speculative_sampling_mask_rows(
++                reqs=reqs,
++                batch_indices=batch_indices,
++                num_accept_tokens=sampling_output.num_accept_tokens.tolist(),
++                lengths=lengths,
++                statuses=statuses,
++                token_ids=token_ids,
++                selected_logprobs=selected_logprobs,
++                support_logprobs=support_logprobs,
++                masks=masks,
++                logprobs=logprobs,
++                status_by_batch=status_by_batch,
++            )
++            output.next_token_sampling_mask_idx = masks
++            output.next_token_sampling_logprobs = logprobs
++            output.next_token_sampling_mask_status = status_by_batch
++            output.sampling_mask_output = None
++            return
++
+         support_row = 0
+         for row, batch_index in enumerate(batch_indices):
+             returns_support_logprobs = (
+diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
+index ed40ce3694a5..5c405dff913d 100644
+--- a/python/sglang/srt/managers/utils.py
++++ b/python/sglang/srt/managers/utils.py
+@@ -312,6 +312,11 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
+         "sampling_mask_statuses": (
+             None if sampling_mask_output is None else sampling_mask_output.statuses
+         ),
++        "sampling_mask_num_accept_tokens": (
++            None
++            if sampling_mask_output is None
++            else sampling_mask_output.num_accept_tokens
++        ),
+         "input_token_logprobs": result.logits_output.input_token_logprobs,
+         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
+         "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
+@@ -332,6 +337,7 @@ def get_logprob_from_pp_outputs(
+             selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
+             support_logprobs=next_pp_outputs["sampling_mask_support_logprobs"],
+             statuses=next_pp_outputs["sampling_mask_statuses"],
++            num_accept_tokens=next_pp_outputs["sampling_mask_num_accept_tokens"],
+         )
+     logits_output = LogitsProcessorOutput(
+         # Do not send logits and hidden states because they are large
+diff --git a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
+index 2472f76a810c..7d19e7702671 100644
+--- a/python/sglang/srt/sampling/sampling_batch_info.py
++++ b/python/sglang/srt/sampling/sampling_batch_info.py
+@@ -98,6 +98,8 @@ class SamplingBatchInfo:
+     return_sampling_support_logprobs: Optional[List[bool]] = None
+     sampling_mask_batch_indices: Optional[torch.Tensor] = None
+     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
++    # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
++    sampling_mask_top_ks: Optional[List[int]] = None
+ 
+     # Device
+     device: str = "cuda"
+@@ -201,6 +203,9 @@ def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
+                 device,
+             )
+         )
++        sampling_mask_top_ks = [
++            r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs
++        ]
+ 
+         if has_custom_logit_processor:
+             # Merge the same type of custom logit processors together
+@@ -271,6 +276,7 @@ def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
+             sampling_support_logprobs_capture_indices=(
+                 sampling_support_logprobs_capture_indices
+             ),
++            sampling_mask_top_ks=sampling_mask_top_ks,
+         )
+         ret.adjusted_from_schedule_batch(batch, vocab_size)
+         return ret
+@@ -435,6 +441,10 @@ def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tenso
+             self.return_sampling_masks = [
+                 self.return_sampling_masks[i] for i in keep_indices
+             ]
++            if self.sampling_mask_top_ks is not None:
++                self.sampling_mask_top_ks = [
++                    self.sampling_mask_top_ks[i] for i in keep_indices
++                ]
+             if self.return_sampling_support_logprobs is not None:
+                 self.return_sampling_support_logprobs = [
+                     self.return_sampling_support_logprobs[i] for i in keep_indices
+@@ -537,6 +547,9 @@ def merge_batch(self, other: SamplingBatchInfo):
+                     self.device,
+                 )
+             )
++            self.sampling_mask_top_ks = (
++                self.sampling_mask_top_ks or [1] * self_len
++            ) + (other.sampling_mask_top_ks or [1] * other_len)
+ 
+         # Note: because the __len()__ operator is defined on the temperatures tensor,
+         # please make sure any merge operation with len(self) or len(other) is done before
+diff --git a/python/sglang/srt/speculative/dflash_utils.py b/python/sglang/srt/speculative/dflash_utils.py
+index 132797a8b979..4eabf9a8ea7d 100644
+--- a/python/sglang/srt/speculative/dflash_utils.py
++++ b/python/sglang/srt/speculative/dflash_utils.py
+@@ -1086,7 +1086,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
+                 dtype=torch.float32,
+             )
+ 
+-        target_probs = build_dflash_verify_target_probs(
++        target_probs = build_speculative_verify_target_probs(
+             next_token_logits=next_token_logits,
+             sampling_info=sampling_info,
+             draft_token_num=draft_token_num,
+@@ -1127,7 +1127,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
+     return correct_len, bonus
+ 
+ 
+-def build_dflash_verify_target_probs(
++def build_speculative_verify_target_probs(
+     *,
+     next_token_logits: torch.Tensor,
+     sampling_info: Any,
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 50edb5bf5b59..eb7655e2643e 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -82,6 +82,9 @@
+     target_input_embeddings,
+ )
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
++from sglang.srt.speculative.spec_sampling_mask import (
++    SpeculativeSamplingMaskCapture,
++)
+ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+ from sglang.srt.speculative.spec_utils import (
+     SIMULATE_ACC_LEN,
+@@ -2810,6 +2813,19 @@ def forward_batch_generation(
+             # accept_len; recompute it from the forced commit_lens.
+             new_seq_lens = None
+ 
++        sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
++            sampling_info,
++            next_token_logits=logits_output.next_token_logits,
++            draft_input=draft_input,
++            draft_token_num=int(self.block_size),
++            bs=bs,
++        )
++        if sampling_mask_capture is not None:
++            logits_output.sampling_mask_output = sampling_mask_capture.build_output(
++                out_tokens=out_tokens,
++                commit_lens=commit_lens,
++            )
++
+         if batch.return_logprob:
+             compute_spec_logprobs(
+                 batch,
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+index ec34bf5789a7..8a4baf410b36 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+@@ -71,6 +71,9 @@
+     TargetVerifyExecutor,
+     verify_logits_adjustments_are_noop,
+ )
++from sglang.srt.speculative.spec_sampling_mask import (
++    SpeculativeSamplingMaskCapture,
++)
+ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+ from sglang.srt.speculative.spec_utils import (
+     GrammarTree,
+@@ -968,6 +971,19 @@ def _forward_decode(
+             req_pool_indices=batch.req_pool_indices,
+             commit_lens=accept.commit_lens,
+         )
++        sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
++            sampling_info,
++            next_token_logits=logits_output.next_token_logits,
++            draft_input=draft_input,
++            draft_token_num=self.verify_num_draft_tokens,
++            bs=bs,
++            greedy_mask=draft_block.greedy_mask,
++        )
++        if sampling_mask_capture is not None:
++            logits_output.sampling_mask_output = sampling_mask_capture.build_output(
++                out_tokens=accept.out_tokens,
++                commit_lens=accept.commit_lens,
++            )
+         if batch.return_logprob:
+             compute_spec_logprobs(
+                 batch,
+diff --git a/python/sglang/srt/speculative/spec_sampling_mask.py b/python/sglang/srt/speculative/spec_sampling_mask.py
+new file mode 100644
+index 000000000000..ee75275333c3
+--- /dev/null
++++ b/python/sglang/srt/speculative/spec_sampling_mask.py
+@@ -0,0 +1,179 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Optional
++
++import msgspec
++import torch
++
++from sglang.srt.environ import envs
++from sglang.srt.layers.logits_processor import SamplingMaskOutput, SamplingMaskStatus
++from sglang.srt.runtime_context import get_spec
++from sglang.srt.speculative.dflash_utils import (
++    build_speculative_verify_target_probs,
++    is_dflash_sampling_verify_available,
++)
++
++if TYPE_CHECKING:
++    from sglang.srt.managers.schedule_batch import Req
++    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
++
++
++def validate_spec_sampling_mask_request(
++    req: Req, spec_algorithm: SpeculativeAlgorithm
++) -> Optional[str]:
++    """Reject configurations whose committed tokens are not exact samples from
++    the captured target distribution."""
++    if not spec_algorithm.is_dflash_family():
++        return "return_sampling_mask is not supported with speculative decoding."
++
++    # build_speculative_verify_target_probs applies top-k/top-p only.
++    if req.sampling_params.min_p > 0:
++        return "return_sampling_mask with speculative decoding does not support min_p."
++
++    if envs.SGLANG_SIMULATE_ACC_LEN.get() > 0:
++        return (
++            "return_sampling_mask is not supported with simulated speculative "
++            "acceptance."
++        )
++
++    if spec_algorithm.is_dflash():
++        if (
++            get_spec().speculative_accept_threshold_single != 1.0
++            or get_spec().speculative_accept_threshold_acc != 1.0
++        ):
++            return (
++                "return_sampling_mask with DFlash requires acceptance thresholds "
++                "of 1.0."
++            )
++        # Without the kernel DFlash verifies non-greedy rows by greedy argmax.
++        if req.sampling_params.top_k > 1 and not is_dflash_sampling_verify_available():
++            return (
++                "return_sampling_mask with non-greedy DFlash decoding requires "
++                "sampling verification support."
++            )
++
++    return None
++
++
++class SpeculativeSamplingMaskCapture(msgspec.Struct):
++    target_probs: torch.Tensor | None
++    batch_indices: torch.Tensor
++    max_top_k: int
++    greedy_mask: torch.Tensor | None = None
++    support_capture_indices: torch.Tensor | None = None
++
++    @classmethod
++    def from_logits(
++        cls,
++        sampling_info,
++        *,
++        next_token_logits: torch.Tensor,
++        draft_input,
++        draft_token_num: int,
++        bs: int,
++        greedy_mask: torch.Tensor | None = None,
++    ) -> SpeculativeSamplingMaskCapture | None:
++        """Rebuild the verified target policy after acceptance; returns None
++        when no request in the batch asked for sampling masks."""
++        if sampling_info is None or sampling_info.sampling_mask_batch_indices is None:
++            return None
++        target_probs = None
++        if not sampling_info.is_all_greedy:
++            target_probs = build_speculative_verify_target_probs(
++                next_token_logits=next_token_logits,
++                sampling_info=sampling_info,
++                draft_token_num=draft_token_num,
++                bs=bs,
++                max_top_k=draft_input.max_top_k,
++                uniform_top_k_value=draft_input.uniform_top_k_value,
++            )
++        return cls(
++            target_probs=target_probs,
++            batch_indices=sampling_info.sampling_mask_batch_indices,
++            max_top_k=max(sampling_info.sampling_mask_top_ks),
++            greedy_mask=greedy_mask,
++            support_capture_indices=sampling_info.sampling_support_logprobs_capture_indices,
++        )
++
++    def build_output(
++        self,
++        *,
++        out_tokens: torch.Tensor,
++        commit_lens: torch.Tensor,
++    ) -> SamplingMaskOutput:
++        batch_indices = self.batch_indices
++        output_tokens = out_tokens.index_select(0, batch_indices).clone()
++        num_accept_tokens = commit_lens.index_select(0, batch_indices).clone()
++        greedy_mask = (
++            None
++            if self.greedy_mask is None
++            else self.greedy_mask.index_select(0, batch_indices).clone()
++        )
++
++        support_logprobs = None
++        if self.target_probs is None:
++            support_tokens = output_tokens.unsqueeze(-1).to(torch.int32)
++            support_lens = torch.ones_like(output_tokens, dtype=torch.int32)
++            selected_logprobs = torch.zeros_like(output_tokens, dtype=torch.float32)
++            if self.support_capture_indices is not None:
++                support_logprobs = selected_logprobs.index_select(
++                    0, self.support_capture_indices
++                ).unsqueeze(-1)
++        else:
++            max_top_k = min(int(self.max_top_k), self.target_probs.shape[-1])
++            if max_top_k <= 0:
++                raise ValueError(
++                    "Sampling-mask capture requires a positive finite top_k."
++                )
++            target_probs = self.target_probs.index_select(0, batch_indices)
++            support_probs, support_tokens = torch.topk(
++                target_probs, k=max_top_k, dim=-1
++            )
++            support_tokens = support_tokens.to(torch.int32)
++            support_lens = (support_probs > 0).sum(dim=-1, dtype=torch.int32)
++            selected_logprobs = torch.log(
++                target_probs.gather(-1, output_tokens.unsqueeze(-1)).squeeze(-1)
++            )
++            if self.support_capture_indices is not None:
++                support_logprobs = torch.log(
++                    support_probs.index_select(0, self.support_capture_indices)
++                )
++            if greedy_mask is not None:
++                greedy_rows = greedy_mask[:, None]
++                support_tokens = torch.where(
++                    greedy_rows[:, :, None],
++                    output_tokens[:, :, None],
++                    support_tokens,
++                )
++                support_lens = torch.where(
++                    greedy_rows,
++                    torch.ones_like(support_lens),
++                    support_lens,
++                )
++                selected_logprobs = torch.where(
++                    greedy_rows,
++                    torch.zeros_like(selected_logprobs),
++                    selected_logprobs,
++                )
++                if support_logprobs is not None:
++                    support_logprobs = torch.where(
++                        greedy_rows.index_select(0, self.support_capture_indices)[
++                            :, :, None
++                        ],
++                        torch.zeros_like(support_logprobs),
++                        support_logprobs,
++                    )
++
++        statuses = torch.where(
++            torch.isfinite(selected_logprobs),
++            int(SamplingMaskStatus.OK),
++            int(SamplingMaskStatus.INVALID),
++        ).to(torch.int8)
++        return SamplingMaskOutput(
++            token_ids=support_tokens,
++            lengths=support_lens,
++            selected_logprobs=selected_logprobs,
++            support_logprobs=support_logprobs,
++            statuses=statuses,
++            num_accept_tokens=num_accept_tokens,
++        )
+diff --git a/python/sglang/srt/speculative/uno_utils.py b/python/sglang/srt/speculative/uno_utils.py
+index b91ec88e79bd..2b2b2f17fe75 100644
+--- a/python/sglang/srt/speculative/uno_utils.py
++++ b/python/sglang/srt/speculative/uno_utils.py
+@@ -11,7 +11,7 @@
+ )
+ from sglang.srt.speculative.dflash_utils import (
+     _get_or_create_chain_verify_buffers,
+-    build_dflash_verify_target_probs,
++    build_speculative_verify_target_probs,
+ )
+ from sglang.srt.speculative.spec_utils import fast_sample
+ 
+@@ -277,7 +277,7 @@ def _build_dense_probs(
+     uniform_top_k_value: int | None,
+ ) -> torch.Tensor:
+     """Build the dense sampling distribution used by SGLang verification."""
+-    return build_dflash_verify_target_probs(
++    return build_speculative_verify_target_probs(
+         next_token_logits=next_token_logits,
+         sampling_info=sampling_info,
+         draft_token_num=forward_width,
+diff --git a/python/sglang/test/kits/spec_server_kits.py b/python/sglang/test/kits/spec_server_kits.py
+index 1b2c944f50c2..a4552e3e0abf 100644
+--- a/python/sglang/test/kits/spec_server_kits.py
++++ b/python/sglang/test/kits/spec_server_kits.py
+@@ -9,6 +9,7 @@
+ 
+ import concurrent.futures
+ import json
++import math
+ import random
+ import threading
+ from concurrent.futures import ThreadPoolExecutor
+@@ -696,3 +697,64 @@ def test_grammar_logprob_count_matches_completion_tokens(self):
+             f"got {len(output_logprobs)} logprobs vs {completion_tokens} completion tokens",
+         )
+         json.loads(out["text"])
++
++
++class SpecSamplingMaskKit:
++    """return_sampling_mask on a mixed greedy/sampling batch: one mask per output
++    token, each output token inside its mask, and greedy rows as singletons."""
++
++    def test_sampling_mask(self):
++        response = requests.post(
++            self.base_url + "/generate",
++            json={
++                "text": ["The capital of France is"] * 4,
++                "sampling_params": [
++                    {
++                        "temperature": 0.0,
++                        "top_k": 1,
++                        "max_new_tokens": 7,
++                        "ignore_eos": True,
++                    },
++                    {
++                        "temperature": 1.0,
++                        "top_k": 10,
++                        "top_p": 0.95,
++                        "max_new_tokens": 7,
++                        "ignore_eos": True,
++                    },
++                ]
++                * 2,
++                "return_sampling_mask": True,
++                "sampling_logprobs_mode": [
++                    "selected",
++                    "selected",
++                    "support",
++                    "support",
++                ],
++            },
++            timeout=60,
++        )
++        self.assertEqual(response.status_code, 200, response.text)
++        outputs = response.json()
++        self.assertEqual(len(outputs), 4)
++        for request_idx, output in enumerate(outputs):
++            output_ids = output["output_ids"]
++            meta_info = output["meta_info"]
++            masks = meta_info["output_token_sampling_mask"]
++            logprobs = meta_info["output_token_sampling_logprobs"]
++            self.assertEqual(len(output_ids), 7)
++            self.assertEqual(len(masks), len(output_ids))
++            self.assertEqual(len(logprobs), len(output_ids))
++            for output_id, mask, logprob in zip(output_ids, masks, logprobs):
++                self.assertIn(output_id, mask)
++                if request_idx >= 2:
++                    self.assertEqual(len(logprob), len(mask))
++                    self.assertTrue(all(math.isfinite(value) for value in logprob))
++                    self.assertAlmostEqual(
++                        sum(math.exp(value) for value in logprob), 1.0, places=5
++                    )
++                else:
++                    self.assertTrue(math.isfinite(logprob))
++                if request_idx % 2 == 0:
++                    self.assertEqual(mask, [output_id])
++                    self.assertEqual(logprob, [0.0] if request_idx >= 2 else 0.0)
+diff --git a/test/registered/core/test_basic_sanity_dflash.py b/test/registered/core/test_basic_sanity_dflash.py
+index d370856775ae..45f5eeedb358 100644
+--- a/test/registered/core/test_basic_sanity_dflash.py
++++ b/test/registered/core/test_basic_sanity_dflash.py
+@@ -11,6 +11,7 @@
+ from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
+ from sglang.test.kits.eval_accuracy_kit import MMLUSanityMixin
+ from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
++from sglang.test.kits.spec_server_kits import SpecSamplingMaskKit
+ from sglang.test.test_utils import (
+     DEFAULT_DRAFT_MODEL_DFLASH,
+     DEFAULT_TARGET_MODEL_DFLASH,
+@@ -29,6 +30,7 @@ class TestBasicSanityDFlash(
+     BasicSchedulerStressMixin,
+     FwdOccupancyMixin,
+     MMLUSanityMixin,
++    SpecSamplingMaskKit,
+     CustomTestCase,
+ ):
+     served_model_name = DEFAULT_TARGET_MODEL_DFLASH
+diff --git a/test/registered/core/test_basic_sanity_dspark.py b/test/registered/core/test_basic_sanity_dspark.py
+index bc0d55a27f31..583f8de8d131 100644
+--- a/test/registered/core/test_basic_sanity_dspark.py
++++ b/test/registered/core/test_basic_sanity_dspark.py
+@@ -8,7 +8,11 @@
+ from sglang.test.kits.eval_accuracy_kit import MMLUSanityMixin
+ from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
+ from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
+-from sglang.test.kits.spec_server_kits import SpecGrammarKit, SpecLogprobKit
++from sglang.test.kits.spec_server_kits import (
++    SpecGrammarKit,
++    SpecLogprobKit,
++    SpecSamplingMaskKit,
++)
+ from sglang.test.test_utils import (
+     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+     DEFAULT_URL_FOR_TEST,
+@@ -39,6 +43,7 @@ class TestBasicSanityDSpark(
+     JSONConstrainedMixin,
+     SpecGrammarKit,
+     SpecLogprobKit,
++    SpecSamplingMaskKit,
+     CustomTestCase,
+ ):
+     served_model_name = TARGET_MODEL
+diff --git a/test/registered/unit/managers/test_batch_result_processor_hidden_states.py b/test/registered/unit/managers/test_batch_result_processor_hidden_states.py
+index 103432afbd62..8122187d51cb 100644
+--- a/test/registered/unit/managers/test_batch_result_processor_hidden_states.py
++++ b/test/registered/unit/managers/test_batch_result_processor_hidden_states.py
+@@ -5,7 +5,11 @@
+ import torch
+ 
+ from sglang.srt.environ import envs
+-from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
++from sglang.srt.layers.logits_processor import (
++    LogitsProcessorOutput,
++    SamplingMaskOutput,
++    SamplingMaskStatus,
++)
+ from sglang.srt.managers.scheduler_components.batch_result_processor import (
+     SchedulerBatchResultProcessor,
+ )
+@@ -55,7 +59,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
+     def test_selected_and_support_modes_share_one_batch(self):
+         output = LogitsProcessorOutput(
+             next_token_logits=None,
+-            sampling_mask_output=SimpleNamespace(
++            sampling_mask_output=SamplingMaskOutput(
+                 token_ids=torch.tensor([[7, 8], [9, 10]], dtype=torch.int32),
+                 lengths=torch.tensor([2, 2]),
+                 selected_logprobs=torch.tensor([-0.5, -0.25]),
+@@ -88,7 +92,7 @@ def test_selected_and_support_modes_share_one_batch(self):
+     def test_selected_mode_does_not_require_support_tensor(self):
+         output = LogitsProcessorOutput(
+             next_token_logits=None,
+-            sampling_mask_output=SimpleNamespace(
++            sampling_mask_output=SamplingMaskOutput(
+                 token_ids=torch.tensor([[7, 8]], dtype=torch.int32),
+                 lengths=torch.tensor([2]),
+                 selected_logprobs=torch.tensor([-0.5]),
+@@ -114,7 +118,7 @@ def test_packed_ids_are_copied_before_per_request_slicing(self):
+         packed_ids.cpu.return_value = torch.tensor([[7, 8, 0], [9, 0, 0]])
+         output = LogitsProcessorOutput(
+             next_token_logits=None,
+-            sampling_mask_output=SimpleNamespace(
++            sampling_mask_output=SamplingMaskOutput(
+                 token_ids=packed_ids,
+                 lengths=torch.tensor([2, 1]),
+                 selected_logprobs=torch.tensor([-0.5, -0.25]),
+diff --git a/test/registered/unit/managers/test_output_streamer_customized_info.py b/test/registered/unit/managers/test_output_streamer_customized_info.py
+index 8817dc762561..a426f434a556 100644
+--- a/test/registered/unit/managers/test_output_streamer_customized_info.py
++++ b/test/registered/unit/managers/test_output_streamer_customized_info.py
+@@ -9,7 +9,11 @@
+ import torch
+ 
+ from sglang.srt.disaggregation.utils import DisaggregationMode
+-from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
++from sglang.srt.layers.logits_processor import (
++    LogitsProcessorOutput,
++    SamplingMaskOutput,
++    SamplingMaskStatus,
++)
+ from sglang.srt.managers import io_struct
+ from sglang.srt.managers.io_struct import (
+     msgpack_decode,
+@@ -494,7 +498,7 @@ def test_clients_receive_the_sampler_rows_unchanged(self):
+                     support = torch.randn(len(support_reqs), width, generator=generator)
+                     output = LogitsProcessorOutput(
+                         next_token_logits=None,
+-                        sampling_mask_output=SimpleNamespace(
++                        sampling_mask_output=SamplingMaskOutput(
+                             token_ids=token_ids,
+                             lengths=lengths,
+                             selected_logprobs=selected,
