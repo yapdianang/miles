@@ -11,6 +11,7 @@ engines; start the Ray cluster first and set ``MILES_SCRIPT_EXTERNAL_RAY=1`` on 
 python examples/multi_lora/serve_mimo_v26_flash_tinker.py serve --hf-checkpoint <official> --ref-load <bf16>
 """
 
+import os
 from dataclasses import dataclass, field
 
 import typer
@@ -74,6 +75,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
 
 def _serve(args: ScriptArgs) -> None:
+    os.makedirs(f"{args.save_dir}/nccl_trace", exist_ok=True)
     trainer_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
     checkpoint_args = (
         f"--hf-checkpoint {args.hf_checkpoint} --ref-load {args.ref_load} --load {args.ref_load} "
@@ -146,7 +148,16 @@ def _serve(args: ScriptArgs) -> None:
         train_script="serve_tinker.py",
         megatron_path=args.megatron_path,
         job_lifetime="launcher",
-        extra_env_vars={"OMP_NUM_THREADS": "4", "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false"},
+        extra_env_vars={
+            "OMP_NUM_THREADS": "4",
+            "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+            # As in the GLM-5.3 launcher: one inductor compile thread per trainer actor.
+            "TORCHINDUCTOR_COMPILE_THREADS": "1",
+            # Keep the NCCL flight recorder so a collective timeout leaves per-rank traces.
+            "TORCH_NCCL_TRACE_BUFFER_SIZE": "4096",
+            "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
+            "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": f"{args.save_dir}/nccl_trace/rank_",
+        },
     )
 
 
