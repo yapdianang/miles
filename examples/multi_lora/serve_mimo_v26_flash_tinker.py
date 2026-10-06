@@ -27,7 +27,10 @@ _ENGINE_GPUS = 4
 class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = field(default_factory=U.create_run_id)
     base_model: str = "XiaomiMiMo/MiMo-V2.6-Flash-RL"
-    hf_checkpoint: str = "/data/model-cache/mimo-v26/MiMo-V2.6-Flash-RL"
+    hf_checkpoint: str = (
+        "/data/model-cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-RL/snapshots/"
+        "5711b268169967567844e1e560e8a3966da959b1"
+    )
     ref_load: str = "/data/model-cache/mimo-v26/MiMo-V2.6-Flash-RL-bf16"
     # The 4-layer partial (mimo26-p4-bf16 + mimo26-p4-native) uses the same flags with fewer layers.
     megatron_model_type: str = "mimo-v2.6-flash"

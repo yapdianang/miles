@@ -26,7 +26,8 @@ RUN python3 -m py_compile \
       /root/miles/miles_plugins/megatron_bridge/mimo_v2.py \
       /root/miles/miles/utils/lora/hf_lora_targets.py
 
+ARG MILES_REVISION
 LABEL org.opencontainers.image.source="https://github.com/yapdianang/miles" \
-      org.opencontainers.image.revision="9a025d2bc975da78131f84fff1c6def1e8c0b056"
+      org.opencontainers.image.revision="${MILES_REVISION}"
 
 FROM runtime AS final
