@@ -55,6 +55,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     max_tokens_per_gpu: int = 131072
     # DFlash speculative decoding with the drafter shipped in the checkpoint's dflash/ directory.
     dflash: bool = True
+    # The cookbook's MoE all-to-all; sglang#41041 measures "none" faster on B300 TP4/EP4.
+    moe_a2a_backend: str = "deepep"
     # R3 (MiMo-V2.6 section 6.4): the trainer replays the experts the engine routed each sampled token to.
     routing_replay: bool = True
     extra_args: str = ""
@@ -104,7 +106,8 @@ def _serve(args: ScriptArgs) -> None:
     sglang_args = (
         f"--rollout-num-gpus-per-engine {_ENGINE_GPUS} --sglang-ep-size {_ENGINE_GPUS} "
         "--sglang-dp-size 1 --sglang-pp-size 1 "
-        "--sglang-moe-runner-backend deep_gemm --sglang-moe-a2a-backend deepep --sglang-deepep-mode auto "
+        f"--sglang-moe-runner-backend deep_gemm --sglang-moe-a2a-backend {args.moe_a2a_backend} "
+        "--sglang-deepep-mode auto "
         "--sglang-moe-dense-tp-size 1 --sglang-enable-dp-lm-head "
         "--sglang-log-level-http warning --sglang-enable-cache-report "
         "--sglang-page-size 1 --sglang-cuda-graph-max-bs-decode 64 --sglang-max-running-requests 64 "
