@@ -79,7 +79,7 @@ def abort_kind(message: str) -> str:
 
 def _tied_at_top_k(value, case: dict) -> bool:
     """A support row past top_k is a cutoff tie: every id ranked at or beyond top_k shares the top_k-th log-prob."""
-    if case["mode"] != "support":
+    if case["mode"] != "support" or len(value) <= case["top_k"]:
         return False
     ranked = sorted((float(entry) for entry in value), reverse=True)
     cutoff = ranked[case["top_k"] - 1]

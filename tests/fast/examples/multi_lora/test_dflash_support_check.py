@@ -143,3 +143,5 @@ def test_masks_past_top_k_pass_only_for_cutoff_ties(probabilities, passes):
     assert (failures == []) is passes, failures
     selected = meta | {"output_token_sampling_logprobs": [math.log(0.4)]}
     assert probe.check_response(selected, {"mode": "selected", "top_k": 3}, 1e-5), "selected mode has no tie evidence"
+    short_row = meta | {"output_token_sampling_logprobs": [[math.log(0.4), math.log(0.6)]]}
+    assert probe.check_response(short_row, case, 1e-5), "a row shorter than its mask is reported, not raised"
