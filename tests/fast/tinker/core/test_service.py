@@ -434,14 +434,16 @@ async def test_a_failed_window_stops_already_queued_training(service):
 
 
 async def test_unsupported_lora_configs_are_rejected(service):
-    for lora_config in ({"rank": 8, "seed": 7}, {"rank": 8, "train_unembed": True}, {"rank": 8, "train_mlp": False}):
+    for lora_config in ({"rank": 8, "seed": 7}, {"rank": 8, "train_mlp": False}):
         with pytest.raises(UserInputError):
             service.create_model("tenant", model_payload(service, lora_config=lora_config))
-    _, model_id = service.create_model(
-        "tenant",
-        model_payload(service, lora_config={"rank": 8, "train_attn": True, "train_mlp": True, "train_unembed": False}),
-    )
-    assert model_id in service.models
+    # SDK defaults request every group; the gateway trains its own layout.
+    for lora_config in (
+        {"rank": 8, "train_attn": True, "train_mlp": True, "train_unembed": False},
+        {"rank": 8, "train_attn": True, "train_mlp": True, "train_unembed": True},
+    ):
+        _, model_id = service.create_model("tenant", model_payload(service, lora_config=lora_config))
+        assert model_id in service.models
 
 
 @pytest.mark.parametrize("expire_lease", [False, True])

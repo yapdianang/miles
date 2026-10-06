@@ -3,7 +3,7 @@
 # Megatron-Core fd15ee20a and Megatron-Bridge 8cd3466d (mimo_v2_flash), all at Miles 7890b298.
 FROM radixark/miles:dev-202610052107@sha256:b625f82472c7dac836565241cd827c25b560400120b5139d27d41a94dc523728 AS runtime
 
-RUN pip install --no-cache-dir "tinker==0.26.2"
+RUN pip install --no-cache-dir "tinker==0.32.0"
 
 # TE's cuDNN attention needs cuDNN >= 9.26 for the backward of learnable-sink SWA layers on
 # packed (thd) sequences on SM100.

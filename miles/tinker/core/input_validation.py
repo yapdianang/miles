@@ -21,10 +21,11 @@ def validate_model_config(lora_config: dict, config: GatewayConfig) -> None:
         "train_unembed": config.trains_unembed,
     }
     for field, layout_trains in layout.items():
-        requested = lora_config.get(field)
-        if requested is not None and requested != layout_trains:
+        # Tinker SDKs from 0.27 send every group flag with a True default, so True cannot narrow the layout;
+        # only an explicit False for a group this gateway trains is a conflict.
+        if lora_config.get(field) is False and layout_trains:
             raise UserInputError(
-                f"lora_config.{field}={requested} conflicts with this gateway's adapter layout "
+                f"lora_config.{field}=False conflicts with this gateway's adapter layout "
                 f"({field}={layout_trains}); the layout is fixed by the gateway target selection at server start"
             )
     rank = lora_config.get("rank", 32)
