@@ -54,6 +54,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # trainer out of memory in the unfused fp32 cross entropy.
     context_length: int = 131072
     max_tokens_per_gpu: int = 131072
+    # Activation recompute: "full" (every layer), "selective" (core attention only) or "none".
+    recompute: str = "full"
     # DFlash speculative decoding with the drafter shipped in the checkpoint's dflash/ directory.
     dflash: bool = True
     # flashinfer_mxfp4 (TRT-LLM on SM100) runs the MXFP4 experts on BF16 activations without an all-to-all;
@@ -76,6 +78,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
             raise ValueError(f"rollout GPUs must be a multiple of the {_ENGINE_GPUS}-GPU engine")
         if self.tp > 4:
             raise ValueError("trainer TP must not exceed the 4 global-attention KV heads")
+        if self.recompute not in ("full", "selective", "none"):
+            raise ValueError(f"recompute must be full, selective or none, not {self.recompute}")
         if self.target_modules != "attn":
             raise ValueError("MXFP4 engine experts cannot take LoRA; train attention adapters only")
 
@@ -104,8 +108,11 @@ def _serve(args: ScriptArgs) -> None:
         f"--tensor-model-parallel-size {args.tp} {'--sequence-parallel ' if args.tp > 1 else ''}"
         "--pipeline-model-parallel-size 1 --context-parallel-size 1 "
         f"--expert-model-parallel-size {trainer_gpus} --expert-tensor-parallel-size 1 "
-        "--recompute-granularity full --recompute-method uniform --recompute-num-layers 1 "
     )
+    if args.recompute == "full":
+        parallel_args += "--recompute-granularity full --recompute-method uniform --recompute-num-layers 1 "
+    elif args.recompute == "selective":
+        parallel_args += "--recompute-granularity selective "
     batching_args = (
         f"--seq-length {args.context_length} --rollout-max-context-len {args.context_length} "
         f"--max-tokens-per-gpu {args.max_tokens_per_gpu} --micro-batch-size 1 --use-dynamic-batch-size "
