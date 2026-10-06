@@ -16,7 +16,7 @@ from miles.ray.rollout.train_data_conversion import ROLLOUT_DATA_VALUE_SPEC
 from miles.tinker.core.types import UserInputError
 from miles.utils import object_store
 from miles.utils.http_utils import post
-from tinker.types.sample_response import MASK_LOGPROB
+from tinker.types.topk_logprobs import MASK_LOGPROB
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +31,8 @@ def _tokens_key(tokens: list[int]) -> bytes:
 class RoutedExpertsCache:
     """Engine-routed experts of recent samples, keyed by the tokens a datum feeds the trainer.
 
-    A sample of ``prompt`` with output ``out`` routes ``prompt + out[:-1]``: the same tokens as the
-    datum that trains on it. Entries hold int16 expert ids (``[tokens, layers, topk]``); the oldest
+    A sample of ``prompt`` with output ``out`` routes ``prompt + out[:-1]``: a datum's tokens without
+    its last target. Entries hold int16 expert ids (``[tokens, layers, topk]``); the oldest
     are evicted first, so a multi-turn trajectory's earlier calls leave before its last one.
     """
 
@@ -99,7 +99,7 @@ def _build_train_data(slot_datums: list, routed_experts: RoutedExpertsCache | No
         if datum_key in datums[0]:
             train_data[batch_key] = [datum[datum_key] for datum in datums]
     if routed_experts is not None:
-        routes = [routed_experts.get(datum["tokens"]) for datum in datums]
+        routes = [routed_experts.get(datum["tokens"][:-1]) for datum in datums]
         missing = sum(route is None for route in routes)
         if missing:
             # Replay is all or nothing per pass; a datum the engine did not sample trains on its own routing.

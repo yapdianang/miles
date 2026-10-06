@@ -30,8 +30,11 @@ def run_forward_backward(
 ) -> dict:
     data_iterator, num_microbatches = get_data_iterator(args, model, rollout_data)
     assert len(num_microbatches) == 1, "a work unit is a single forward/backward pass"
-    # Replay the engine's expert choices (R3) when the gateway attached them to every datum.
-    replay = routing_replay_manager.enabled and "rollout_routed_experts" in rollout_data
+    # Replay the engine's expert choices (R3) when the gateway attached them to every datum; the forward
+    # step pops replay_forward and the backward recompute replay_backward. Without routes the pass routes
+    # on its own, so the manager is off for it.
+    replay_enabled = routing_replay_manager.enabled
+    replay = replay_enabled and "rollout_routed_experts" in rollout_data
     if replay:
         fill_replay_data(
             args=args,
@@ -44,7 +47,8 @@ def run_forward_backward(
             register_replay_list_func=routing_replay_manager.register_replay_list_func,
             if_sp_region=routing_replay_manager.if_sp_region,
         )
-    routing_replay_manager.stage = ("replay_forward" if forward_only else "replay_backward") if replay else "fallthrough"
+    routing_replay_manager.enabled = replay
+    routing_replay_manager.stage = "replay_backward" if replay else "fallthrough"
 
     for iterator in data_iterator:
         iterator.reset()
@@ -56,20 +60,22 @@ def run_forward_backward(
         reset_grad_metadata_keep_grads(model)
 
     dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=batch_id)
-    losses_reduced = run_forward_backward_pass(
-        args,
-        dumper_phase_util,
-        data_iterator,
-        model,
-        num_microbatches[0],
-        num_rollouts=None,
-        forward_only=forward_only,
-    )
-    per_datum_outputs = [output for microbatch in losses_reduced for output in microbatch["per_datum"]]
-    dumper_phase_util.finalize(model)
-    if replay:
+    try:
+        losses_reduced = run_forward_backward_pass(
+            args,
+            dumper_phase_util,
+            data_iterator,
+            model,
+            num_microbatches[0],
+            num_rollouts=None,
+            forward_only=forward_only,
+        )
+    finally:
         routing_replay_manager.clear_all()
         routing_replay_manager.stage = "fallthrough"
+        routing_replay_manager.enabled = replay_enabled
+    per_datum_outputs = [output for microbatch in losses_reduced for output in microbatch["per_datum"]]
+    dumper_phase_util.finalize(model)
 
     if get_parallel_state().is_pp_last_stage:
         return {"metrics": aggregate_train_losses(losses_reduced, None), "per_datum": per_datum_outputs}
