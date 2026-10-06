@@ -6,6 +6,8 @@ import httpx
 import pytest
 from tests.fast.tinker.harness import ADAM
 
+from miles.tinker.core.types import EngineUnavailableError
+from miles.tinker.engine_load import EngineLoad, KvPool
 from miles.tinker.server.app import build_app
 
 
@@ -181,3 +183,15 @@ async def test_retrieve_long_polls_until_settlement(client):
     client.service.futures.resolve(future.request_id, {"op": "optim_step", "metrics": {"grad_norm": 1.0}})
     response = await asyncio.wait_for(poll, timeout=2)
     assert response.json() == {"type": "optim_step", "metrics": {"grad_norm": 1.0}}
+
+
+async def test_engine_load_reports_each_engine_and_503_when_unreachable(client):
+    pool = KvPool(used_tokens=10, evictable_tokens=5, total_tokens=100)
+    client.service.backend.loads = [EngineLoad(0, "http://engine-a", 3, 1, 64, pool, None, None)]
+
+    (engine,) = (await client.get("/api/v1/engine_load", headers=_headers())).json()["engines"]
+    assert engine["full_kv"] == {"used_tokens": 10, "evictable_tokens": 5, "total_tokens": 100}
+    assert (engine["running_requests"], engine["swa_kv"]) == (3, None)
+
+    client.service.backend.loads = EngineUnavailableError("router down")
+    assert (await client.get("/api/v1/engine_load", headers=_headers())).status_code == 503

@@ -49,6 +49,14 @@ def add_tinker_arguments(parser):
         ),
     )
     add_argument(
+        "engine-affinity",
+        action="store_true",
+        help=(
+            "Send every turn of a rollout to the engine holding its context, and start each rollout on the "
+            "engine with the most free request slots and KV; without it the router places every request"
+        ),
+    )
+    add_argument(
         "sampler-record-cache-gb",
         type=float,
         default=64.0,

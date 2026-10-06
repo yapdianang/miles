@@ -2,13 +2,14 @@
 
 import asyncio
 from contextlib import suppress
+from dataclasses import asdict
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from miles.tinker.core.future import FAILED, PENDING
 from miles.tinker.core.service import TinkerService
-from miles.tinker.core.types import OwnershipError, UserInputError
+from miles.tinker.core.types import EngineUnavailableError, OwnershipError, UserInputError
 from miles.tinker.server.encoding import (
     decode_command,
     decode_sample_request,
@@ -55,6 +56,10 @@ def build_app(service: TinkerService) -> FastAPI:
     async def _ownership_error(request: Request, error: OwnershipError):
         return JSONResponse(status_code=403, content={"error": str(error)})
 
+    @app.exception_handler(EngineUnavailableError)
+    async def _engine_unavailable(request: Request, error: EngineUnavailableError):
+        return JSONResponse(status_code=503, content={"error": str(error)})
+
     @app.get("/api/v1/healthz")
     async def healthz():
         return {"status": "ok"}
@@ -72,6 +77,11 @@ def build_app(service: TinkerService) -> FastAPI:
     @app.post("/api/v1/telemetry")
     async def telemetry():
         return {"status": "accepted"}
+
+    @app.get("/api/v1/engine_load")
+    async def engine_load(request: Request):
+        _tenant(request)
+        return {"engines": [asdict(load) for load in await service.engine_loads()]}
 
     @app.post("/api/v1/create_session")
     async def create_session(request: Request):

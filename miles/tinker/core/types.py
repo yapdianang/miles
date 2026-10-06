@@ -46,6 +46,10 @@ class OwnershipError(Exception):
     """model/checkpoint does not belong to the caller's tenant."""
 
 
+class EngineUnavailableError(Exception):
+    """An inference engine or its router did not answer."""
+
+
 @dataclass
 class GatewayConfig:
     base_model: str

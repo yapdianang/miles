@@ -440,6 +440,9 @@ class TinkerService:
         self.sampling_sessions[sampling_session_id] = SamplingSessionRecord(tenant=tenant, model_path=model_path, session_id=session_id)
         return sampling_session_id
 
+    async def engine_loads(self) -> list:
+        return await self.backend.engine_loads()
+
     def get_sampler(self, tenant: str, sampling_session_id: str) -> dict:
         session = self.sampling_sessions.get(sampling_session_id)
         if session is None:
