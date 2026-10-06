@@ -11,11 +11,26 @@ without re-quantizing base weights.
 One node: 4 trainer GPUs (EP4) and one TP4/EP4 engine. Two nodes: 8 trainer GPUs (EP8) and two
 engines; start the Ray cluster first and set ``MILES_SCRIPT_EXTERNAL_RAY=1`` on its head.
 
+``prepare`` builds whichever of the two checkpoints is missing (a conversion is finished once its
+model.safetensors.index.json exists). It downloads the official checkpoint at ``--base-model-revision``
+into ``--hf-hub-cache`` and converts it on the GPU:
+
+  HF_HUB_OFFLINE=0 hf download XiaomiMiMo/MiMo-V2.6-Flash-RL --revision <revision> --cache-dir <hf hub cache>
+  python tools/convert_mimo_v2_to_bf16.py --model-dir <snapshot> --save-dir <hf checkpoint> --device cuda \
+    --keep-quant --bf16-linears
+  python tools/convert_mimo_v2_to_bf16.py --model-dir <snapshot> --save-dir <ref load> --device cuda
+
+where <snapshot> is <hf hub cache>/models--XiaomiMiMo--MiMo-V2.6-Flash-RL/snapshots/<revision>.
+
+python examples/multi_lora/serve_mimo_v26_flash_tinker.py prepare
 python examples/multi_lora/serve_mimo_v26_flash_tinker.py serve --hf-checkpoint <bf16 linears> --ref-load <bf16>
+
+tools/mimo_dev.py runs this service on a dev pod and tools/mimo_gates.py measures it; see the README.
 """
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import typer
 
@@ -31,6 +46,9 @@ _ENGINE_GPUS = 4
 class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = field(default_factory=U.create_run_id)
     base_model: str = "XiaomiMiMo/MiMo-V2.6-Flash-RL"
+    # A commit hash, which also names the snapshot directory in the hub cache.
+    base_model_revision: str = "5711b268169967567844e1e560e8a3966da959b1"
+    hf_hub_cache: str = "/data/model-cache/huggingface/hub"
     hf_checkpoint: str = "/data/model-cache/mimo-v26/MiMo-V2.6-Flash-RL-w4a16-linear"
     ref_load: str = "/data/model-cache/mimo-v26/MiMo-V2.6-Flash-RL-bf16"
     # The 4-layer partial (mimo26-p4-bf16 + mimo26-p4-native) uses the same flags with fewer layers.
@@ -78,6 +96,29 @@ class ScriptArgs(U.ExecuteTrainConfig):
             raise ValueError("trainer TP must not exceed the 4 global-attention KV heads")
         if self.target_modules != "attn":
             raise ValueError("MXFP4 engine experts cannot take LoRA; train attention adapters only")
+
+
+def _is_converted(path: str) -> bool:
+    # The converter writes the index last, so it marks a finished conversion.
+    return (Path(path) / "model.safetensors.index.json").exists()
+
+
+def _prepare(args: ScriptArgs) -> None:
+    conversions = {args.hf_checkpoint: " --keep-quant --bf16-linears", args.ref_load: ""}
+    pending = {path: flags for path, flags in conversions.items() if not _is_converted(path)}
+    if not pending:
+        return
+    backend = args.create_backend()
+    backend.exec_command_cpu(
+        f"HF_HUB_OFFLINE=0 hf download {args.base_model} --revision {args.base_model_revision} "
+        f"--cache-dir {args.hf_hub_cache}"
+    )
+    snapshot = f"{args.hf_hub_cache}/models--{args.base_model.replace('/', '--')}/snapshots/{args.base_model_revision}"
+    for path, flags in pending.items():
+        backend.exec_command_gpu(
+            f"python {U.repo_base_dir}/tools/convert_mimo_v2_to_bf16.py "
+            f"--model-dir {snapshot} --save-dir {path} --device cuda{flags}"
+        )
 
 
 def _serve(args: ScriptArgs) -> None:
@@ -169,6 +210,13 @@ def _serve(args: ScriptArgs) -> None:
             "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": f"{args.save_dir}/nccl_trace/rank_",
         },
     )
+
+
+@app.command()
+@U.dataclass_cli
+def prepare(args: ScriptArgs) -> None:
+    """Build the engine and trainer checkpoints that are missing."""
+    _prepare(args)
 
 
 @app.command()
