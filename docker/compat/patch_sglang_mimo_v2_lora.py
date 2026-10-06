@@ -6,6 +6,10 @@ LoRA layer sizes and slices V with the K shard size, and the default
 ``get_hidden_dim`` uses one global head layout, so both qkv_proj LoRA-B buffers
 are mis-sized.  Patch the qkv LoRA layer to use ``v_proj_shard_size`` and give
 ``MiMoV2ForCausalLM`` a per-layer ``get_hidden_dim``.
+
+MiMo-V2's audio encoder also has plain ``nn.Linear`` attention projections with the
+same leaf names.  The LoRA manager consults the model's ``should_apply_lora``, and
+MiMo-V2 limits LoRA to its decoder layers.
 """
 
 from pathlib import Path
@@ -56,6 +60,23 @@ LAYERS_PATCHES = (
     ),
 )
 
+MANAGER_PATCHES = (
+    (
+        """\
+            # The module should be converted if it is included in target_names
+            parts = module_name.split(".")
+""",
+        """\
+            should_apply_lora = getattr(self.base_model, "should_apply_lora", None)
+            if should_apply_lora is not None and not should_apply_lora(module_name):
+                continue
+
+            # The module should be converted if it is included in target_names
+            parts = module_name.split(".")
+""",
+    ),
+)
+
 MIMO_ANCHOR = """\
     @property
     def routed_experts_weights_of_layer(self):
@@ -63,6 +84,10 @@ MIMO_ANCHOR = """\
 """
 
 MIMO_GET_HIDDEN_DIM = """\
+    def should_apply_lora(self, module_name: str) -> bool:
+        # The audio encoder has plain nn.Linear projections with the decoder's leaf names.
+        return module_name.startswith("model.layers.")
+
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         # SWA and global layers have their own KV heads, and V heads are narrower than Q/K.
         if module_name in ("qkv_proj", "o_proj"):
@@ -92,6 +117,7 @@ def patch(path: Path, replacements) -> None:
 
 def main(srt: Path = SGLANG_SRT) -> None:
     patch(srt / "lora/layers.py", LAYERS_PATCHES)
+    patch(srt / "lora/lora_manager.py", MANAGER_PATCHES)
     patch(srt / "models/mimo_v2.py", ((MIMO_ANCHOR, MIMO_GET_HIDDEN_DIM + MIMO_ANCHOR),))
 
 
