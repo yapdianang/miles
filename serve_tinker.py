@@ -39,9 +39,9 @@ async def serve(args, *, disposer: Disposer):
     hf_config = load_hf_config(args.hf_checkpoint).get_text_config()
     max_tokens_per_datum = hf_config.max_position_embeddings
     if args.max_tokens_per_gpu is not None:
-        # The trainer pads each packed microbatch to this multiple.
+        # The trainer pads each packed microbatch to this multiple; CP ranks each hold 1/cp of a datum.
         pad_size = args.tensor_model_parallel_size * args.data_pad_size_multiplier
-        trainer_token_limit = args.max_tokens_per_gpu // pad_size * pad_size
+        trainer_token_limit = args.max_tokens_per_gpu // pad_size * pad_size * args.context_parallel_size
         max_tokens_per_datum = min(max_tokens_per_datum, trainer_token_limit)
     assert max_tokens_per_datum > 0, "trainer token budget must fit at least one padding block"
     _worker_manager = init_orchestration_script(args, disposer=disposer)

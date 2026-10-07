@@ -15,6 +15,10 @@ two need ``MiMoV2SelfAttention`` and ``MiMoV2TEDotProductAttention``. The per-la
 SWA window reuse existing config fields (``rotary_base_per_layer``, ``window_size`` with a per-layer
 ``window_attn_skip_freq``) instead of Megatron-Bridge's dual-base RoPE and window rule.
 
+Context parallelism needs THD packing. Global layers use TE's p2p ring; TE's CP takes neither the SWA
+window nor the sink there, so SWA layers exchange only the keys their window reaches
+(``swa_context_parallel``) and attend locally.
+
 Weights load from the BF16 split-q/k/v layout written by ``tools/convert_mimo_v2_to_bf16.py``. The
 official config (FP8/MXFP4, fused kv-head-interleaved ``qkv_proj``) or its ``--keep-quant``
 conversions can still describe the model, as the rollout checkpoint of an MXFP4 engine; export then
@@ -41,6 +45,10 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.utils import is_layer_window_attention
+
+from miles_plugins.megatron_bridge.swa_context_parallel import exchange_swa_halo, plan_swa_halo
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +89,9 @@ class MiMoV2SelfAttention(SelfAttention):
         assert groups >= self.world_size, "TP must not exceed the layer's KV heads"
         self.linear_qkv_out_dim = qkv_out_dim
         self.val_hidden_size = config.v_head_dim
+        if self.rotary_pos_emb is not None:
+            # THD RoPE indexes the full table by zigzag position; Attention.forward would slice it per CP rank.
+            self.rotary_pos_emb.cp_group = None
 
     def get_query_key_value_tensors(
         self, hidden_states, key_value_states=None, output_gate=False, head_wise_gate=False, split_qkv=True
@@ -100,7 +111,8 @@ class MiMoV2SelfAttention(SelfAttention):
 class MiMoV2TEDotProductAttention(TEDotProductAttention):
     """TE core attention with separate Q/K and V channels and V scaled by ``attention_value_scale``.
 
-    The learnable sink comes from the layer config's ``softmax_type``.
+    The learnable sink comes from the layer config's ``softmax_type``. Under context parallelism a SWA
+    layer runs TE without CP over keys extended by ``exchange_swa_halo``; a global layer uses TE's ring.
     """
 
     def __init__(self, config, layer_number, attn_mask_type, attention_type, attention_dropout=None, **kwargs):
@@ -115,11 +127,52 @@ class MiMoV2TEDotProductAttention(TEDotProductAttention):
             **kwargs,
         )
         self.attention_value_scale = config.attention_value_scale
+        self.swa_cp_group = None
+        if config.context_parallel_size > 1:
+            if is_layer_window_attention(config.window_size, config.window_attn_skip_freq, layer_number):
+                # TE's unfused fallback builds a self-attention mask from the queries alone
+                assert config.attention_backend == AttnBackend.fused, "MiMo-V2 CP needs --attention-backend fused"
+                self.swa_cp_group = self.cp_group
+                self.swa_cp_rank, self.swa_cp_size = self.swa_cp_group.rank(), self.swa_cp_group.size()
+                self.set_context_parallel_group(None, None, None)
+            else:
+                assert (
+                    self.cp_comm_type == "p2p" and config.softmax_type == "vanilla"
+                ), "MiMo-V2 global layers under CP need cp_comm_type p2p and no attention sink"
 
     def forward(self, query, key, value, attention_mask, attn_mask_type, **kwargs):
         if self.attention_value_scale is not None:
             value = value * self.attention_value_scale
-        return super().forward(query, key, value, attention_mask, attn_mask_type, **kwargs)
+        if self.config.context_parallel_size > 1:
+            packed_seq_params = kwargs.get("packed_seq_params")
+            assert packed_seq_params is not None and packed_seq_params.qkv_format == "thd", "MiMo-V2 CP needs THD"
+        if self.swa_cp_group is None:
+            return super().forward(query, key, value, attention_mask, attn_mask_type, **kwargs)
+        return self._swa_forward_with_cp(query, key, value, kwargs["packed_seq_params"])
+
+    def _swa_forward_with_cp(self, query, key, value, packed_seq_params):
+        # Miles batches carry host boundaries; reading the device copy would sync the stream.
+        cu_seqlens = getattr(packed_seq_params, "cu_seqlens_host", None) or packed_seq_params.cu_seqlens_q.tolist()
+        plan = plan_swa_halo(
+            tuple(cu_seqlens),
+            cp_rank=self.swa_cp_rank,
+            cp_size=self.swa_cp_size,
+            window=self.window_size[0],
+            device=query.device,
+        )
+        key, value = exchange_swa_halo(key, value, plan, self.swa_cp_group)
+        # Megatron's wrapper maps a THD mask to top-left padding_causal; [halo | chunk] needs bottom-right.
+        return super(TEDotProductAttention, self).forward(
+            query,
+            key,
+            value,
+            qkv_format="thd",
+            attn_mask_type="padding_causal_bottom_right",
+            cu_seqlens_q=plan.cu_seqlens_q,
+            cu_seqlens_kv=plan.cu_seqlens_kv,
+            max_seqlen_q=plan.max_seqlen_q,
+            max_seqlen_kv=plan.max_seqlen_kv,
+        )
 
 
 AutoMapping.register_module_type("MiMoV2TEDotProductAttention", "column")
@@ -162,7 +215,6 @@ class MiMoV2ModelProvider(GPTModelProvider):
         assert self.tensor_model_parallel_size <= min(
             self.full_attn_num_query_groups, self.swa_num_query_groups
         ), "MiMo-V2 needs TP <= the smallest per-layer KV head count"
-        assert self.context_parallel_size == 1, "MiMo-V2 attention does not support context parallelism yet"
         return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
 
 
