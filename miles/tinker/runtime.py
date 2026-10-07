@@ -17,14 +17,19 @@ import pybase64
 import torch
 
 from miles.ray.rollout.train_data_conversion import ROLLOUT_DATA_VALUE_SPEC
-from miles.tinker.core.types import UserInputError
+from miles.tinker.core.types import EngineUnavailableError, UserInputError
+from miles.tinker.engine_load import EngineLoad, EngineLoadMonitor
 from miles.tinker.expert_load import expert_counts
+from miles.tinker.rank_affinity import RankAffinity
 from miles.tinker.sampler_records import SamplerRecordStore, SequenceRecord, parse_supports, prefix_hashes, support_csr
 from miles.utils import object_store
 from miles.utils.http_utils import post
 from tinker.types.topk_logprobs import MASK_LOGPROB
 
 logger = logging.getLogger(__name__)
+
+# A pinned engine that keeps failing hands its sample to the router after this many attempts.
+_PINNED_ENGINE_ATTEMPTS = 3
 
 # internal datum key -> trainer batch key
 DATUM_TO_BATCH_KEYS = {"weights": "loss_weights", "advantages": "advantages", "sampling_logprobs": "rollout_log_probs"}
@@ -182,6 +187,7 @@ class MilesBackend:
         num_experts: int | None = None,
         engine_urls: Callable[[], Awaitable[list[str]]] | None = None,
         unbounded_supports: bool = False,
+        rank_affinity: RankAffinity | None = None,
     ) -> None:
         self.trainer = trainer
         self.router_url = router_url
@@ -198,6 +204,8 @@ class MilesBackend:
         self.unbounded_supports = unbounded_supports
         # adapter backfill paths, for recomputing the routes of a sample whose records the engine lost
         self._lora_paths: dict[str, str] = {}
+        self.rank_affinity = rank_affinity
+        self.engine_load_monitor = EngineLoadMonitor(router_url)
 
     async def trainer_dead(self) -> bool:
         return await self.trainer.has_errored_cell()
@@ -378,6 +386,34 @@ class MilesBackend:
 
     # -------- sampling --------
 
+    async def engine_loads(self) -> list[EngineLoad]:
+        return await self.engine_load_monitor.get_loads()
+
+    async def _choose_engine(self, prompt_tokens: list[int]) -> str:
+        """The engine holding this rollout's context, or the router when affinity is off or load is unknown."""
+        if self.rank_affinity is None:
+            return self.router_url
+        try:
+            loads = await self.engine_loads()
+        except EngineUnavailableError as error:
+            logger.warning(f"rank affinity skipped: {error}")
+            return self.router_url
+        if not loads:
+            return self.router_url
+        return self.rank_affinity.choose_engine(prompt_tokens, loads)
+
+    async def _generate(self, prompt_tokens: list[int], requests: list[dict]) -> tuple[str, list[dict]]:
+        """Sample on the rollout's engine; when that engine keeps failing, the router places the request."""
+        engine_url = await self._choose_engine(prompt_tokens)
+        if engine_url != self.router_url:
+            try:
+                return engine_url, await asyncio.gather(
+                    *[post(f"{engine_url}/generate", item, max_retries=_PINNED_ENGINE_ATTEMPTS) for item in requests]
+                )
+            except httpx.HTTPError as error:
+                logger.warning(f"rank affinity: {engine_url} failed ({error}); the router places this sample")
+        return self.router_url, await asyncio.gather(*[post(f"{self.router_url}/generate", item) for item in requests])
+
     async def sample(
         self, payload: dict, lora_name: str | None, lora_path: str | None = None, sequence_ids: list[str] | None = None
     ) -> dict:
@@ -398,13 +434,16 @@ class MilesBackend:
             if lora_name is not None and lora_path is not None:
                 self._lora_paths[lora_name] = lora_path
         try:
-            responses = await asyncio.gather(*[post(f"{self.router_url}/generate", sample_request) for sample_request in sample_requests])
+            engine_url, responses = await self._generate(payload["prompt_tokens"], sample_requests)
         except httpx.HTTPError as error:
             return {"error": str(error)}
         sequences = [_to_sequence(response) for response in responses]
         for sequence in sequences:
             if "error" in sequence:
                 return sequence
+        if self.rank_affinity is not None and engine_url != self.router_url:
+            for sequence in sequences:
+                self.rank_affinity.record(payload["prompt_tokens"], sequence["tokens"], engine_url)
         if self.routed_experts is not None:
             for sequence, response in zip(sequences, responses, strict=True):
                 self._cache_routes(payload["prompt_tokens"], sequence["tokens"], response)

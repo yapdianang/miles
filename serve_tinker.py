@@ -16,6 +16,7 @@ from miles.tinker.arguments import add_tinker_arguments, configure_tinker_args
 from miles.tinker.core.service import TinkerService
 from miles.tinker.core.types import GatewayConfig
 from miles.tinker.expert_load import moe_layers
+from miles.tinker.rank_affinity import RankAffinity
 from miles.tinker.runtime import MilesBackend, RoutedExpertsCache, engines_return_unbounded_supports
 from miles.tinker.sampler_records import SamplerRecordStore
 from miles.tinker.server.app import build_app
@@ -105,6 +106,7 @@ async def serve(args, *, disposer: Disposer):
         num_experts=args.num_experts,
         engine_urls=functools.partial(get_worker_urls, args),
         unbounded_supports=engines_return_unbounded_supports(),
+        rank_affinity=RankAffinity() if args.tinker_engine_affinity else None,
     )
     service = TinkerService(backend, config)
 

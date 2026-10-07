@@ -157,6 +157,8 @@ def _serve(args: ScriptArgs) -> None:
     tinker_args = (
         f"--tinker-base-model {args.base_model} --tinker-server-port {args.tinker_port} "
         f"--tinker-checkpoint-root {args.save_dir}/{args.run_id} "
+        # MiMo-V2.6 section 6.3: each rollout's turns stay on the engine that holds its context.
+        "--tinker-engine-affinity "
     )
     topology_args = (
         f"--actor-num-nodes {args.actor_num_nodes} --actor-num-gpus-per-node {args.actor_num_gpus_per_node} "

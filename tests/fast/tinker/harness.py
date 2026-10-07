@@ -26,6 +26,7 @@ class FakeBackend:
         self.dead = False
         self.optim_outcomes: dict[int, dict] = {}
         self.fail_on: dict[str, Exception | dict] = {}
+        self.loads: list | Exception = []
 
     def _record(self, name: str, **kwargs) -> dict | None:
         self.calls.append((name, kwargs))
@@ -88,6 +89,11 @@ class FakeBackend:
         if failure is None and metadata is not None:
             write_checkpoint_dir(path, lambda _: None, metadata=metadata, overwrite=name == "save_slot")
         return failure
+
+    async def engine_loads(self):
+        if isinstance(self.loads, Exception):
+            raise self.loads
+        return self.loads
 
     async def sample(self, payload, lora_name, lora_path=None, sequence_ids=None):
         failure = self._record(
