@@ -1,0 +1,821 @@
+diff --git a/python/sglang/srt/arg_groups/fields/exec_.py b/python/sglang/srt/arg_groups/fields/exec_.py
+index 159d4b0..8397958 100644
+--- a/python/sglang/srt/arg_groups/fields/exec_.py
++++ b/python/sglang/srt/arg_groups/fields/exec_.py
+@@ -105,6 +105,13 @@ class ExecFeatures(msgspec.Struct):
+         "Use the same value on disaggregated prefill and decode nodes; clients "
+         "should set top_k below the limit to leave headroom for cutoff ties.",
+     ] = 4096
++    rollout_record_cache_gb: A[
++        float,
++        "Host memory for rollout records. A request with keep_rollout_record keeps "
++        "its routed experts and sampling mask in the engine under its rid instead of "
++        "returning them, and /collect_rollout_records returns them once. Its response "
++        "keeps each output token's selected sampling log-probability.",
++    ] = 0.0
+     disable_outlines_disk_cache: A[
+         bool,
+         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index bb76f30..de41cb0 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -43,6 +43,7 @@ from typing import (
+ import aiohttp
+ import numpy as np
+ import orjson
++import pybase64
+ import requests
+ import uvicorn
+ import uvloop
+@@ -125,6 +126,7 @@ from sglang.srt.managers.io_struct import (
+     BeginWeightUpdateReqInput,
+     CheckWeightsReqInput,
+     CloseSessionReqInput,
++    CollectRolloutRecordsReqInput,
+     ConfigureLoggingReq,
+     ContinueGenerationReqInput,
+     DestroyWeightsUpdateGroupReqInput,
+@@ -985,6 +987,31 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
+         return _create_error_response(e)
+ 
+ 
++@app.post("/collect_rollout_records")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def collect_rollout_records(
++    obj: Annotated[CollectRolloutRecordsReqInput, Body()],
++):
++    """Return and drop the routed experts and sampling masks kept for these rids."""
++    ret = await _global_state.tokenizer_manager.collect_rollout_records(obj)
++
++    def encode(array):
++        return None if array is None else pybase64.b64encode(array.tobytes()).decode()
++
++    records = {}
++    for rid, record in ret.records.items():
++        supports = record.supports
++        records[rid] = {
++            "routes_start": record.routes_start,
++            "routes_shape": None if record.routes is None else record.routes.shape,
++            "routes": encode(record.routes),
++            "support_lengths": encode(supports and supports.lengths),
++            "support_ids": encode(supports and supports.token_ids),
++            "support_logprobs": encode(supports and supports.logprobs),
++        }
++    return ORJSONResponse({"records": records, "num_evicted": ret.num_evicted})
++
++
+ @app.api_route("/flush_cache", methods=["GET", "POST"])
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 17e7704..14c3316 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -639,6 +639,8 @@ class Envs:
+     # an accurate TTFT for benchmarking; the upstream default of 50 trades
+     # off some TTFT-metric accuracy for less IPC overhead.
+     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
++    # Kept rollout records are also returned in full, to compare the two paths.
++    SGLANG_ROLLOUT_RECORDS_ALSO_RETURN = EnvBool(False)
+ 
+     # ===================================================================
+     # Overlap scheduler and pipeline parallelism
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 4ebce9c..f65cfb1 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -55,6 +55,7 @@ from sglang.srt.environ import envs
+ from sglang.srt.lora.lora_registry import LoRARef
+ from sglang.srt.managers.embed_types import PositionalEmbeds
+ from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
++from sglang.srt.managers.rollout_records import RolloutRecord
+ from sglang.srt.managers.schedule_batch import (
+     Modality,
+     MultimodalProcessorOutput,
+@@ -264,6 +265,9 @@ class GenerateReqInput:
+     # 0 = full sequence.
+     routed_experts_start_len: int = 0
+     return_indexer_topk: bool = False
++    # Keep the routed experts and sampling mask in the engine under the rid until
++    # /collect_rollout_records instead of returning them (--rollout-record-cache-gb).
++    keep_rollout_record: bool = False
+ 
+     # The modalities of the image data [image, multi-images, video]
+     modalities: Optional[List[str]] = None
+@@ -980,6 +984,7 @@ class GenerateReqInput:
+             return_routed_experts=self.return_routed_experts,
+             routed_experts_start_len=self.routed_experts_start_len,
+             return_indexer_topk=self.return_indexer_topk,
++            keep_rollout_record=self.keep_rollout_record,
+             modalities=self.modalities[i] if self.modalities else None,
+             session_params=self.session_params,
+             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+@@ -1153,6 +1158,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+     # Shape of output_token_sampling_logprobs for each output token. This is a
+     # defaulted tail field so older IPC senders decode as selected mode.
+     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
++    # See GenerateReqInput.keep_rollout_record; an append-only tail field.
++    keep_rollout_record: bool = False
+ 
+     def wrap_pickle_fields(self):
+         self.time_stats = wrap_as_pickle(self.time_stats)
+@@ -1804,6 +1811,16 @@ class ListExternalCorporaReqOutput(BaseReq, kw_only=True):
+     message: str = ""
+ 
+ 
++class CollectRolloutRecordsReqInput(BaseReq, kw_only=True):
++    rids: List[str]
++
++
++class CollectRolloutRecordsReqOutput(BaseReq, kw_only=True):
++    # Absent rids were evicted, never kept, or collected before.
++    records: Dict[str, RolloutRecord] = msgspec.field(default_factory=dict)
++    num_evicted: int = 0
++
++
+ class AttachHiCacheStorageReqInput(BaseReq, kw_only=True):
+     """Dynamically attach (enable) HiCache storage backend at runtime.
+ 
+diff --git a/python/sglang/srt/managers/rollout_records.py b/python/sglang/srt/managers/rollout_records.py
+new file mode 100644
+index 0000000..a818f33
+--- /dev/null
++++ b/python/sglang/srt/managers/rollout_records.py
+@@ -0,0 +1,85 @@
++"""Routed experts and sampling supports kept on the host until a trainer collects them.
++
++With ``--rollout-record-cache-gb``, a finished request that asked for routed experts or a
++sampling mask leaves them here under its rid instead of in its response; the response keeps
++only each output token's selected log-probability. ``/collect_rollout_records`` returns the
++records of a rollout once and drops them.
++"""
++
++from collections import OrderedDict
++from typing import Dict, List, Optional
++
++import msgspec
++import numpy as np
++
++from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
++
++
++class RolloutRecord(msgspec.Struct, array_like=True, kw_only=True):
++    # The request's routed_experts_start_len: routes cover positions [routes_start, seqlen - 1).
++    routes_start: int = 0
++    # int16 [rows, layers, topk]
++    routes: Optional[np.ndarray] = None
++    # One support row per output token, as the response would have carried it.
++    supports: Optional[SamplingMaskChunk] = None
++
++    @property
++    def nbytes(self) -> int:
++        arrays = [self.routes]
++        if self.supports is not None:
++            supports = self.supports
++            arrays += [supports.lengths, supports.token_ids, supports.logprobs]
++        return sum(array.nbytes for array in arrays if array is not None)
++
++
++def selected_logprobs_chunk(
++    supports: SamplingMaskChunk, output_ids: np.ndarray, support_logprobs: bool
++) -> SamplingMaskChunk:
++    """Rows without token ids whose log-probability is that of the sampled token."""
++    logprobs = supports.logprobs
++    if support_logprobs:
++        sampled = np.repeat(
++            output_ids[: len(supports.lengths)].astype(np.int32), supports.lengths
++        )
++        logprobs = logprobs[supports.token_ids == sampled]
++    return SamplingMaskChunk(
++        lengths=np.zeros(len(logprobs), dtype=np.int32),
++        token_ids=np.empty(0, dtype=np.int32),
++        logprobs=np.ascontiguousarray(logprobs, dtype=np.float32),
++    )
++
++
++class RolloutRecordPool:
++    """Records by rid; the oldest leave first once they exceed ``max_bytes``."""
++
++    def __init__(self, max_bytes: int) -> None:
++        self.max_bytes = max_bytes
++        self.num_bytes = 0
++        self.num_evicted = 0
++        self._records: "OrderedDict[str, RolloutRecord]" = OrderedDict()
++
++    def __len__(self) -> int:
++        return len(self._records)
++
++    def put(self, rid: str, record: RolloutRecord) -> None:
++        previous = self._records.pop(rid, None)
++        if previous is not None:
++            self.num_bytes -= previous.nbytes
++        self._records[rid] = record
++        self.num_bytes += record.nbytes
++        while self.num_bytes > self.max_bytes and len(self._records) > 1:
++            self.num_bytes -= self._records.popitem(last=False)[1].nbytes
++            self.num_evicted += 1
++
++    def collect(self, rids: List[str]) -> Dict[str, RolloutRecord]:
++        records = {}
++        for rid in rids:
++            record = self._records.pop(rid, None)
++            if record is not None:
++                self.num_bytes -= record.nbytes
++                records[rid] = record
++        return records
++
++    def clear(self) -> None:
++        self._records.clear()
++        self.num_bytes = 0
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index a94a1df..7f1ba9e 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1025,6 +1025,7 @@ class Req(ReqDllmMixin):
+         return_routed_experts: bool = False,
+         routed_experts_start_len: int = 0,
+         return_indexer_topk: bool = False,
++        keep_rollout_record: bool = False,
+         eos_token_ids: Optional[Set[int]] = None,
+         bootstrap_host: Optional[str] = None,
+         bootstrap_port: Optional[int] = None,
+@@ -1289,6 +1290,7 @@ class Req(ReqDllmMixin):
+         )
+ 
+         self.return_indexer_topk = return_indexer_topk
++        self.keep_rollout_record = keep_rollout_record
+         self.indexer_topk: Optional[torch.Tensor] = (
+             None  # cpu tensor: shape (seqlen, num_indexer_layers, index_topk)
+         )
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 2ddc48f..d119988 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -132,6 +132,8 @@ from sglang.srt.managers.io_struct import (
+     ClearHiCacheReqInput,
+     ClearHiCacheReqOutput,
+     CloseSessionReqInput,
++    CollectRolloutRecordsReqInput,
++    CollectRolloutRecordsReqOutput,
+     ConfigureLoggingReq,
+     ContinueGenerationReqInput,
+     DestroyWeightsUpdateGroupReqInput,
+@@ -210,6 +212,7 @@ from sglang.srt.managers.prefill_delayer import (
+     PrefillDelayerSinglePassExecutor,
+     RecentPrefillBatchSizeTracker,
+ )
++from sglang.srt.managers.rollout_records import RolloutRecordPool
+ from sglang.srt.managers.schedule_batch import (
+     FINISH_ABORT,
+     MultimodalInputs,
+@@ -1734,6 +1737,7 @@ class Scheduler(
+                 (AbortReq, self.abort_request),
+                 (OpenSessionReqInput, self.open_session),
+                 (CloseSessionReqInput, self.close_session),
++                (CollectRolloutRecordsReqInput, self.collect_rollout_records),
+                 (
+                     UpdateWeightFromDiskReqInput,
+                     self.weight_updater.update_weights_from_disk,
+@@ -2465,6 +2469,13 @@ class Scheduler(
+         )
+ 
+     def init_output_streamer(self) -> None:
++        # Only the rank that answers the tokenizer keeps records.
++        self.rollout_records = (
++            RolloutRecordPool(int(self.server_args.rollout_record_cache_gb * 2**30))
++            if self.server_args.rollout_record_cache_gb > 0
++            and self.ipc_channels.send_to_tokenizer.socket is not None
++            else None
++        )
+         self.output_streamer = self.get_output_streamer_class()(
+             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
+             tree_cache=self.tree_cache,
+@@ -2477,6 +2488,7 @@ class Scheduler(
+                 self.enable_hicache_storage or self.enable_lmcache
+             ),
+             rust_server=self.rust_server,
++            rollout_records=self.rollout_records,
+         )
+ 
+     def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
+@@ -2801,6 +2813,7 @@ class Scheduler(
+                 return_routed_experts=recv_req.return_routed_experts,
+                 routed_experts_start_len=recv_req.routed_experts_start_len,
+                 return_indexer_topk=recv_req.return_indexer_topk,
++                keep_rollout_record=recv_req.keep_rollout_record,
+                 eos_token_ids=self.model_config.hf_eos_token_id,
+                 bootstrap_host=recv_req.bootstrap_host,
+                 bootstrap_port=recv_req.bootstrap_port,
+@@ -5201,6 +5214,8 @@ class Scheduler(
+             self.req_to_token_pool.reset_aux_cache_allocator()
+             self.grammar_manager.clear()
+             self.metrics_reporter.reset_metrics()
++            if self.rollout_records is not None:
++                self.rollout_records.clear()
+ 
+             if self.draft_worker:
+                 self.draft_worker.clear_cache_pool()
+@@ -5221,6 +5236,16 @@ class Scheduler(
+             success = False
+         return success
+ 
++    def collect_rollout_records(
++        self, recv_req: CollectRolloutRecordsReqInput
++    ) -> CollectRolloutRecordsReqOutput:
++        if self.rollout_records is None:
++            return CollectRolloutRecordsReqOutput()
++        return CollectRolloutRecordsReqOutput(
++            records=self.rollout_records.collect(recv_req.rids),
++            num_evicted=self.rollout_records.num_evicted,
++        )
++
+     def get_internal_state(self, recv_req: GetInternalStateReq):
+         # Resolved config (pristine server_args + post-publish overrides) so a
+         # readback reflects values changed via /set_internal_state, not startup.
+diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+index c394a9f..4feb290 100644
+--- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
++++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+@@ -11,6 +11,7 @@ from typing import (
+     Optional,
+ )
+ 
++import numpy as np
+ import torch
+ import zmq
+ 
+@@ -26,7 +27,13 @@ from sglang.srt.managers.io_struct import (
+     CachedTokensDetails,
+     wrap_as_pickle,
+ )
++from sglang.srt.managers.rollout_records import (
++    RolloutRecord,
++    RolloutRecordPool,
++    selected_logprobs_chunk,
++)
+ from sglang.srt.managers.schedule_batch import (
++    FINISH_ABORT,
+     BaseFinishReason,
+     Req,
+ )
+@@ -62,6 +69,8 @@ class SchedulerOutputStreamer:
+     # Rust egress ring via `rust_server.push_generation` instead of the zmq
+     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
+     rust_server: Optional[RustServer] = None
++    # Set with --rollout-record-cache-gb on the rank that answers the tokenizer.
++    rollout_records: Optional[RolloutRecordPool] = None
+     is_multimodal_gen: bool = False
+     _test_stream_output_count: int = 0
+ 
+@@ -176,6 +185,7 @@ class SchedulerOutputStreamer:
+             get_cached_tokens_details=self.get_cached_tokens_details,
+             rust_server_mode=self.rust_server is not None,
+             current_weight_version=get_serving().weight_version,
++            rollout_records=self.rollout_records,
+         )
+         for req in reqs:
+             if req is skip_req:
+@@ -381,6 +391,7 @@ class _GenerationStreamAccumulator:
+     output_token_ids_logprobs_val: Optional[list] = None
+     output_token_ids_logprobs_idx: Optional[list] = None
+     output_token_sampling_mask: Optional[list[Optional[SamplingMaskChunk]]] = None
++    rollout_records: Optional[RolloutRecordPool] = None
+     # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
+     # output tokens itself and never consumes the scheduler's incremental-detok
+     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
+@@ -413,6 +424,43 @@ class _GenerationStreamAccumulator:
+         if self.return_sampling_mask:
+             self.output_token_sampling_mask = []
+ 
++    def _keep_rollout_record(
++        self, req: Req, output_ids
++    ) -> Optional[SamplingMaskChunk]:
++        """Move a finished request's routes and supports to the pool; the response
++        carries only the selected log-probability of each output token."""
++        empty = SamplingMaskChunk(
++            lengths=np.empty(0, dtype=np.int32),
++            token_ids=np.empty(0, dtype=np.int32),
++            logprobs=np.empty(0, dtype=np.float32),
++        )
++        if not req.finished():
++            # Support rows stay queued on the request until it finishes.
++            return empty
++        supports = req.sampling_mask_rows.take() if req.return_sampling_mask else None
++        routes = req.routed_experts
++        if isinstance(req.finished_reason, FINISH_ABORT):
++            req.routed_experts = None
++            return empty
++        self.rollout_records.put(
++            req.rid,
++            RolloutRecord(
++                routes_start=req.routed_experts_start_len,
++                routes=None if routes is None else routes.numpy().astype(np.int16),
++                supports=supports,
++            ),
++        )
++        if envs.SGLANG_ROLLOUT_RECORDS_ALSO_RETURN.get():
++            return supports
++        req.routed_experts = None
++        if supports is None:
++            return empty
++        return selected_logprobs_chunk(
++            supports,
++            np.asarray(output_ids, dtype=np.int64),
++            support_logprobs=req.sampling_logprobs_mode == "support",
++        )
++
+     def _beam_admits(self, *, req: Req) -> bool:
+         # Only the leader is ever streamed, and only at group finish.
+         return req.is_beam_leader and req.finished()
+@@ -626,9 +674,15 @@ class _GenerationStreamAccumulator:
+                 self.output_token_ids_logprobs_val.append([])
+                 self.output_token_ids_logprobs_idx.append([])
+ 
++        kept_mask = None
++        if self.rollout_records is not None and req.keep_rollout_record:
++            kept_mask = self._keep_rollout_record(req, output_ids_)
++
+         if self.return_sampling_mask:
+             if req.return_sampling_mask:
+-                self.output_token_sampling_mask.append(req.sampling_mask_rows.take())
++                self.output_token_sampling_mask.append(
++                    req.sampling_mask_rows.take() if kept_mask is None else kept_mask
++                )
+             else:
+                 self.output_token_sampling_mask.append(None)
+ 
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index 4abd64d..1529e7e 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -25,6 +25,8 @@ from sglang.srt.managers.io_struct import (
+     ClearHiCacheReqInput,
+     ClearHiCacheReqOutput,
+     CloseSessionReqInput,
++    CollectRolloutRecordsReqInput,
++    CollectRolloutRecordsReqOutput,
+     DestroyWeightsUpdateGroupReqInput,
+     DestroyWeightsUpdateGroupReqOutput,
+     DetachHiCacheStorageReqInput,
+@@ -129,6 +131,7 @@ _COMMUNICATOR_SPECS = [
+     ("slow_down", SlowDownReqOutput),
+     ("pd_role_switch", PdRoleSwitchReqOutput),
+     ("flush_cache", FlushCacheReqOutput),
++    ("collect_rollout_records", CollectRolloutRecordsReqOutput),
+     ("add_external_corpus", AddExternalCorpusReqOutput),
+     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
+     ("list_external_corpora", ListExternalCorporaReqOutput),
+@@ -322,6 +325,19 @@ class TokenizerControlMixin:
+             message=all_message,
+         )
+ 
++    async def collect_rollout_records(
++        self: TokenizerManager, obj: CollectRolloutRecordsReqInput
++    ) -> CollectRolloutRecordsReqOutput:
++        self.auto_create_handle_loop()
++        results = await self.collect_rollout_records_communicator(obj)
++        records = {}
++        for result in results:
++            records.update(result.records)
++        return CollectRolloutRecordsReqOutput(
++            records=records,
++            num_evicted=sum(result.num_evicted for result in results),
++        )
++
+     async def flush_cache(
+         self: TokenizerManager, timeout_s: Optional[float] = None
+     ) -> FlushCacheReqOutput:
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 110c1d9..434e312 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -1406,6 +1406,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     "sampling_logprobs_mode can only be set when "
+                     "return_sampling_mask=true."
+                 )
++            if (
++                obj.keep_rollout_record
++                and get_exec().features.rollout_record_cache_gb <= 0
++            ):
++                raise ValueError(
++                    "keep_rollout_record requires --rollout-record-cache-gb."
++                )
+ 
+     def _validate_mm_limits(
+         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+@@ -1542,6 +1549,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 return_routed_experts=obj.return_routed_experts,
+                 routed_experts_start_len=obj.routed_experts_start_len,
+                 return_indexer_topk=obj.return_indexer_topk,
++                keep_rollout_record=obj.keep_rollout_record,
+                 routed_dp_rank=obj.routed_dp_rank,
+                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
+                 priority=obj.priority,
+@@ -2491,21 +2499,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 and state.obj.return_sampling_mask
+             ):
+                 output_sampling_mask = recv_obj.output_token_sampling_mask
++                # Kept masks stay in the engine; rows carry only selected logprobs.
++                kept = (
++                    state.obj.keep_rollout_record
++                    and not envs.SGLANG_ROLLOUT_RECORDS_ALSO_RETURN.get()
++                )
+                 if output_sampling_mask is not None:
+                     masks, logprobs = output_sampling_mask[i].to_lists(
+                         support_logprobs=state.obj.sampling_logprobs_mode == "support"
++                        and not kept
+                     )
+-                    state.output_token_sampling_mask.extend(masks)
+                     state.output_token_sampling_logprobs.extend(logprobs)
+-                    meta_info["output_token_sampling_mask"] = (
+-                        state.output_token_sampling_mask
+-                    )
+                     meta_info["output_token_sampling_logprobs"] = (
+                         state.output_token_sampling_logprobs
+                     )
+-                    meta_info["output_token_sampling_mask_length"] = len(
+-                        state.output_token_sampling_mask
+-                    )
++                    if not kept:
++                        state.output_token_sampling_mask.extend(masks)
++                        meta_info["output_token_sampling_mask"] = (
++                            state.output_token_sampling_mask
++                        )
++                        meta_info["output_token_sampling_mask_length"] = len(
++                            state.output_token_sampling_mask
++                        )
+ 
+             if not isinstance(recv_obj, BatchEmbeddingOutput):
+                 meta_info.update(
+diff --git a/test/registered/unit/managers/test_rollout_records.py b/test/registered/unit/managers/test_rollout_records.py
+new file mode 100644
+index 0000000..4b4d5c2
+--- /dev/null
++++ b/test/registered/unit/managers/test_rollout_records.py
+@@ -0,0 +1,265 @@
++import unittest
++from types import SimpleNamespace
++
++import numpy as np
++import torch
++
++from sglang.srt.disaggregation.utils import DisaggregationMode
++from sglang.srt.environ import envs
++from sglang.srt.managers.io_struct import (
++    CollectRolloutRecordsReqOutput,
++    msgpack_decode,
++    msgpack_encode,
++)
++from sglang.srt.managers.rollout_records import (
++    RolloutRecord,
++    RolloutRecordPool,
++    selected_logprobs_chunk,
++)
++from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH
++from sglang.srt.managers.scheduler_components.output_streamer import (
++    _GenerationStreamAccumulator,
++)
++from sglang.srt.sampling.sampling_mask import SamplingMaskChunk, SamplingMaskRows
++from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++
++# Output tokens 7, 8, 9; each support row lists the sampled token among its candidates.
++OUTPUT_IDS = [7, 8, 9]
++SUPPORT_IDS = [[3, 7], [8], [9, 4, 5]]
++SUPPORT_LOGPROBS = [[-1.0, -0.5], [0.0], [-0.25, -2.0, -3.0]]
++
++
++def _record(num_bytes: int) -> RolloutRecord:
++    return RolloutRecord(routes=np.zeros(num_bytes // 2, dtype=np.int16))
++
++
++class _FakeReq:
++    def __init__(self, *, finished_reason=None, return_sampling_mask=True, keep=True):
++        self.rid = "seq-1"
++        self.http_worker_ipc = None
++        self.finished_reason = finished_reason
++        self.finished_output = False
++        self.finished_len = None
++        self.stream = False
++        self.sampling_params = SimpleNamespace(
++            max_new_tokens=8,
++            stream_interval=None,
++            skip_special_tokens=True,
++            spaces_between_special_tokens=True,
++            no_stop_trim=False,
++        )
++        self.output_ids = list(OUTPUT_IDS)
++        self.output_ids_through_stop = list(OUTPUT_IDS)
++        self.send_token_offset = 0
++        self.send_output_token_logprobs_offset = 0
++        self.send_decode_id_offset = 0
++        self.decoded_text = ""
++        self.origin_input_ids = [1, 2]
++        self.reasoning_tokens = 0
++        self.cached_tokens = 0
++        self.retraction_count = 0
++        self.time_stats = None
++        self.weight_version_events = []
++        self.mm_image_tokens = 0
++        self.mm_audio_tokens = 0
++        self.mm_video_tokens = 0
++        self.multimodal_inputs = None
++        self.customized_info = None
++        self.is_retracted = False
++        self.beam_group = None
++        self.return_logprob = False
++        self.return_hidden_states = False
++        self.return_indexer_topk = False
++        self.return_routed_experts = True
++        self.keep_rollout_record = keep
++        self.routed_experts_start_len = 1
++        # The scheduler gathers rows [start_len, seqlen - 1) when the request finishes.
++        self.routed_experts = (
++            torch.arange(3 * 2 * 4, dtype=torch.int32).view(3, 2, 4)
++            if finished_reason is not None
++            else None
++        )
++        self.return_sampling_mask = return_sampling_mask
++        self.sampling_logprobs_mode = "support"
++        self.sampling_mask_rows = SamplingMaskRows() if return_sampling_mask else None
++        for ids, logprobs in zip(SUPPORT_IDS, SUPPORT_LOGPROBS):
++            if return_sampling_mask:
++                self.sampling_mask_rows.append(
++                    np.array(ids, dtype=np.int32), np.array(logprobs, dtype=np.float32)
++                )
++
++    def finished(self):
++        return self.finished_reason is not None
++
++    def init_incremental_detokenize(self):
++        return self.output_ids_through_stop, 0
++
++
++def _accumulator(pool: RolloutRecordPool) -> _GenerationStreamAccumulator:
++    return _GenerationStreamAccumulator(
++        return_logprob=False,
++        return_hidden_states=False,
++        return_routed_experts=True,
++        return_indexer_topk=False,
++        return_sampling_mask=True,
++        spec_algorithm=SpeculativeAlgorithm.NONE,
++        disaggregation_mode=DisaggregationMode.NULL,
++        default_stream_interval=1,
++        default_force_stream_interval=1,
++        get_cached_tokens_details=lambda req: None,
++        current_weight_version=None,
++        rollout_records=pool,
++    )
++
++
++class TestRolloutRecordPool(unittest.TestCase):
++    def test_collect_returns_each_record_once(self):
++        pool = RolloutRecordPool(max_bytes=1 << 20)
++        pool.put("a", _record(16))
++        pool.put("b", _record(32))
++        records = pool.collect(["a", "missing"])
++        self.assertEqual(list(records), ["a"])
++        self.assertEqual(pool.collect(["a"]), {})
++        self.assertEqual((len(pool), pool.num_bytes), (1, 32))
++
++    def test_the_oldest_records_leave_first_over_budget(self):
++        pool = RolloutRecordPool(max_bytes=64)
++        for rid in "abc":
++            pool.put(rid, _record(32))
++        self.assertEqual(list(pool.collect(["a", "b", "c"])), ["b", "c"])
++        self.assertEqual(pool.num_evicted, 1)
++
++    def test_a_record_over_budget_is_kept_alone(self):
++        pool = RolloutRecordPool(max_bytes=8)
++        pool.put("a", _record(16))
++        pool.put("b", _record(16))
++        self.assertEqual(list(pool.collect(["a", "b"])), ["b"])
++
++    def test_clear_drops_everything(self):
++        pool = RolloutRecordPool(max_bytes=1 << 20)
++        pool.put("a", _record(16))
++        pool.clear()
++        self.assertEqual((len(pool), pool.num_bytes), (0, 0))
++
++    def test_records_cross_the_ipc_boundary(self):
++        supports = SamplingMaskChunk(
++            lengths=np.array([2], dtype=np.int32),
++            token_ids=np.array([3, 7], dtype=np.int32),
++            logprobs=np.array([-1.0, -0.5], dtype=np.float32),
++        )
++        output = CollectRolloutRecordsReqOutput(
++            records={
++                "a": RolloutRecord(
++                    routes_start=4,
++                    routes=np.ones((1, 2, 3), np.int16),
++                    supports=supports,
++                )
++            },
++        )
++        record = msgpack_decode(msgpack_encode(output)).records["a"]
++        self.assertEqual(record.routes_start, 4)
++        np.testing.assert_array_equal(record.routes, np.ones((1, 2, 3), np.int16))
++        np.testing.assert_array_equal(record.supports.token_ids, [3, 7])
++
++
++class TestSelectedLogprobs(unittest.TestCase):
++    def test_support_rows_reduce_to_the_sampled_token(self):
++        rows = SamplingMaskRows()
++        for ids, logprobs in zip(SUPPORT_IDS, SUPPORT_LOGPROBS):
++            rows.append(np.array(ids, np.int32), np.array(logprobs, np.float32))
++        chunk = selected_logprobs_chunk(
++            rows.view(), np.array(OUTPUT_IDS), support_logprobs=True
++        )
++        np.testing.assert_allclose(chunk.logprobs, [-0.5, 0.0, -0.25])
++        self.assertEqual(chunk.to_lists(support_logprobs=False)[1], [-0.5, 0.0, -0.25])
++
++    def test_selected_rows_pass_through(self):
++        chunk = SamplingMaskChunk(
++            lengths=np.array([1], np.int32),
++            token_ids=np.array([7], np.int32),
++            logprobs=np.array([-0.3], np.float32),
++        )
++        result = selected_logprobs_chunk(chunk, np.array([7]), support_logprobs=False)
++        np.testing.assert_allclose(result.logprobs, [-0.3])
++
++
++class TestStreamerKeepsRecords(unittest.TestCase):
++    def test_an_unfinished_request_streams_no_rows_and_keeps_them_queued(self):
++        pool = RolloutRecordPool(max_bytes=1 << 20)
++        accumulator = _accumulator(pool)
++        req = _FakeReq()
++        accumulator.accept(req=req)
++        self.assertEqual(len(accumulator.output_token_sampling_mask[0].lengths), 0)
++        self.assertEqual(accumulator.routed_experts, [None])
++        self.assertEqual(len(req.sampling_mask_rows.view().lengths), 3)
++        self.assertEqual(len(pool), 0)
++
++    def test_a_finished_request_leaves_routes_and_supports_in_the_pool(self):
++        pool = RolloutRecordPool(max_bytes=1 << 20)
++        accumulator = _accumulator(pool)
++        req = _FakeReq(finished_reason=FINISH_LENGTH(length=3))
++        expected_routes = req.routed_experts.numpy().astype(np.int16)
++        accumulator.accept(req=req)
++        self.assertEqual(accumulator.routed_experts, [None])
++        chunk = accumulator.output_token_sampling_mask[0]
++        np.testing.assert_allclose(chunk.logprobs, [-0.5, 0.0, -0.25])
++        self.assertEqual(len(chunk.token_ids), 0)
++        record = pool.collect(["seq-1"])["seq-1"]
++        self.assertEqual(record.routes_start, 1)
++        self.assertEqual(record.routes.dtype, np.int16)
++        np.testing.assert_array_equal(record.routes, expected_routes)
++        self.assertEqual(
++            record.supports.to_lists(support_logprobs=True),
++            (SUPPORT_IDS, SUPPORT_LOGPROBS),
++        )
++
++    def test_routes_alone_are_kept_without_a_sampling_mask(self):
++        pool = RolloutRecordPool(max_bytes=1 << 20)
++        req = _FakeReq(
++            finished_reason=FINISH_LENGTH(length=3), return_sampling_mask=False
++        )
++        _accumulator(pool).accept(req=req)
++        record = pool.collect(["seq-1"])["seq-1"]
++        self.assertIsNone(record.supports)
++        self.assertEqual(record.routes.shape, (3, 2, 4))
++
++    def test_an_aborted_request_keeps_nothing(self):
++        pool = RolloutRecordPool(max_bytes=1 << 20)
++        req = _FakeReq(finished_reason=FINISH_ABORT("aborted"))
++        _accumulator(pool).accept(req=req)
++        self.assertEqual(len(pool), 0)
++
++    def test_also_return_keeps_and_returns_the_full_record(self):
++        pool = RolloutRecordPool(max_bytes=1 << 20)
++        accumulator = _accumulator(pool)
++        req = _FakeReq(finished_reason=FINISH_LENGTH(length=3))
++        with envs.SGLANG_ROLLOUT_RECORDS_ALSO_RETURN.override(True):
++            accumulator.accept(req=req)
++        masks, _ = accumulator.output_token_sampling_mask[0].to_lists(
++            support_logprobs=True
++        )
++        self.assertEqual(masks, SUPPORT_IDS)
++        self.assertEqual(tuple(accumulator.routed_experts[0].shape), (3, 2, 4))
++        record = pool.collect(["seq-1"])["seq-1"]
++        self.assertEqual(
++            record.supports.to_lists(support_logprobs=True)[0], SUPPORT_IDS
++        )
++
++    def test_a_request_that_does_not_keep_returns_everything(self):
++        pool = RolloutRecordPool(max_bytes=1 << 20)
++        accumulator = _accumulator(pool)
++        req = _FakeReq(finished_reason=FINISH_LENGTH(length=3), keep=False)
++        accumulator.accept(req=req)
++        masks, _ = accumulator.output_token_sampling_mask[0].to_lists(
++            support_logprobs=True
++        )
++        self.assertEqual(masks, SUPPORT_IDS)
++        self.assertEqual(tuple(accumulator.routed_experts[0].shape), (3, 2, 4))
++        self.assertEqual(len(pool), 0)
++
++
++if __name__ == "__main__":
++    unittest.main()

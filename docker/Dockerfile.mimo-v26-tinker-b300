@@ -15,6 +15,12 @@ COPY docker/compat/sglang_pr34201.patch /tmp/sglang_pr34201.patch
 RUN cd /sgl-workspace/sglang && \
     (git apply --reverse --check /tmp/sglang_pr34201.patch 2>/dev/null || git apply /tmp/sglang_pr34201.patch)
 
+# MiMo-V2.6 section 6.4 context caching: with --rollout-record-cache-gb, finished requests keep routed experts
+# and sampling masks in the engine until /collect_rollout_records returns them.
+COPY docker/compat/sglang_rollout_records.patch /tmp/sglang_rollout_records.patch
+RUN cd /sgl-workspace/sglang && \
+    (git apply --reverse --check /tmp/sglang_rollout_records.patch 2>/dev/null || git apply /tmp/sglang_rollout_records.patch)
+
 COPY docker/compat/patch_sglang_mimo_v2_lora.py /tmp/patch_sglang_mimo_v2_lora.py
 RUN python3 /tmp/patch_sglang_mimo_v2_lora.py
 
