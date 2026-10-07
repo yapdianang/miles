@@ -232,10 +232,6 @@ def validate_multi_lora_args(args: Any) -> None:
     assert args.lora_rank > 0, "--lora-rank must be set when --multi-lora-n-adapters > 0"
     assert args.train_backend == "megatron", "Multi-LoRA currently requires --train-backend megatron"
     # Adapter routing is only recompute-safe without pipelining; enforce at launch.
-    assert getattr(args, "context_parallel_size", 1) == 1, (
-        "multi-LoRA requires --context-parallel-size 1: the Tinker losses zip "
-        "full-length per-datum vectors against log_probs, which CP would shard"
-    )
     pipeline_size = getattr(args, "pipeline_model_parallel_size", 1)
     assert pipeline_size == 1 or getattr(args, "recompute_granularity", None) is None, (
         "Multi-LoRA with pipeline parallelism requires activation recompute to be disabled: "

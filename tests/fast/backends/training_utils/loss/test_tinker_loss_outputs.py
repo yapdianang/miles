@@ -10,6 +10,11 @@ from miles.backends.training_utils.loss import objective as loss_module
 from miles.backends.training_utils.loss.hub import tinker_losses
 
 
+@pytest.fixture(autouse=True)
+def _single_cp_rank(monkeypatch):
+    monkeypatch.setattr(tinker_losses, "get_parallel_state", lambda: SimpleNamespace(cp=SimpleNamespace(size=1)))
+
+
 @pytest.mark.parametrize("recompute", [False, True], ids=["direct", "recomputed"])
 def test_loss_passes_return_independent_detached_outputs(monkeypatch, recompute):
     parallel = SimpleNamespace(cp=SimpleNamespace(size=1), intra_dp=SimpleNamespace(size=1))
