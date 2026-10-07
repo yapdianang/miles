@@ -227,6 +227,8 @@ def _serve(args: ScriptArgs) -> None:
     model_args = (
         "--attention-dropout 0.0 --hidden-dropout 0.0 --attention-softmax-in-fp32 --attention-backend fused "
         f"--accumulate-allreduce-grads-in-fp32 --optimizer {args.optimizer} --lr 1e-6 "
+        # A 1M-token datum fits 8 GPUs only without allocator fragmentation; the trainer offloads nothing to TMS.
+        """--train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}' """
     )
     if args.optimizer == "muown":
         model_args += _MUOWN_ARGS
