@@ -86,8 +86,12 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # Section 6.4: no routes for a cached prefix on later turns; the gateway rebuilds them from earlier samples.
     routed_expert_deltas: bool = True
     # Top-p candidate-set replay (section 6.4): the trainer renormalizes within each sampled token's support.
-    # Clients sampling with top_p < 1 must also pass a top_k bound (at most --sglang-sampling-mask-max-tokens).
     sampling_support_replay: bool = True
+    # The engines return each support as a full-vocabulary bitmap (docker/compat/sglang_support_bitmap.patch),
+    # so clients may sample top_p < 1 without a top_k. False returns packed ids
+    # (SGLANG_SAMPLING_MASK_PACKED_IDS=1): clients must then pass a top_k of at most
+    # --sglang-sampling-mask-max-tokens.
+    support_bitmaps: bool = True
     # Fused loss (section 6.4): the loss scores hidden states against the output weight in 4096-row chunks
     # that backward recomputes, so the trainer never holds [tokens, vocab/TP] logits.
     fused_loss: bool = True
@@ -223,6 +227,8 @@ def _serve(args: ScriptArgs) -> None:
             "TORCH_NCCL_TRACE_BUFFER_SIZE": "4096",
             "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
             "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": f"{args.save_dir}/nccl_trace/rank_",
+            # The engines and the gateway both read it.
+            **({} if args.support_bitmaps else {"SGLANG_SAMPLING_MASK_PACKED_IDS": "1"}),
         },
     )
 

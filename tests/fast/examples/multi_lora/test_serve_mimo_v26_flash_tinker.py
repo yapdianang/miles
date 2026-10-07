@@ -1,5 +1,7 @@
 """prepare builds only the missing MiMo checkpoints from the pinned official snapshot."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from examples.multi_lora import serve_mimo_v26_flash_tinker as launcher
@@ -39,3 +41,18 @@ def test_prepare_converts_only_what_is_missing(monkeypatch, tmp_path, converted,
     assert all(
         command.startswith("python ") and "tools/convert_mimo_v2_to_bf16.py" in command for command in commands[1:]
     )
+
+
+@pytest.mark.parametrize("support_bitmaps", [True, False])
+def test_packed_ids_reach_engines_and_gateway_only_without_bitmaps(monkeypatch, tmp_path, support_bitmaps):
+    requests = []
+    args = launcher.ScriptArgs(save_dir=str(tmp_path), support_bitmaps=support_bitmaps)
+    monkeypatch.setattr(
+        args, "create_backend", lambda: SimpleNamespace(execute_train=lambda **kwargs: requests.append(kwargs))
+    )
+
+    launcher._serve(args)
+
+    env = requests[0]["extra_env_vars"]
+    assert ("SGLANG_SAMPLING_MASK_PACKED_IDS" in env) is not support_bitmaps
+    assert "--tinker-sampling-support-replay" in requests[0]["train_args"]

@@ -9,7 +9,7 @@ import torch
 
 from miles.tinker.core.types import UserInputError
 from miles.tinker.expert_load import expert_counts
-from miles.tinker.runtime import MilesBackend, _batches, _build_train_data
+from miles.tinker.runtime import MilesBackend, _batches, _build_train_data, engines_return_unbounded_supports
 from miles.tinker.sampler_records import SamplerRecordStore, SequenceRecord, parse_supports, prefix_hashes
 
 NUM_LAYERS, TOPK = 2, 3
@@ -72,9 +72,13 @@ def engine(monkeypatch) -> FakeEngine:
     return fake
 
 
-def _backend(*, supports: bool = True, routes: bool = True, max_bytes: int = 2**30) -> MilesBackend:
+def _backend(
+    *, supports: bool = True, routes: bool = True, max_bytes: int = 2**30, unbounded_supports: bool = False
+) -> MilesBackend:
     store = SamplerRecordStore(max_bytes, supports=supports, routes=routes)
-    return MilesBackend(None, "http://router", num_layers=NUM_LAYERS, sampler_records=store)
+    return MilesBackend(
+        None, "http://router", num_layers=NUM_LAYERS, sampler_records=store, unbounded_supports=unbounded_supports
+    )
 
 
 def _payload(prompt: list[int], num_samples: int = 1, **params) -> dict:
@@ -273,6 +277,44 @@ class TestSupports:
     def test_top_p_without_a_top_k_bound_is_a_user_error(self):
         with pytest.raises(UserInputError, match="top_k bound"):
             _backend(routes=False)._generate_request(_payload(PROMPT, top_k=-1), lora_name="m@1")
+
+    @pytest.mark.parametrize(
+        "params, requested",
+        [
+            ({"top_p": 0.97, "top_k": -1}, True),
+            ({"top_p": 0.97, "top_k": 1024}, True),
+            ({"top_p": 1.0, "top_k": -1}, False),
+            ({"temperature": 0.0, "top_k": -1}, False),
+        ],
+    )
+    def test_bitmap_engines_take_top_p_without_a_top_k_bound(self, params, requested):
+        backend = _backend(routes=False, unbounded_supports=True)
+        request = backend._generate_request(_payload(PROMPT, **params), lora_name="m@1")
+        assert request.get("return_sampling_mask", False) is requested
+        assert request["sampling_params"]["top_k"] == params.get("top_k", -1)
+
+    @pytest.mark.parametrize(
+        "patched, packed_ids, unbounded",
+        [(True, None, True), (True, "0", True), (True, "1", False), (True, "TRUE", False), (False, None, False)],
+    )
+    def test_the_gateway_detects_bitmap_engines(self, monkeypatch, patched, packed_ids, unbounded):
+        import importlib.util
+
+        find_spec = importlib.util.find_spec
+        monkeypatch.setattr(
+            importlib.util,
+            "find_spec",
+            lambda name, *args: (
+                (object() if patched else None)
+                if name == "sglang.srt.sampling.support_bitmap"
+                else find_spec(name, *args)
+            ),
+        )
+        if packed_ids is None:
+            monkeypatch.delenv("SGLANG_SAMPLING_MASK_PACKED_IDS", raising=False)
+        else:
+            monkeypatch.setenv("SGLANG_SAMPLING_MASK_PACKED_IDS", packed_ids)
+        assert engines_return_unbounded_supports() is unbounded
 
     async def test_a_response_without_requested_supports_fails_the_sample(self, monkeypatch):
         async def no_supports(url, request):
