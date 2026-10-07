@@ -18,6 +18,9 @@ RUN cd /sgl-workspace/sglang && \
 COPY docker/compat/patch_sglang_mimo_v2_lora.py /tmp/patch_sglang_mimo_v2_lora.py
 RUN python3 /tmp/patch_sglang_mimo_v2_lora.py
 
+COPY docker/compat/patch_sglang_dflash_fused_value_scale.py /tmp/patch_sglang_dflash_fused_value_scale.py
+RUN python3 /tmp/patch_sglang_dflash_fused_value_scale.py
+
 COPY miles /root/miles/miles
 COPY miles_plugins /root/miles/miles_plugins
 COPY examples/multi_lora /root/miles/examples/multi_lora
