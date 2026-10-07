@@ -11,16 +11,19 @@ Runs against one SGLang ``/generate`` endpoint with DFLASH speculative decoding 
    each support spans the vocabulary, wider than the packed path's 4096-id cap.
 2. A sweep of ``--sweep-requests`` requests over cases (a), (b), (d) and, with bitmaps, (f) and
    (g), counting INVALID and OVERFLOW aborts.
-3. ``--throughput-requests`` requests of case (a) at ``--concurrency`` with ``ignore_eos``, masks off
+3. ``--throughput-requests`` requests of ``--throughput-case`` at ``--concurrency`` with ``ignore_eos``, masks off
    and then on: decode tok/s, and the DFLASH accept length from each response's ``spec_verify_ct``.
 
 Token checks: mask count == output_token_logprobs count == completion tokens; every token is in
 its mask; masks have no duplicates and at most top_k ids, except support-mode masks whose ids from
 rank top_k on tie the top_k-th log-prob (the samplers keep cutoff ties); support-mode rows sum to one within
 ``--tolerance``; selected-mode values are at least the full-vocabulary log-probability; greedy rows
-are singletons with log-probability 0. With bitmaps, mask ids are ascending and case (h) masks
-exceed 4096 ids. Exits non-zero if any check fails or the accept lengths with and without masks
-differ by more than ``--accept-z`` standard errors.
+are singletons with log-probability 0, or n ids tied at the top with log-probability -log(n): a DFlash
+batch that also holds an unbounded top_k builds a dense target whose top_k renormalization keeps cutoff
+ties. With bitmaps, mask ids are ascending and the widest case (h) mask exceeds 4096 ids; a near-certain
+token's mask is narrower, as the other tokens' float32 probabilities underflow to zero. Exits non-zero if
+any check fails or the accept lengths with and without masks differ by more than ``--accept-z``
+standard errors.
 """
 
 from __future__ import annotations
@@ -81,7 +84,6 @@ def cases(args, stop_token: int) -> dict[str, dict]:
                 "params": {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "max_new_tokens": 4},
                 "mode": "selected",
                 "top_k": None,
-                "min_mask": PACKED_CAP + 1,
             },
         }
     return {name: case | {"ascending": not args.packed_ids} for name, case in probe_cases.items()}
@@ -96,9 +98,12 @@ def abort_kind(message: str) -> str:
     return next((kind for kind, text in ABORT_KINDS if text in message), "OTHER")
 
 
-def _tied_at_top_k(value, case: dict) -> bool:
-    """A support row past top_k is a cutoff tie: every id ranked at or beyond top_k shares the top_k-th log-prob."""
-    if case["mode"] != "support" or len(value) <= case["top_k"]:
+def _tied_at_top_k(mask: list[int], value, case: dict) -> bool:
+    """A mask past top_k is a cutoff tie: every id ranked at or beyond top_k shares the top_k-th log-prob.
+    Selected mode shows this only for top_k 1, where n tied ids each have log-prob -log(n)."""
+    if case["mode"] == "selected":
+        return case["top_k"] == 1 and abs(float(value) + math.log(len(mask))) <= TIE_TOLERANCE
+    if len(value) <= case["top_k"]:
         return False
     ranked = sorted((float(entry) for entry in value), reverse=True)
     cutoff = ranked[case["top_k"] - 1]
@@ -124,12 +129,10 @@ def check_response(meta: dict, case: dict, tolerance: float) -> list[str]:
             failures.append(f"{where} is not in its mask of {len(mask)}")
             continue
         past_top_k = case["top_k"] is not None and len(mask) > case["top_k"]
-        if len(set(mask)) != len(mask) or (past_top_k and not _tied_at_top_k(value, case)):
+        if len(set(mask)) != len(mask) or (past_top_k and not _tied_at_top_k(mask, value, case)):
             failures.append(f"{where}: mask of {len(mask)} ids, {len(set(mask))} distinct, top_k {case['top_k']}")
         if case["ascending"] and mask != sorted(mask):
             failures.append(f"{where}: mask ids are not ascending, as bitmaps unpack them")
-        if len(mask) < case.get("min_mask", 0):
-            failures.append(f"{where}: mask of {len(mask)} ids, expected at least {case['min_mask']}")
         if case["mode"] == "support":
             if len(value) != len(mask) or abs(_logsumexp([float(entry) for entry in value])) > tolerance:
                 failures.append(f"{where}: support log-probs do not sum to one over the mask")
@@ -138,7 +141,7 @@ def check_response(meta: dict, case: dict, tolerance: float) -> list[str]:
         else:
             selected = float(value)
         if case.get("greedy"):
-            if mask != [token] or selected != 0.0:
+            if (mask != [token] or selected != 0.0) and not _tied_at_top_k(mask, value, case):
                 failures.append(f"{where}: greedy mask {mask[:4]} with log-prob {selected}")
         elif not math.isfinite(selected) or selected > 1e-6 or selected < float(full) - 1e-4:
             failures.append(f"{where}: renormalized log-prob {selected} vs full-vocabulary {full}")
@@ -270,7 +273,7 @@ async def run(args) -> dict:
         sweep_cases = [name for name in sweep_names if name in probe_cases]
         sweep = [sweep_cases[index % len(sweep_cases)] for index in range(args.sweep_requests)]
         report["sweep"] = await run_cases(client, args, prompts, [(name, probe_cases[name]) for name in sweep])
-        throughput_case = probe_cases["a_support"]
+        throughput_case = probe_cases[args.throughput_case]
         await run_throughput(client, args, prompts, throughput_case, masks=False, requests=args.concurrency)  # warm up
         off = await run_throughput(
             client, args, prompts, throughput_case, masks=False, requests=args.throughput_requests
@@ -279,6 +282,7 @@ async def run(args) -> dict:
             client, args, prompts, throughput_case, masks=True, requests=args.throughput_requests
         )
     report["throughput"] = {
+        "case": args.throughput_case,
         "off": {key: value for key, value in off.items() if key != "per_request_accept_lengths"},
         "on": {key: value for key, value in on.items() if key != "per_request_accept_lengths"},
         "masks_on_over_off": on["decode_tokens_per_second"] / off["decode_tokens_per_second"],
@@ -293,6 +297,9 @@ def failures_of(report: dict, args) -> list[str]:
         failures.append(f"engine runs {report['speculative_algorithm']}, not DFLASH")
     for phase in ("cases", "sweep"):
         failures += [f"{phase}: {failure}" for failure in report[phase]["failures"]]
+    widest = report["cases"]["widest_mask"].get("h_full_vocab")
+    if widest is not None and widest <= PACKED_CAP:
+        failures.append(f"the widest case (h) mask holds {widest} ids, not more than {PACKED_CAP}")
     if report["cases"]["stopped_on_stop_token"] == 0:
         failures.append(f"no case (e) request stopped on {args.stop_text!r}; pick a more frequent --stop-text")
     z = report["throughput"]["accept_length"]["z"]
@@ -312,6 +319,9 @@ def main() -> None:
     parser.add_argument("--case-requests", type=int, default=16)
     parser.add_argument("--sweep-requests", type=int, default=1024)
     parser.add_argument("--throughput-requests", type=int, default=128)
+    parser.add_argument(
+        "--throughput-case", default="a_support", help="case whose decode speed is measured with masks off and on"
+    )
     parser.add_argument("--concurrency", type=int, default=64)
     parser.add_argument("--tolerance", type=float, default=1e-5)
     parser.add_argument("--accept-z", type=float, default=3.0)

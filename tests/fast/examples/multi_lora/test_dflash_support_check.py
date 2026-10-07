@@ -83,6 +83,7 @@ def run_probe(monkeypatch, breakage=None, packed_ids=False) -> tuple[dict, list[
         case_requests=4,
         sweep_requests=12,
         throughput_requests=8,
+        throughput_case="a_support",
         concurrency=4,
         tolerance=1e-5,
         accept_z=3.0,
@@ -117,7 +118,7 @@ def test_packed_ids_skip_bitmap_only_checks(monkeypatch):
         ("overflow", "aborted: Sampling support exceeds"),
         ("slower_accept", "accept length with masks differs"),
         ("descending", "not ascending"),
-        ("capped", "expected at least 4097"),
+        ("capped", "widest case (h) mask holds 4096 ids"),
     ],
 )
 def test_each_broken_contract_fails(monkeypatch, breakage, expected):
@@ -165,3 +166,25 @@ def test_masks_past_top_k_pass_only_for_cutoff_ties(probabilities, passes):
     assert probe.check_response(selected, selected_case, 1e-5), "selected mode has no tie evidence"
     short_row = meta | {"output_token_sampling_logprobs": [[math.log(0.4), math.log(0.6)]]}
     assert probe.check_response(short_row, case, 1e-5), "a row shorter than its mask is reported, not raised"
+
+
+@pytest.mark.parametrize(
+    "mask, value, passes",
+    [
+        ([7], 0.0, True),
+        ([7, 9], math.log(0.5), True),  # two ids tied at the top of a dense DFlash target
+        ([5, 7, 9], math.log(1 / 3), True),
+        ([7, 9], math.log(0.6), False),
+        ([7, 9], 0.0, False),
+    ],
+)
+def test_greedy_masks_hold_only_the_token_or_a_top_tie(mask, value, passes):
+    case = {"mode": "selected", "top_k": 1, "greedy": True, "ascending": True}
+    meta = {
+        "output_token_logprobs": [(-0.5, 7, None)],
+        "completion_tokens": 1,
+        "finish_reason": {"type": "length"},
+        "output_token_sampling_mask": [mask],
+        "output_token_sampling_logprobs": [value],
+    }
+    assert (probe.check_response(meta, case, 1e-5) == []) is passes
