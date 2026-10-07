@@ -124,9 +124,9 @@ def main(argv: list[str] | None = None) -> None:
         with running_servers(argvs, ports=ports, log_dir=log_dir) as urls:
             metrics = asyncio.run(_gather(*(replay(url, rollouts, args) for url in urls)))
         for ((name, _), block_size, precision), metric, dtype_path in zip(wave, metrics, dtype_paths, strict=True):
-            dtypes = json.loads(dtype_path.read_text()) if dtype_path.exists() else None
+            probe = json.loads(dtype_path.read_text()) if dtype_path.exists() else {}
             results.append({"drafter": name, "block_size": block_size, "draft_precision": precision} | metric)
-            results[-1]["draft_param_numel_by_dtype"] = dtypes
+            results[-1]["draft_param_numel_by_dtype"] = probe.get("numel_by_dtype")
             print(json.dumps(results[-1]), flush=True)
         (args.out / "bench.json").write_text(json.dumps(results, indent=2) + "\n")
 

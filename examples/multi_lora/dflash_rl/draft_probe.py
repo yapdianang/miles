@@ -2,7 +2,8 @@
 
 The hook manager calls the factory for each model runner after loading and CUDA-graph capture. On TP rank 0 it
 finds the draft model (quantized by then under --speculative-draft-model-quantization) and writes the parameter
-count per dtype to ``config["path"]``. It registers no hook.
+count per dtype and each weight-bearing module's weight dtype and quant method to ``config["path"]``. It registers
+no hook.
 """
 
 import gc
@@ -22,5 +23,10 @@ def record_draft_dtypes(config: dict) -> None:
             numel = Counter()
             for parameter in obj.parameters():
                 numel[str(parameter.dtype)] += parameter.numel()
-            Path(config["path"]).write_text(json.dumps(numel))
+            modules = {
+                name: [str(module.weight.dtype), type(getattr(module, "quant_method", None)).__name__]
+                for name, module in obj.named_modules()
+                if isinstance(getattr(module, "weight", None), torch.Tensor)
+            }
+            Path(config["path"]).write_text(json.dumps({"numel_by_dtype": numel, "modules": modules}))
     return None

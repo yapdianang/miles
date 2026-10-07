@@ -481,5 +481,7 @@ def test_draft_probe_counts_the_draft_parameters_per_dtype(tmp_path: Path) -> No
     model = DFlashDraftModel()
     path = tmp_path / "dtypes.json"
     assert draft_probe.record_draft_dtypes({"path": str(path)}) is None
-    assert json.loads(path.read_text()) == {"torch.float32": 8, "torch.float8_e4m3fn": 3}
+    probe = json.loads(path.read_text())
+    assert probe["numel_by_dtype"] == {"torch.float32": 8, "torch.float8_e4m3fn": 3}
+    assert probe["modules"] == {"": ["torch.float8_e4m3fn", "NoneType"], "fc": ["torch.float32", "NoneType"]}
     del model
