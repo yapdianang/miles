@@ -64,8 +64,10 @@ def _build_model(args):
     provider.bias_activation_fusion = True
     provider.variable_seq_lengths = True
     provider.moe_enable_routing_replay = True
-    if args.recompute:
+    if args.recompute == "full":
         provider.recompute_granularity, provider.recompute_method, provider.recompute_num_layers = "full", "uniform", 1
+    elif args.recompute == "selective":
+        provider.recompute_granularity = "selective"
     provider.finalize()
     provider.initialize_model_parallel(seed=1234)
     [model] = provider.provide_distributed_model(wrap_with_ddp=False, bf16=True)
@@ -347,7 +349,9 @@ def main():
     run_parser.add_argument("--tokens-file", help="JSON list of token-id lists, used instead of --seq-lens")
     run_parser.add_argument("--seed", type=int, default=0)
     run_parser.add_argument("--replay-routes", help="a CP=1 run directory whose routes to replay")
-    run_parser.add_argument("--recompute", action="store_true", help="full activation recompute, as training")
+    run_parser.add_argument(
+        "--recompute", nargs="?", const="full", choices=("full", "selective"), help="activation recompute, as training"
+    )
     run_parser.add_argument("--log-prob-chunk", type=int, default=4096, help="the launcher's --log-probs-chunk-size")
     run_parser.add_argument("--no-save", action="store_true", help="report timing and memory only")
     run_parser.add_argument("--out", required=True)
