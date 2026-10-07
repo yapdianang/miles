@@ -569,7 +569,7 @@ index 8122187d51..616bb7a1cf 100644
              status=SamplingMaskStatus.INVALID
 diff --git a/test/registered/unit/sampling/test_support_bitmap.py b/test/registered/unit/sampling/test_support_bitmap.py
 new file mode 100644
-index 0000000000..6d8492518b
+index 0000000000..83842aa2aa
 --- /dev/null
 +++ b/test/registered/unit/sampling/test_support_bitmap.py
 @@ -0,0 +1,548 @@
@@ -1084,17 +1084,17 @@ index 0000000000..6d8492518b
 +            bitmap_vocab_size=vocab_size,
 +        )
 +        out_tokens = tokens[:, None].repeat(1, draft)
++        # Copies from host lists synchronize, so the inputs are on the device first.
++        support_rows = torch.tensor([1, 3, 7], device="cuda")
++        commit_lens = torch.tensor([3, 3, 3, 3, 3, 3, 3, 1], device="cuda")
 +        torch.cuda.synchronize()
 +        torch.cuda.set_sync_debug_mode("error")
 +        try:
 +            plain = _sampler(True, OLD_CAP)._build_sampling_mask_output(
-+                tokens,
-+                capture,
-+                support_capture_indices=torch.tensor([1, 3, 7], device="cuda"),
++                tokens, capture, support_capture_indices=support_rows
 +            )
 +            spec = spec_capture.build_output(
-+                out_tokens=out_tokens,
-+                commit_lens=torch.tensor([3, 3, 3, 3, 3, 3, 3, 1], device="cuda"),
++                out_tokens=out_tokens, commit_lens=commit_lens
 +            )
 +        finally:
 +            torch.cuda.set_sync_debug_mode(0)
