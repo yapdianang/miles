@@ -10,6 +10,8 @@ without re-quantizing base weights.
 
 One node: 4 trainer GPUs (EP4) and one TP4/EP4 engine. Two nodes: 8 trainer GPUs (EP8) and two
 engines; start the Ray cluster first and set ``MILES_SCRIPT_EXTERNAL_RAY=1`` on its head.
+``--cp`` splits each datum over CP ranks (section 6.4), so a datum may hold ``max_tokens_per_gpu * cp``
+tokens; the trainer GPUs must be a multiple of ``tp * cp``.
 
 ``prepare`` builds whichever of the two checkpoints is missing (a conversion is finished once its
 model.safetensors.index.json exists). It downloads the official checkpoint at ``--base-model-revision``
@@ -24,6 +26,8 @@ where <snapshot> is <hf hub cache>/models--XiaomiMiMo--MiMo-V2.6-Flash-RL/snapsh
 
 python examples/multi_lora/serve_mimo_v26_flash_tinker.py prepare
 python examples/multi_lora/serve_mimo_v26_flash_tinker.py serve --hf-checkpoint <bf16 linears> --ref-load <bf16>
+python examples/multi_lora/serve_mimo_v26_flash_tinker.py serve --hf-checkpoint <bf16 linears> --ref-load <bf16> \
+    --actor-num-nodes 2 --rollout-num-gpus 8 --tp 1 --cp 8 --context-length 1048576 --max-tokens-per-gpu 131072
 
 tools/mimo_dev.py runs this service on a dev pod and tools/mimo_gates.py measures it; see the README.
 """
@@ -61,6 +65,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     actor_num_gpus_per_node: int = 4
     rollout_num_gpus: int = 4
     tp: int = 4
+    # Context-parallel ranks per datum.
+    cp: int = 1
 
     lora_rank: int = 32
     lora_alpha: int = 32
@@ -100,6 +106,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
             raise ValueError("trainer TP must not exceed the 4 global-attention KV heads")
         if self.recompute not in ("full", "selective", "none"):
             raise ValueError(f"recompute must be full, selective or none, not {self.recompute}")
+        if (self.actor_num_nodes * self.actor_num_gpus_per_node) % (self.tp * self.cp):
+            raise ValueError("trainer GPUs must be a multiple of tp * cp")
         if self.target_modules != "attn":
             raise ValueError("MXFP4 engine experts cannot take LoRA; train attention adapters only")
 
@@ -149,7 +157,7 @@ def _serve(args: ScriptArgs) -> None:
     )
     parallel_args = (
         f"--tensor-model-parallel-size {args.tp} {'--sequence-parallel ' if args.tp > 1 else ''}"
-        "--pipeline-model-parallel-size 1 --context-parallel-size 1 "
+        f"--pipeline-model-parallel-size 1 --context-parallel-size {args.cp} "
         f"--expert-model-parallel-size {trainer_gpus} --expert-tensor-parallel-size 1 "
     )
     if args.recompute == "full":
