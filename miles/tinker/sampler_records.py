@@ -132,8 +132,9 @@ class SamplerRecordStore:
         self.routes = routes
         self.collect = collect
         self.num_bytes = 0
-        # collection outcomes: records filled, records the engine no longer held, datums whose routes were recomputed
-        self.num_collected = self.num_missing = self.num_recomputed = 0
+        # collection outcomes: records filled, records the engine no longer held, datums whose routes were recomputed,
+        # and rids two engines returned
+        self.num_collected = self.num_missing = self.num_recomputed = self.num_duplicates = 0
         self._lru: OrderedDict[SequenceRecord, None] = OrderedDict()
         self._by_sequence: dict[str, SequenceRecord] = {}
         self._by_prompt = _KeyIndex()

@@ -291,12 +291,18 @@ class MilesBackend:
             logger.info(
                 f"rollout records: collected {len(pending) - missing}/{len(pending)}, routes recomputed for "
                 f"{recomputed}/{len(datums)} datums (run totals: {records.num_collected} collected, "
-                f"{records.num_missing} missing, {records.num_recomputed} recomputed)"
+                f"{records.num_missing} missing, {records.num_recomputed} recomputed, "
+                f"{records.num_duplicates} held by two engines)"
             )
 
     async def _collect_from_engines(self, rids: list[str], row_counts: list[int]) -> dict[str, dict]:
-        """Every engine returns and drops what it kept for these rids, a bounded number of rows per call."""
+        """Every engine returns and drops what it kept for these rids, a bounded number of rows per call.
+
+        A sample that failed over from its pinned engine can leave a record of the same rid on two engines;
+        the one with the expected rows wins.
+        """
         urls = await self.engine_urls() if rids else []
+        expected_rows = dict(zip(rids, row_counts, strict=True))
         kept = {}
         for batch in _batches(rids, row_counts, _COLLECT_ROWS_PER_CALL):
             responses = await asyncio.gather(
@@ -306,8 +312,13 @@ class MilesBackend:
             for url, response in zip(urls, responses, strict=True):
                 if isinstance(response, BaseException):
                     logger.warning(f"rollout records: collecting {len(batch)} records from {url} failed: {response!r}")
-                else:
-                    kept.update(response["records"])
+                    continue
+                for rid, record in response["records"].items():
+                    if rid in kept:
+                        self.sampler_records.num_duplicates += 1
+                        if _kept_rows(kept[rid]) == expected_rows[rid]:
+                            continue
+                    kept[rid] = record
         return kept
 
     def _decode_kept(self, kept: dict | None, record: SequenceRecord) -> tuple[np.ndarray | None, tuple | None]:
@@ -594,7 +605,18 @@ def _b64_array(encoded: str, dtype) -> np.ndarray:
 
 def _row_counts(records: list[SequenceRecord]) -> list[int]:
     """Route rows plus support rows the engine keeps for each record."""
-    return [record.covered_len - record.routes_start + len(record.tokens) for record in records]
+    return [
+        (record.covered_len - record.routes_start if record.pending_routes else 0)
+        + (len(record.tokens) if record.pending_supports else 0)
+        for record in records
+    ]
+
+
+def _kept_rows(kept: dict) -> int:
+    """Route rows plus support rows of a record an engine returned, counted as ``_row_counts`` counts them."""
+    routes = kept["routes_shape"][0] if kept["routes_shape"] is not None else 0
+    supports = len(_b64_array(kept["support_lengths"], np.int32)) if kept["support_lengths"] is not None else 0
+    return routes + supports
 
 
 def _batches(items: list, sizes: list[int], max_size: int) -> list[list]:

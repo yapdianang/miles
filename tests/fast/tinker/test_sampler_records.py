@@ -528,6 +528,35 @@ class TestCollection:
         assert _rows(ids.numpy(), offsets.numpy()) == [[], [], *TURN_1_SUPPORTS]
         assert [engine.collected for engine in engines.values()] == [[["first"]], [["first"]]]
 
+    @pytest.mark.parametrize("stale_engine", ["http://a", "http://b"])
+    async def test_a_rid_two_engines_hold_resolves_to_the_record_with_the_sampled_rows(
+        self, monkeypatch, stale_engine
+    ):
+        """A sample that failed over from its pinned engine can leave a partial record of its rid behind."""
+        engines = {"http://a": KeepingEngine(), "http://b": KeepingEngine()}
+        fresh_engine = next(url for url in engines if url != stale_engine)
+
+        async def post(url, request, max_retries=60):
+            engine = engines[fresh_engine] if url == "http://router/generate" else engines[url.rsplit("/", 1)[0]]
+            return await engine.post(url, request)
+
+        async def engine_urls() -> list[str]:
+            return list(engines)
+
+        monkeypatch.setattr("miles.tinker.runtime.post", post)
+        backend = _collecting_backend()
+        backend.engine_urls = engine_urls
+        engines[fresh_engine].outputs.append((TURN_1, TURN_1_SUPPORTS))
+        await backend.sample(_payload(PROMPT), "m@1", sequence_ids=["first"])
+        stale = dict(engines[fresh_engine].kept["first"])
+        stale["support_lengths"] = _b64(np.array([1], dtype=np.int32))  # the failed attempt stopped after one token
+        engines[stale_engine].kept["first"] = stale
+
+        train_data = await _train_data(backend, [_datum(PROMPT + TURN_1)])
+        ids, offsets = train_data["rollout_sampling_mask_ids"][0], train_data["rollout_sampling_mask_offsets"][0]
+        assert _rows(ids.numpy(), offsets.numpy()) == [[], [], *TURN_1_SUPPORTS]
+        assert backend.sampler_records.num_duplicates == 1
+
     async def test_forward_backward_trains_and_measures_expert_load_on_collected_routes(self, keeping_engine):
         backend = _collecting_backend()
         backend.moe_layers, backend.num_experts = [0, 1], 64
