@@ -21,6 +21,13 @@ COPY docker/compat/sglang_rollout_records.patch /tmp/sglang_rollout_records.patc
 RUN cd /sgl-workspace/sglang && \
     (git apply --reverse --check /tmp/sglang_rollout_records.patch 2>/dev/null || git apply /tmp/sglang_rollout_records.patch)
 
+# Sampling supports as full-vocabulary bitmaps (MiMo-V2.6 report, section 6.4): no top_k bound or
+# --sampling-mask-max-tokens cap on a support. Applies on top of the rollout-records patch.
+# SGLANG_SAMPLING_MASK_PACKED_IDS=1 restores packed ids.
+COPY docker/compat/sglang_support_bitmap.patch /tmp/sglang_support_bitmap.patch
+RUN cd /sgl-workspace/sglang && \
+    (git apply --reverse --check /tmp/sglang_support_bitmap.patch 2>/dev/null || git apply /tmp/sglang_support_bitmap.patch)
+
 COPY docker/compat/patch_sglang_mimo_v2_lora.py /tmp/patch_sglang_mimo_v2_lora.py
 RUN python3 /tmp/patch_sglang_mimo_v2_lora.py
 

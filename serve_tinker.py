@@ -16,7 +16,7 @@ from miles.tinker.arguments import add_tinker_arguments, configure_tinker_args
 from miles.tinker.core.service import TinkerService
 from miles.tinker.core.types import GatewayConfig
 from miles.tinker.expert_load import moe_layers
-from miles.tinker.runtime import MilesBackend, RoutedExpertsCache
+from miles.tinker.runtime import MilesBackend, RoutedExpertsCache, engines_return_unbounded_supports
 from miles.tinker.sampler_records import SamplerRecordStore
 from miles.tinker.server.app import build_app
 from miles.utils.arguments import parse_args
@@ -104,6 +104,7 @@ async def serve(args, *, disposer: Disposer):
         moe_layers=moe_layers(args.moe_layer_freq, args.num_layers) if args.num_experts else None,
         num_experts=args.num_experts,
         engine_urls=functools.partial(get_worker_urls, args),
+        unbounded_supports=engines_return_unbounded_supports(),
     )
     service = TinkerService(backend, config)
 

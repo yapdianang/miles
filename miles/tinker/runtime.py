@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import importlib.util
 import logging
 import os
 import tempfile
@@ -180,6 +181,7 @@ class MilesBackend:
         moe_layers: list[int] | None = None,
         num_experts: int | None = None,
         engine_urls: Callable[[], Awaitable[list[str]]] | None = None,
+        unbounded_supports: bool = False,
     ) -> None:
         self.trainer = trainer
         self.router_url = router_url
@@ -192,6 +194,8 @@ class MilesBackend:
         self.num_experts = num_experts
         # with sampler_records.collect: the engines /collect_rollout_records reads from
         self.engine_urls = engine_urls
+        # the engines return supports of any size, so top_p sampling needs no top_k bound
+        self.unbounded_supports = unbounded_supports
         # adapter backfill paths, for recomputing the routes of a sample whose records the engine lost
         self._lora_paths: dict[str, str] = {}
 
@@ -500,7 +504,7 @@ class MilesBackend:
         records = self.sampler_records
         if self.routed_experts is not None or (records is not None and records.routes):
             request["return_routed_experts"] = True
-        if records is not None and records.supports and _draws_from_support(sampling_params):
+        if records is not None and records.supports and _draws_from_support(sampling_params, self.unbounded_supports):
             request["return_sampling_mask"] = True
             request["sampling_logprobs_mode"] = "support"
         if payload["prompt_logprobs"] or payload["topk_prompt_logprobs"]:
@@ -515,18 +519,27 @@ class MilesBackend:
         return request
 
 
-def _draws_from_support(sampling_params: dict) -> bool:
+def engines_return_unbounded_supports() -> bool:
+    """Whether the engines return each sampling support as a full-vocabulary bitmap
+    (docker/compat/sglang_support_bitmap.patch); SGLANG_SAMPLING_MASK_PACKED_IDS=1 selects packed ids, which
+    need a top_k bound."""
+    if importlib.util.find_spec("sglang.srt.sampling.support_bitmap") is None:
+        return False
+    return os.environ.get("SGLANG_SAMPLING_MASK_PACKED_IDS", "false").lower() not in ("1", "true")
+
+
+def _draws_from_support(sampling_params: dict, unbounded_supports: bool) -> bool:
     """Whether the engine samples from a top-k/top-p support narrower than the vocabulary."""
     top_k = sampling_params["top_k"]
     if sampling_params["temperature"] <= 0 or top_k == 1:
         return False
     if top_k > 1:
         return True
-    if sampling_params["top_p"] < 1:
+    if sampling_params["top_p"] < 1 and not unbounded_supports:
         raise UserInputError(
             "top_p below 1 needs a top_k bound: the engine returns sampling supports only under a finite top_k"
         )
-    return False
+    return sampling_params["top_p"] < 1
 
 
 def _selected_logprobs(values: list[float], tokens: list[int]) -> list[float]:
