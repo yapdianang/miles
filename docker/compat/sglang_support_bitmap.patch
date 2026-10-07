@@ -145,7 +145,7 @@ index e77b853de0..b637345ed0 100644
          if token_ids is None:
              packed_weights, packed_positions = torch.topk(
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index d119988274..8ce590e2d3 100644
+index 6658a2c81f..451d9fb0bd 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -326,6 +326,7 @@ from sglang.srt.platforms import current_platform
@@ -156,7 +156,7 @@ index d119988274..8ce590e2d3 100644
  from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
  from sglang.srt.session.session_controller import SessionController
  from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-@@ -2976,7 +2977,12 @@ class Scheduler(
+@@ -2975,7 +2976,12 @@ class Scheduler(
                  return
              top_k = req.sampling_params.top_k
              sampling_mask_cap = self.server_args.sampling_mask_max_tokens
