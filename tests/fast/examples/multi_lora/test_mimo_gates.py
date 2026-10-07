@@ -100,7 +100,7 @@ class FakeTraining:
             }
             for datum in datums
         ]
-        return _Future(SimpleNamespace(loss_fn_outputs=outputs))
+        return _Future(SimpleNamespace(loss_fn_outputs=outputs, metrics={"expert_load/cv/layer_mean:mean": 0.3}))
 
     forward_backward = forward
 
@@ -160,6 +160,12 @@ def test_workload_selection():
         ("32-64K", 40_000),
     ]
     assert [len(prompt) for prompt in gates.longest_contexts(workload, 2)] == [40_000, 7_000]
+
+
+def test_long_context_is_cut_from_the_longest_prompts_and_repeats_them_when_short():
+    workload = _workload([[10, 30], [20]])
+    assert gates.long_context(workload, 40) == [1] * 40
+    assert len(gates.long_context(workload, 125)) == 125
 
 
 def test_replay_copies_get_distinct_prefixes_and_a_seeded_order():
@@ -242,6 +248,11 @@ def test_length_and_long_train_gates_run(monkeypatch, capsys, tmp_path):
     summary, line, _ = run_gate(monkeypatch, capsys, ["long-train", *workload, "--contexts", "1"], FakeGateway())
     assert summary["datum_lengths"] == [20_000 + 3 - 1]
     assert set(summary["seconds"]) == {"sample", "forward", "forward_backward"}
+    assert summary["forward_backward_metrics"] == {"expert_load/cv/layer_mean:mean": 0.3}
+    summary, _, _ = run_gate(
+        monkeypatch, capsys, ["long-train", *workload, "--context-tokens", "50000"], FakeGateway()
+    )
+    assert summary["datum_lengths"] == [50_000 + 3 - 1]
 
 
 def test_replay_reads_engine_stats_only_from_its_own_log_lines(monkeypatch, capsys, tmp_path):

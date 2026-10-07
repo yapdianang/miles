@@ -152,6 +152,12 @@ trainer − sampler log-prob of a sampled token, and k3 = mean(exp(d) − d − 
 | `replay --workload W [--copies N --concurrency C --env-delay S --engine-log L]` | trajectories/min, generated tok/s and turn latency; with `--engine-log`, the engine's prefix-cache hit rate during the replay | none |
 | `engine-stats [LOG ...]` | prefix-cache hit rate, decode tok/s, queue and DFlash accept length from SGLang batch log lines | none |
 
+`tools/mimo_final_gate.py mimo-dev --workload /root/replay.json` is the gate before a live run. It
+restarts the service per phase and checks kl-decompose, parity without top_k, the DFlash probe,
+`bench_rollout_records.py --check`, long-train on a 250K-token datum, replay at concurrency 64,
+`/api/v1/engine_load` and `run_dora_parity_check.py` under Muown against the bars in its docstring. It then writes one JSON
+summary and exits 1 if any check fails.
+
 A replay workload is a JSON (or `.json.gz`) list of trajectories; each trajectory is a list of
 turns `{"prompt": [token ids], "output_len": n}`. The service log is `/tmp/mimo-dev/service.log`
 in the pod. To compare launcher arms, run `restart` with each arm's serve args and then the gates.

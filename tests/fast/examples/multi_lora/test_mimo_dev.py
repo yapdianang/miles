@@ -111,12 +111,13 @@ def test_remote_commands_run_this_checkouts_tools_in_the_pod(monkeypatch):
         ["restart", "mimo-dev", "--hf-checkpoint", "/ckpt"],
         ["gate", "mimo-dev", "replay", "--workload", "/root/replay.json.gz"],
         ["gate", "mimo-dev", "engine-stats", "/tmp/mimo-dev/service.log"],
+        ["run", "mimo-dev", gates.__file__, "--help"],
     ):
         with pytest.raises(SystemExit):
             dev.main(argv)
 
     exec_prefix = ["kubectl", "exec", "-i", "mimo-dev", "--", "python3", "-"]
-    (restart, restart_script), (replay, replay_script), (stats, _) = calls
+    (restart, restart_script), (replay, replay_script), (stats, _), (run, run_script) = calls
     assert restart[:7] == exec_prefix and restart_script.endswith("mimo_dev.py")
     in_pod = dev.build_parser().parse_args(restart[7:])
     assert in_pod.launcher_argv == ["serve", *dev.SERVE_ARGS, "--hf-checkpoint", "/ckpt"]
@@ -124,6 +125,7 @@ def test_remote_commands_run_this_checkouts_tools_in_the_pod(monkeypatch):
     assert replay_script.endswith("mimo_gates.py")
     assert gates.build_parser().parse_args(replay[7:]).workload.name == "replay.json.gz"
     assert stats[7:] == ["engine-stats", "/tmp/mimo-dev/service.log"]
+    assert run == [*exec_prefix, "--help"] and run_script == gates.__file__
 
 
 def test_sync_archive_holds_the_listed_files_that_exist(tmp_path):

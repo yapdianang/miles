@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gzip
+import itertools
 import json
 import math
 import random
@@ -109,6 +110,15 @@ def length_buckets(workload: list[list[dict]], per_bucket: int) -> list[tuple[st
 def longest_contexts(workload: list[list[dict]], count: int) -> list[list[int]]:
     """The last-turn prompts of the `count` longest trajectories."""
     return sorted((trajectory[-1]["prompt"] for trajectory in workload), key=len, reverse=True)[:count]
+
+
+def long_context(workload: list[list[dict]], tokens: int) -> list[int]:
+    """The last-turn prompts, longest first and repeated as needed, concatenated and cut to `tokens` tokens."""
+    context = []
+    for prompt in itertools.cycle(longest_contexts(workload, len(workload))):
+        context += prompt
+        if len(context) >= tokens:
+            return context[:tokens]
 
 
 def replay_jobs(workload: list[list[dict]], copies: int, rng: random.Random) -> list[tuple[list[int], list[dict]]]:
@@ -315,16 +325,26 @@ def run_parity_by_length(args) -> tuple[dict, str]:
 
 def run_long_train(args) -> tuple[dict, str]:
     """Samples after the longest contexts, then runs forward and forward_backward on those datums."""
-    contexts = longest_contexts(load_workload(args.workload), args.contexts)
+    workload = load_workload(args.workload)
+    if args.context_tokens:
+        contexts = [long_context(workload, args.context_tokens)]
+    else:
+        contexts = longest_contexts(workload, args.contexts)
     training = _training_client(args)
     sampler = training.save_weights_and_get_sampling_client("repro")
     params = types.SamplingParams(max_tokens=args.max_tokens, temperature=1.0, top_p=args.top_p, top_k=args.top_k)
     seconds = {}
     samples = _timed(seconds, "sample", lambda: _sample(sampler, contexts, params))
     datums = _datums(samples, [1.0] * len(samples))
-    for name, call in (("forward", training.forward), ("forward_backward", training.forward_backward)):
-        _timed(seconds, name, lambda call=call: call(datums, "importance_sampling").result())
-    summary = {"datum_lengths": [datum.model_input.length for datum in datums], "seconds": seconds}
+    _timed(seconds, "forward", lambda: training.forward(datums, "importance_sampling").result())
+    result = _timed(
+        seconds, "forward_backward", lambda: training.forward_backward(datums, "importance_sampling").result()
+    )
+    summary = {
+        "datum_lengths": [datum.model_input.length for datum in datums],
+        "seconds": seconds,
+        "forward_backward_metrics": result.metrics,
+    }
     line = f"{len(datums)} datums up to {max(summary['datum_lengths'])} tokens: " + ", ".join(
         f"{name} {value:.0f}s" for name, value in seconds.items()
     )
@@ -458,6 +478,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sampling(long_train, max_tokens=256)
     long_train.add_argument("--contexts", type=int, default=5)
+    long_train.add_argument(
+        "--context-tokens", type=int, default=0, help="instead, one context of this many tokens cut from the workload"
+    )
 
     replay = client_gate("replay", run_replay, "replay sampling throughput", True)
     replay.add_argument("--copies", type=int, default=1, help="copies of each trajectory")

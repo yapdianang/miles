@@ -5,8 +5,9 @@
   restart POD [SERVE ARGS]          stop the service, start the launcher's `serve` with SERVE ARGS, wait for the gateway
   stop POD                          stop the service
   gate POD GATE [GATE ARGS]         run mimo_gates.py GATE in the pod against its gateway
+  run POD SCRIPT [ARGS]             run this checkout's python SCRIPT in the pod's checkout
 
-restart, stop and gate send this checkout's copy of the tool to the pod, so the image needs no copy. The
+restart, stop, gate and run send this checkout's copy of the script to the pod, so the image needs no copy. The
 service runs in a session of its own: stop sends its launcher SIGTERM (the launcher then stops its Ray job),
 SIGKILLs what is left of that session, and runs `ray stop --force`; it does not signal other processes.
 The service log is /tmp/mimo-dev/service.log in the pod.
@@ -149,6 +150,10 @@ def gate(args) -> int:
     return _run_script(args.pod, TOOLS_DIR / "mimo_gates.py", [args.gate, *url, *args.gate_args])
 
 
+def run_in_pod(args) -> int:
+    return _run_script(args.pod, args.script, args.script_args)
+
+
 def pod_restart(args) -> int:
     stop_service(args.state_dir, args.stop_timeout)
     start = time.monotonic()
@@ -196,6 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
     remote_gate.add_argument("pod")
     remote_gate.add_argument("gate")
     remote_gate.add_argument("gate_args", nargs=argparse.REMAINDER)
+
+    remote_run = command("run", run_in_pod, "run a local python script in the pod")
+    remote_run.add_argument("pod")
+    remote_run.add_argument("script", type=Path)
+    remote_run.add_argument("script_args", nargs=argparse.REMAINDER)
 
     # The commands below run inside the pod.
     for name, run in (("pod-restart", pod_restart), ("pod-stop", pod_stop)):
