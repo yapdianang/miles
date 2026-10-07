@@ -280,6 +280,20 @@ def test_dora_starts_at_the_lora_weight_and_its_norm_is_the_dense_row_norm(tp1, 
     torch.testing.assert_close(layer.row_norm(0), (w0 + 2.0 * b @ a).norm(dim=1))
 
 
+@pytest.mark.parametrize("in_features", [4096, 8192])
+def test_closed_form_norm_matches_the_dense_fp64_norm_on_mimo_sized_bf16_rows(tp1, in_features):
+    # MiMo-V2.6 qkv_proj and o_proj inputs, rank 32, with s B A about a tenth of W0 per row
+    torch.manual_seed(6)
+    rows, rank = 256, 32
+    w0 = (0.02 * torch.randn(rows, in_features)).to(torch.bfloat16)
+    a = (torch.randn(rank, in_features) / in_features**0.5).to(torch.bfloat16)
+    b = (0.02 * torch.randn(rows, rank)).to(torch.bfloat16)
+    layer = _dora_layer(w0, [(a, b)], rank=rank)
+    dense = (w0.double() + 2.0 * b.double() @ a.double()).norm(dim=1)
+    assert ((w0.double().norm(dim=1) - dense).abs() / dense).max() > 1e-2
+    torch.testing.assert_close(layer.row_norm(0).double(), dense, rtol=1e-6, atol=0)
+
+
 def test_prop6_dora_gradients_are_muown_gradients(tp1, factors):
     b, a, grad_w = factors
     w0 = torch.randn(M, N)

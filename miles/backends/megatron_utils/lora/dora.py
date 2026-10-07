@@ -102,16 +102,17 @@ class MultiDoRALinear(MultiLoRALinear):
         split = not self.input_is_parallel or self._tokens_split()
         if self.input_is_parallel:
             # W0 and A hold this rank's input columns; B holds this rank's slice of the output rows
-            cross = self._tp_sum(w0 @ a.to(w0.dtype).T, split=split)
-            gram = self._tp_sum(a.float() @ a.float().T, split=split)
+            a = a.float()
+            cross = self._tp_sum(_FrozenTimesTransposed.apply(w0, a), split=split)
+            gram = self._tp_sum(a @ a.T, split=split)
             b = self._tp_gather_rows(b, split=split)
         else:
             # W0 and B hold this rank's output rows; A holds this rank's rank rows
             a = self._tp_gather_rows(a, split=split).float()
-            cross = w0 @ a.to(w0.dtype).T
+            cross = _FrozenTimesTransposed.apply(w0, a)
             gram = a @ a.T
         b = b.float()
-        sq = self._w0_sq + 2 * scale * (b * cross.float()).sum(dim=1) + scale**2 * ((b @ gram) * b).sum(dim=1)
+        sq = self._w0_sq + 2 * scale * (b * cross).sum(dim=1) + scale**2 * ((b @ gram) * b).sum(dim=1)
         return sq.clamp_min(torch.finfo(torch.float32).tiny).sqrt()
 
     def _tokens_split(self) -> bool:
@@ -147,6 +148,20 @@ class MultiDoRALinear(MultiLoRALinear):
                     adapter.weight_magnitude, key, tp_axis=0, prepend_offsets=sharded_offsets
                 )
         return sharded
+
+
+class _FrozenTimesTransposed(torch.autograd.Function):
+    """``W0 A^T`` in fp32 for a frozen ``W0``, saving ``W0`` as stored rather than its fp32 copy."""
+
+    @staticmethod
+    def forward(ctx, w0: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(w0)
+        return w0.float() @ a.T
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        (w0,) = ctx.saved_tensors
+        return None, grad.T @ w0.float()
 
 
 @dataclass
