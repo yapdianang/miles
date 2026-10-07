@@ -199,6 +199,8 @@ def _serve(args: ScriptArgs) -> None:
     model_args = (
         "--attention-dropout 0.0 --hidden-dropout 0.0 --attention-softmax-in-fp32 --attention-backend fused "
         "--accumulate-allreduce-grads-in-fp32 --optimizer adam --lr 1e-6 "
+        # A 1M-token datum fits 8 GPUs only without allocator fragmentation; the trainer offloads nothing to TMS.
+        """--train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}' """
     )
     replay_args = "--use-rollout-routing-replay " if args.routing_replay else ""
     if args.routing_replay and args.routed_expert_deltas:
