@@ -46,11 +46,15 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.utils import is_layer_window_attention
 
 from miles_plugins.megatron_bridge.swa_context_parallel import exchange_swa_halo, plan_swa_halo
 
 logger = logging.getLogger(__name__)
+
+# One RoPE module per (base, device): it holds no parameters, and each instance caches its own full table.
+_ROTARY_POS_EMBS: dict = {}
 
 
 def _sized_linear(build, *, input_size: int | None = None, output_size: int | None = None):
@@ -89,9 +93,13 @@ class MiMoV2SelfAttention(SelfAttention):
         assert groups >= self.world_size, "TP must not exceed the layer's KV heads"
         self.linear_qkv_out_dim = qkv_out_dim
         self.val_hidden_size = config.v_head_dim
-        if self.rotary_pos_emb is not None:
-            # THD RoPE indexes the full table by zigzag position; Attention.forward would slice it per CP rank.
-            self.rotary_pos_emb.cp_group = None
+
+    def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
+        super()._build_per_layer_rotary_pos_emb(rotary_base)
+        # THD RoPE indexes the full table by zigzag position; Attention.forward would slice it per CP rank.
+        self.rotary_pos_emb.cp_group = None
+        key = (rotary_base, self.rotary_pos_emb.inv_freq.numel(), self.rotary_pos_emb.inv_freq.device)
+        self.rotary_pos_emb = _ROTARY_POS_EMBS.setdefault(key, self.rotary_pos_emb)
 
     def get_query_key_value_tensors(
         self, hidden_states, key_value_states=None, output_gate=False, head_wise_gate=False, split_qkv=True
@@ -215,7 +223,16 @@ class MiMoV2ModelProvider(GPTModelProvider):
         assert self.tensor_model_parallel_size <= min(
             self.full_attn_num_query_groups, self.swa_num_query_groups
         ), "MiMo-V2 needs TP <= the smallest per-layer KV head count"
-        return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        model = super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        for module in model.modules():
+            if isinstance(module, MoELayer):
+                module.register_forward_hook(_drop_dispatcher_state)
+        return model
+
+
+def _drop_dispatcher_state(moe_layer: MoELayer, _inputs, _output) -> None:
+    # The dispatcher keeps the last routing probs; under recompute their graph pins the layer input and its grad.
+    moe_layer.token_dispatcher.reset_transient_forward_state()
 
 
 def fuse_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, shards: int) -> torch.Tensor:
