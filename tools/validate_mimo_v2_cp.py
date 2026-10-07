@@ -238,11 +238,14 @@ def run(args):
         RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
     weights_gb = torch.cuda.memory_allocated() / 2**30
+    num_targets = sum(len(seq) - 1 for seq in sequences)
+    assert not args.warmup_steps or (args.no_save and not args.replay_routes), "warm up only timing runs"
+    for _ in range(args.warmup_steps):
+        (-(_target_log_probs(model, batch, args.log_prob_chunk) * batch["weights"]).sum() / num_targets).backward()
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     start = time.perf_counter()
     log_probs = _target_log_probs(model, batch, args.log_prob_chunk)
-    num_targets = sum(len(seq) - 1 for seq in sequences)
     loss = -(log_probs * batch["weights"]).sum() / num_targets
     recorded = _recorded_routes(cu_seqlens, sequences, args.cp) if record else None
     if args.replay_routes:
@@ -271,7 +274,8 @@ def run(args):
             "cp": args.cp,
             "seq_lens": [len(seq) for seq in sequences],
             "local_rows": cu_seqlens[-1] // args.cp,
-            "first_forward_backward_s": seconds,
+            "forward_backward_s": seconds,
+            "warmup_steps": args.warmup_steps,
             "weights_gb": weights_gb,
             "peak_gb": peak.item(),
             "forward_bytes_per_layer_max_rank": {key: int(value.item()) for key, value in worst.items()},
@@ -352,6 +356,7 @@ def main():
     run_parser.add_argument(
         "--recompute", nargs="?", const="full", choices=("full", "selective"), help="activation recompute, as training"
     )
+    run_parser.add_argument("--warmup-steps", type=int, default=0, help="untimed forward+backward passes first")
     run_parser.add_argument("--log-prob-chunk", type=int, default=4096, help="the launcher's --log-probs-chunk-size")
     run_parser.add_argument("--no-save", action="store_true", help="report timing and memory only")
     run_parser.add_argument("--out", required=True)
