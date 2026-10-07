@@ -276,8 +276,8 @@ def validate_multi_lora_args(args: Any) -> None:
         "(sample-mean); per-token loss normalization would make adapter batch weights "
         "depend on batch contents. Drop --calculate-per-token-loss."
     )
-    assert (getattr(args, "optimizer", "adam") or "adam").lower() == "adam", (
-        "Multi-LoRA requires --optimizer adam: the per-slot SlotOptimizer only "
-        f"implements Adam semantics; got --optimizer {args.optimizer}"
+    assert (getattr(args, "optimizer", "adam") or "adam").lower() in ("adam", "muown"), (
+        "Multi-LoRA requires --optimizer adam or muown: the per-slot SlotOptimizer only "
+        f"implements those; got --optimizer {args.optimizer}"
     )
     args.megatron_to_hf_mode = "bridge"

@@ -31,11 +31,10 @@ def validate_multi_lora_optimizer_args(args: Namespace) -> None:
         "sharding replaces byte-level ZeRO"
     )
     assert args.bf16 and not args.fp16, "multi-LoRA per-slot optimizers require bf16 (no dynamic loss scaler)"
-    assert (
-        args.optimizer or ""
-    ).lower() == "adam", (
-        f"multi-LoRA per-slot optimizers only implement Adam semantics; got optimizer={args.optimizer!r}"
-    )
+    assert (args.optimizer or "").lower() in (
+        "adam",
+        "muown",
+    ), f"multi-LoRA per-slot optimizers implement Adam and Muown; got optimizer={args.optimizer!r}"
     for flag in ("optimizer_cpu_offload", "stream_optimizer_state_to_disk", "rematerialize_param_from_master_weight"):
         assert not getattr(args, flag, False), f"--{flag.replace('_', '-')} is not supported with multi-LoRA slots"
 
@@ -102,9 +101,10 @@ def _build_slot_base_optimizers(config, model, slot_params, *, use_gloo_process_
 class SlotOptimizer:
     """One tenant's optimizer over one adapter slot.
 
-    Wraps a per-slot LayerWiseDistributedOptimizer, so every method touches
-    only this slot's parameters and state: reloads cannot round other tenants'
-    FP32 masters, and the parameter all-gather moves only this slot."""
+    Wraps a per-slot LayerWiseDistributedOptimizer (Muown: a ChainedOptimizer
+    that every DP rank steps whole), so every method touches only this slot's
+    parameters and state: reloads cannot round other tenants' FP32 masters,
+    and the parameter all-gather moves only this slot."""
 
     def __init__(self, args: Namespace, model, slot: int) -> None:
         self.slot = slot
@@ -116,22 +116,35 @@ class SlotOptimizer:
             **{f.name: getattr(args, f.name) for f in fields(OptimizerConfig) if hasattr(args, f.name)}
         )
         config.timers = None
-        base_optimizers = _build_slot_base_optimizers(
-            config, model, slot_params, use_gloo_process_groups=args.use_gloo_process_groups
-        )
-        assert base_optimizers, f"adapter slot {slot} produced no optimizer children"
-        self._inner = LayerWiseDistributedOptimizer(
-            base_optimizers,
-            config,
-            ProcessGroupCollection.use_mpu_process_groups(),
-            init_state_fn_list=[_adam_init_state_fn] * len(base_optimizers),
-            model_chunks=list(model),
-        )
-        # params are scattered whole across DP ranks; per-child norm/clip reductions must span the world
-        for child in self._inner.chained_optimizers:
-            child.grad_stats_parallel_group = None
+        if config.optimizer == "muown":
+            import miles.backends.megatron_utils.muown  # noqa: F401  registers the optimizer with Megatron
+
+            # Muown steps each adapter's (A, B) together, so every DP rank keeps and steps the whole slot
+            # (grads are all-reduced) instead of LayerWise sharding; norms then reduce over model parallelism.
+            with _only_slot_trainable(model, slot_params):
+                self._inner = get_megatron_optimizer(
+                    config, list(model), use_gloo_process_groups=args.use_gloo_process_groups
+                )
+            self._grad_stats_group = ProcessGroupCollection.use_mpu_process_groups().mp
+        else:
+            base_optimizers = _build_slot_base_optimizers(
+                config, model, slot_params, use_gloo_process_groups=args.use_gloo_process_groups
+            )
+            assert base_optimizers, f"adapter slot {slot} produced no optimizer children"
+            self._inner = LayerWiseDistributedOptimizer(
+                base_optimizers,
+                config,
+                ProcessGroupCollection.use_mpu_process_groups(),
+                init_state_fn_list=[_adam_init_state_fn] * len(base_optimizers),
+                model_chunks=list(model),
+            )
+            # params are scattered whole across DP ranks; per-child norm/clip reductions must span the world
+            for child in self._inner.chained_optimizers:
+                child.grad_stats_parallel_group = None
+            self._grad_stats_group = None
 
     def apply_adam_params(self, adam_params: dict) -> None:
+        """Under Muown the lr also drives the LoRA direction steps; betas and eps reach only Adam groups."""
         for child in self._inner.chained_optimizers:
             for group in child.param_groups:
                 group["lr"] = adam_params["learning_rate"]
@@ -151,7 +164,7 @@ class SlotOptimizer:
         for child in self._inner.chained_optimizers:
             grads_for_norm += child.get_grads_for_grad_norm()
             slot_params += child.get_parameters()
-        slot_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+        slot_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=self._grad_stats_group)
         # BF16 has no grad scaler; the all-reduced norm detects inf/nan on every rank
         if not math.isfinite(slot_norm):
             return {"skipped_nonfinite": 1.0}
@@ -162,7 +175,8 @@ class SlotOptimizer:
         return {"grad_norm": float(slot_norm)}
 
     def allgather_params(self) -> None:
-        self._inner.allgather_params()
+        if isinstance(self._inner, LayerWiseDistributedOptimizer):
+            self._inner.allgather_params()
 
     def reload_masters(self) -> None:
         """Refresh this slot's FP32 masters from its model parameters."""
