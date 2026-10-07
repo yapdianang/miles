@@ -1,17 +1,18 @@
 """Stage (a): export RL rollouts from the Trajectory Service, resampled to the RL training task mix.
 
 The rollout logs are the completed train-split samples of ``--xids``, optionally only those sampled at policy step
-``<= --max-policy-step`` (MiMo-V2.6 section 6.4 fine-tunes on early RL logs). The RL training distribution is the
-task mix of the samples the trainer used: collected and not rejected (rejection drops zero-variance groups). A
-rollout of task t gets weight ``trained_share(t) / logged_count(t)``, and ``--num-train + --num-heldout`` rollouts
-are drawn without replacement with Efraimidis-Spirakis keys. A rollout is its last stored step: the full token
-sequence, with ``token_masks`` 1 on every sampled token.
+``<= --max-policy-step`` (MiMo-V2.6 section 6.4 fine-tunes on early RL logs). The pool is the collected samples, or
+every ENV_DONE sample when fewer than ``--num-train + --num-heldout`` were collected. The RL training distribution
+is the task mix of the samples the trainer used: collected and not rejected (rejection drops zero-variance groups);
+a run stopped before its first update has none, and the pool's own mix stands in. A rollout of task t gets weight
+``trained_share(t) / pooled_count(t)``, and rollouts are drawn without replacement with Efraimidis-Spirakis keys.
+A rollout is its last stored step: the full token sequence, with ``token_masks`` 1 on every sampled token.
 
-Writes ``train.jsonl`` and ``heldout.jsonl`` ({key, xid, task_id, policy_step, tokens, loss_mask}),
-``heldout_replay.json`` (the replay_bench turn format) and ``summary.json``. Needs gcloud with Spanner and GCS read.
+Writes ``train.jsonl`` and ``heldout.jsonl`` ({key, xid, task_id, policy_step, tokens, loss_mask}) and
+``summary.json``. Needs gcloud with Spanner and GCS read.
 
-python -m examples.multi_lora.dflash_rl.export_rollouts --xids 1063337 1063338 --num-train 2000 --num-heldout 64 \\
-    --out /data/dflash-rl/rollouts
+python -m examples.multi_lora.dflash_rl.export_rollouts --xids 1063168 1063227 1063268 1063329 \\
+    --num-train 300 --num-heldout 100 --out /data/dflash-rl/rollouts
 """
 
 import argparse
@@ -24,23 +25,24 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from examples.multi_lora.dflash_rl.data import replay_turns
 
-
-def resample(rows: list[dict], *, num: int, max_policy_step: int | None, seed: int) -> list[dict]:
+def select_rollouts(rows: list[dict], *, num: int, max_policy_step: int | None, seed: int) -> list[dict]:
     """``num`` logged rollouts drawn without replacement so the task mix matches the trained samples' mix."""
-    trained = Counter(row["task_id"] for row in rows if row["trained"])
-    pool = [
+    rows = [
         row
         for row in rows
-        if trained[row["task_id"]]
-        and (max_policy_step is None or (row["policy_step"] is not None and row["policy_step"] <= max_policy_step))
+        if max_policy_step is None or (row["policy_step"] is not None and row["policy_step"] <= max_policy_step)
     ]
-    logged = Counter(row["task_id"] for row in pool)
+    pool = [row for row in rows if row["collected"]]
+    if len(pool) < num:
+        pool = [row for row in rows if row["env_done"]]
+    trained = Counter(row["task_id"] for row in rows if row["trained"]) or Counter(row["task_id"] for row in pool)
+    pool = [row for row in pool if trained[row["task_id"]]]
+    pooled = Counter(row["task_id"] for row in pool)
     total = sum(trained.values())
     rng = random.Random(seed)
     # log(u) / weight: the log of the Efraimidis-Spirakis key u ** (1 / weight), which underflows for rare tasks.
-    keys = [math.log(1.0 - rng.random()) * logged[row["task_id"]] * total / trained[row["task_id"]] for row in pool]
+    keys = [math.log(1.0 - rng.random()) * pooled[row["task_id"]] * total / trained[row["task_id"]] for row in pool]
     order = sorted(range(len(pool)), key=keys.__getitem__, reverse=True)
     return [pool[index] for index in order[:num]]
 
@@ -65,7 +67,8 @@ def _logged_rows(args) -> list[dict]:
     xids = ", ".join(f"'{xid}'" for xid in args.xids)
     rows = _sql(
         args,
-        "SELECT s.tid, s.xid, s.task_id, s.rollout_policy_step, s.is_collected AND s.rejection_reason IS NULL, "
+        "SELECT s.tid, s.xid, s.task_id, s.rollout_policy_step, s.is_collected, s.rejection_reason IS NULL, "
+        "s.termination_reason, "
         "(SELECT st.step_blob_uri FROM steps st WHERE st.trajectory_id = s.tid ORDER BY st.step_index DESC LIMIT 1) "
         f"FROM samples s WHERE s.xid IN ({xids}) AND s.split = 'train' AND s.status = 'completed' "
         "AND s.tid IS NOT NULL",
@@ -76,10 +79,12 @@ def _logged_rows(args) -> list[dict]:
             "xid": xid,
             "task_id": task,
             "policy_step": None if step is None else int(step),
-            "trained": trained,
+            "collected": collected,
+            "trained": collected and not_rejected,
+            "env_done": termination == "TERMINATION_REASON_ENV_DONE",
             "uri": uri,
         }
-        for tid, xid, task, step, trained, uri in rows
+        for tid, xid, task, step, collected, not_rejected, termination, uri in rows
         if uri is not None
     ]
 
@@ -111,7 +116,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     rows = _logged_rows(args)
-    chosen = resample(
+    chosen = select_rollouts(
         rows, num=args.num_train + args.num_heldout, max_policy_step=args.max_policy_step, seed=args.seed
     )
     with ThreadPoolExecutor(32) as pool:
@@ -120,18 +125,22 @@ def main(argv: list[str] | None = None) -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     _write_jsonl(args.out / "train.jsonl", train)
     _write_jsonl(args.out / "heldout.jsonl", heldout)
-    replay = [replay_turns(rollout["tokens"], rollout["loss_mask"]) for rollout in heldout]
-    (args.out / "heldout_replay.json").write_text(json.dumps(replay))
     summary = {
         "xids": args.xids,
         "logged": len(rows),
+        "collected": sum(row["collected"] for row in rows),
+        "trained": sum(row["trained"] for row in rows),
+        "env_done": sum(row["env_done"] for row in rows),
+        "chosen_policy_steps": Counter(row["policy_step"] for row in chosen),
         "trained_task_mix": Counter(row["task_id"] for row in rows if row["trained"]),
         "chosen_task_mix": Counter(row["task_id"] for row in chosen),
         "train": {"rollouts": len(train), "sampled_tokens": sum(sum(r["loss_mask"]) for r in train)},
         "heldout": {"rollouts": len(heldout), "sampled_tokens": sum(sum(r["loss_mask"]) for r in heldout)},
     }
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(json.dumps({key: summary[key] for key in ("logged", "train", "heldout")}))
+    print(
+        json.dumps({key: summary[key] for key in ("logged", "collected", "trained", "env_done", "train", "heldout")})
+    )
 
 
 if __name__ == "__main__":

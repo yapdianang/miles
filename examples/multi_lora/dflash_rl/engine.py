@@ -36,11 +36,12 @@ def server_argv(
     argv = [sys.executable, "-m", "sglang.launch_server", "--model-path", hf_checkpoint, "--port", str(port)]
     argv += ["--trust-remote-code", "--skip-server-warmup"]
     for token in shlex.split(launcher._sglang_args(serve_args)):
-        if token == "--rollout-num-gpus-per-engine":
+        name = token.removeprefix("--")
+        if name == "rollout-num-gpus-per-engine":
             argv.append("--tp-size")
-        elif token.startswith("--sglang-"):
-            argv.append("--" + token.removeprefix("--sglang-"))
-        elif token.startswith("--"):
+        elif name.startswith("sglang-"):
+            argv.append("--" + name.removeprefix("sglang-"))
+        elif name != token:
             raise ValueError(f"no SGLang server flag for engine argument {token}")
         else:
             argv.append(token)

@@ -37,11 +37,6 @@ def context_spans(loss_mask: list[int], window: int) -> list[tuple[int, int]]:
     return merged
 
 
-def replay_turns(tokens: list[int], loss_mask: list[int]) -> list[dict]:
-    """The rollout as replay_bench turns: each turn's prompt and its sampled token count."""
-    return [{"prompt": tokens[:start], "output_len": end - start} for start, end in turn_spans(loss_mask)]
-
-
 def spans_mask(positions: torch.Tensor, spans: list[tuple[int, int]]) -> torch.Tensor:
     keep = torch.zeros_like(positions, dtype=torch.bool)
     for start, end in spans:
@@ -128,13 +123,18 @@ def make_chunk(
 
 
 def walk_accept(shard: dict[str, torch.Tensor], anchors: list[int], accepted: list[int]) -> tuple[int, int]:
-    """Tokens and verify steps of decoding each turn block by block, as the engine does: (sum of 1 + accepted, steps)."""
+    """Tokens after each turn's first and the verify steps that decode them block by block, as the engine does.
+
+    A step emits its accepted drafts and a bonus token, none past the turn's last token (the engine stops at EOS),
+    so the tokens are each turn's length minus one: an engine request's completion_tokens - 1.
+    """
     accepted_at = dict(zip(anchors, accepted, strict=True))
     tokens = steps = 0
-    for start, _ in turn_spans(shard["loss_mask"].tolist()):
+    for start, end in turn_spans(shard["loss_mask"].tolist()):
         index = start
-        while index in accepted_at:
-            tokens += accepted_at[index] + 1
+        while index < end - 1:
+            advance = min(accepted_at[index] + 1, end - 1 - index)
+            tokens += advance
             steps += 1
-            index += accepted_at[index] + 1
+            index += advance
     return tokens, steps

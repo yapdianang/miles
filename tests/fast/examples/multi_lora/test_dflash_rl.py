@@ -1,19 +1,20 @@
 """DFlash RL drafter pipeline: data formats, the drafter forward against a per-query reference, the loss, and a
 CPU dry run of capture -> train -> offline eval on tiny shapes."""
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import torch
-from examples.multi_lora.dflash_rl import capture_hook, eval_offline, train_drafter
+from examples.multi_lora.dflash_rl import bench_engine, capture_hook, eval_offline, run_pipeline, train_drafter
 from examples.multi_lora.dflash_rl.data import (
     assemble_shard,
     context_spans,
     load_shard,
     make_chunk,
-    replay_turns,
     save_shard,
     turn_spans,
     valid_anchors,
@@ -29,7 +30,7 @@ from examples.multi_lora.dflash_rl.drafter import (
     save_drafter,
 )
 from examples.multi_lora.dflash_rl.engine import server_argv
-from examples.multi_lora.dflash_rl.export_rollouts import resample, rollout_from_step
+from examples.multi_lora.dflash_rl.export_rollouts import rollout_from_step, select_rollouts
 from safetensors.torch import save_file
 
 VOCAB = 64
@@ -100,14 +101,6 @@ def test_turn_and_context_spans_cover_each_turn_and_its_window() -> None:
     assert context_spans([1, 1, 0], window=1024) == [(0, 2)]
 
 
-def test_replay_turns_split_the_rollout_at_each_turn() -> None:
-    tokens = list(range(10))
-    assert replay_turns(tokens, [0, 0, 1, 1, 0, 0, 1, 1, 1, 0]) == [
-        {"prompt": [0, 1], "output_len": 2},
-        {"prompt": [0, 1, 2, 3, 4, 5], "output_len": 3},
-    ]
-
-
 def test_rollout_from_step_rejects_misaligned_masks() -> None:
     assert rollout_from_step({"tokens": [1, 2, 3], "token_masks": [0, 1, 1]})["loss_mask"] == [0, 1, 1]
     with pytest.raises(ValueError):
@@ -116,18 +109,34 @@ def test_rollout_from_step_rejects_misaligned_masks() -> None:
         rollout_from_step({"tokens": [1, 2], "token_masks": [0, 0]})
 
 
-def test_resample_matches_the_trained_task_mix_and_filters_policy_steps() -> None:
-    rows = [
-        {"key": f"{task}{index}", "task_id": task, "policy_step": index % 10, "trained": index < trained}
-        for task, trained in (("a", 50), ("b", 450), ("never", 0))
-        for index in range(1000)
+def _rows(task: str, count: int, *, trained: int = 0, collected: int = 0) -> list[dict]:
+    return [
+        {
+            "key": f"{task}{index}",
+            "task_id": task,
+            "policy_step": index % 10,
+            "collected": index < max(collected, trained),
+            "trained": index < trained,
+            "env_done": index % 4 != 0,
+        }
+        for index in range(count)
     ]
-    chosen = resample(rows, num=200, max_policy_step=None, seed=0)
+
+
+def test_select_rollouts_matches_the_trained_task_mix_and_filters_policy_steps() -> None:
+    rows = [*_rows("a", 1000, trained=50), *_rows("b", 1000, trained=450), *_rows("never", 1000, collected=10)]
+    chosen = select_rollouts(rows, num=200, max_policy_step=None, seed=0)
     counts = {task: sum(row["task_id"] == task for row in chosen) for task in ("a", "b", "never")}
-    assert len({row["key"] for row in chosen}) == 200
+    assert len({row["key"] for row in chosen}) == 200 and all(row["collected"] for row in chosen)
     assert counts["never"] == 0 and 10 <= counts["a"] <= 30
-    early = resample(rows, num=100, max_policy_step=2, seed=0)
-    assert all(row["policy_step"] <= 2 for row in early)
+    assert all(row["policy_step"] <= 2 for row in select_rollouts(rows, num=100, max_policy_step=2, seed=0))
+
+
+def test_select_rollouts_falls_back_to_env_done_rollouts_of_an_untrained_run() -> None:
+    rows = [*_rows("a", 100, collected=5), *_rows("b", 300, collected=5)]
+    chosen = select_rollouts(rows, num=200, max_policy_step=None, seed=0)
+    assert len(chosen) == 200 and all(row["env_done"] for row in chosen)
+    assert 30 <= sum(row["task_id"] == "a" for row in chosen) <= 70
 
 
 def test_capture_hook_saves_spanned_rows_of_extend_batches_only(tmp_path: Path) -> None:
@@ -269,11 +278,11 @@ def test_block_loss_weights_slots_by_decay_and_counts_leading_matches() -> None:
     assert loss > 0
 
 
-def test_walk_accept_steps_through_each_turn_by_accepted_blocks() -> None:
+def test_walk_accept_steps_through_each_turn_and_stops_at_its_last_token() -> None:
     shard = {"loss_mask": torch.tensor([0, 1, 1, 1, 1, 1, 0, 1, 1, 1], dtype=torch.bool)}
     anchors, accepted = [1, 2, 3, 4, 7, 8], [2, 0, 1, 0, 0, 1]
-    # Turn 1 starts at 1: accept 2 (3 tokens) -> 4: accept 0 (1 token) -> 5 ends; turn 2: 7 -> 8 -> 10.
-    assert walk_accept(shard, anchors, accepted) == (3 + 1 + 1 + 2, 4)
+    # Turn 1: 1 -> 4 (2 drafts + bonus) -> 5 (bonus); turn 2: 7 -> 8 -> 9 (one draft, no bonus past the end).
+    assert walk_accept(shard, anchors, accepted) == (4 + 2, 4)
 
 
 def test_save_drafter_round_trips_checkpoint_names(tmp_path: Path) -> None:
@@ -357,3 +366,92 @@ def test_dry_run_capture_train_and_eval_on_tiny_shapes(tmp_path: Path, capsys: p
     assert set(results) == {("shipped", 3), ("shipped", 4), ("rl", 3), ("rl", 4)}
     assert results[("rl", 4)]["loss"] < results[("shipped", 4)]["loss"]
     assert all(1 <= row["walk_accept_length"] <= row["block_size"] for row in results.values())
+
+
+def _fake_stage(engine_accept: float):
+    """Stage outputs keyed by stage name, in place of the subprocesses."""
+
+    def run(self, name: str, command: list[str]) -> None:
+        self.elapsed[name] = 0
+        if name.startswith("eval_"):
+            drafter = name.removeprefix("eval_")
+            walk = {"shipped": 3.0, "rl": 3.3}[drafter]
+            rows = [{"drafter": drafter, "block_size": b, "walk_accept_length": walk - (b == 6) * 0.2} for b in (8, 6)]
+            (self.work / f"{name}.json").write_text(json.dumps(rows))
+        elif name.startswith("bench_"):
+            drafter, precisions = {"gate": ("shipped", ["bf16"]), "rl": ("rl", ["bf16", "fp8"])}.get(
+                name.removeprefix("bench_"), ("shipped", ["fp8"])
+            )
+            rows = [
+                {
+                    "drafter": drafter,
+                    "block_size": b,
+                    "draft_precision": p,
+                    "accept_length": engine_accept + 1,
+                    "accept_length_after_first": engine_accept,
+                    "output_tok_per_s": 100
+                    * (1.1 if b == 6 else 1)
+                    * (1.05 if p == "fp8" else 1)
+                    * (1.2 if drafter == "rl" else 1),
+                }
+                for b in (8, 6)
+                for p in precisions
+            ]
+            (self.work / name).mkdir()
+            (self.work / name / "bench.json").write_text(json.dumps(rows))
+        elif name == "train":
+            (self.work / "logs" / "train.log").write_text('{"epoch": 1, "step": 2, "of": 2, "loss": 1.0}\n')
+
+    return run
+
+
+@pytest.mark.parametrize("engine_accept, passed", [(3.05, True), (3.5, False)])
+def test_pipeline_runs_every_stage_only_after_the_parity_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine_accept: float, passed: bool
+) -> None:
+    rollouts, work = tmp_path / "rollouts", tmp_path / "work"
+    rollouts.mkdir()
+    (rollouts / "summary.json").write_text(json.dumps({"xids": ["1063329"], "chosen_task_mix": {"t": 1}}))
+    monkeypatch.setattr(run_pipeline._Stages, "run", _fake_stage(engine_accept))
+    args = ["--rollouts", str(rollouts), "--work", str(work), "--hf-checkpoint", str(tmp_path / "ckpt")]
+    if passed:
+        run_pipeline.main(args)
+    else:
+        with pytest.raises(SystemExit, match="parity gate failed"):
+            run_pipeline.main(args)
+    summary = json.loads((work / "summary.json").read_text())
+    assert summary["gate"]["passed"] is passed and summary["rollouts"] == {"xids": ["1063329"]}
+    gate_stages = ["extract_heldout", "eval_shipped", "bench_gate"]
+    later_stages = ["extract_train", "train", "eval_rl", "bench_rl", "bench_shipped_fp8"]
+    assert list(summary["elapsed_s"]) == gate_stages + later_stages * passed
+    if passed:
+        comparisons = summary["comparisons"]
+        assert comparisons["offline_walk_accept_rl_vs_shipped"]["8"] == pytest.approx(0.1)
+        assert comparisons["engine_tok_per_s_block6_vs_block8"]["rl_fp8"] == pytest.approx(0.1)
+        assert comparisons["engine_tok_per_s_rl_fp8_block6_vs_shipped_bf16_block8"] == pytest.approx(
+            1.1 * 1.05 * 1.2 - 1
+        )
+        assert len(summary["engine"]) == 8 and summary["train"]["last"]["step"] == 2
+
+
+def test_bench_replays_each_turn_prompt_and_counts_accept_length_after_the_first_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"meta_info": {"completion_tokens": 5, "spec_verify_ct": 2}})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs)
+    )
+    rollout = {"tokens": list(range(10)), "loss_mask": [0, 0, 1, 1, 0, 0, 1, 1, 1, 0]}
+    args = SimpleNamespace(
+        concurrency=4, temperature=1.0, top_p=0.97, top_k=1024, max_new_tokens=8192, lora_path=None, timeout=10
+    )
+    metrics = asyncio.run(bench_engine.replay("http://engine", [rollout], args))
+    assert [request["input_ids"] for request in requests] == [[0, 1], [0, 1, 2, 3, 4, 5]]
+    assert requests[0]["sampling_params"] == {"temperature": 1.0, "top_p": 0.97, "top_k": 1024, "max_new_tokens": 8192}
+    assert metrics["accept_length"] == 10 / 4 and metrics["accept_length_after_first"] == 8 / 4

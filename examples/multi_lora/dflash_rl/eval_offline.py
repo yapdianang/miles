@@ -2,10 +2,10 @@
 
 For each drafter and block size, drafts every block start of ``--data`` greedily, as SGLang's DFlash draft sampler
 does, against the rollouts' sampled tokens. Reports the decay-weighted loss, the mean accept length over block
-starts, and the walk accept length: decode each turn block by block from its first sampled token (tokens / verify
-steps), the quantity the engine reports as completion_tokens / spec_verify_ct. With sampled verification, matching
-a sampled token is accepted with the target's probability of the draft, so both estimate engine acceptance on the
-same contexts.
+starts, and the walk accept length: decode each turn block by block from its first sampled token (tokens after the
+first / verify steps), bench_engine.py's accept_length_after_first. With sampled verification, matching a sampled
+token is accepted with the target's probability of the draft, so both estimate engine acceptance on the same
+contexts.
 
 python -m examples.multi_lora.dflash_rl.eval_offline \\
     --target-checkpoint /data/model-cache/mimo-v26/MiMo-V2.6-Flash-RL-w4a16-linear \\

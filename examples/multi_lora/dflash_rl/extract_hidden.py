@@ -99,6 +99,8 @@ def main(argv: list[str] | None = None) -> None:
         rollouts = [json.loads(line) for line in file]
     todo = [rollout for rollout in rollouts if not (args.out / f"{rollout['key']}.safetensors").exists()]
     print(json.dumps({"rollouts": len(rollouts), "todo": len(todo)}))
+    if not todo:
+        return
     ports = [args.port + index for index in range(args.num_engines)]
     argvs = [
         server_argv(
