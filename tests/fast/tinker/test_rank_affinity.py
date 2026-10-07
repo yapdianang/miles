@@ -1,5 +1,7 @@
 """Rank affinity keeps a rollout's turns on one engine and starts new rollouts where there is most room."""
 
+import httpx
+
 from miles.tinker.engine_load import EngineLoad, KvPool
 from miles.tinker.rank_affinity import RankAffinity
 from miles.tinker.runtime import MilesBackend
@@ -45,6 +47,15 @@ def test_a_rollout_whose_engine_left_the_router_starts_over():
     assert affinity.choose_engine(PROMPT + [1, 2, 5], [_load("http://idle", 0)]) == "http://idle"
 
 
+def test_rollouts_started_from_one_snapshot_spread_across_engines():
+    affinity = RankAffinity()
+    loads = [_load("http://engine-a", 0), _load("http://engine-b", 0)]
+
+    engines = {affinity.choose_engine([index], loads) for index in range(2)}
+
+    assert engines == {"http://engine-a", "http://engine-b"}
+
+
 def test_the_oldest_contexts_are_evicted():
     affinity = RankAffinity(max_contexts=1)
     affinity.record(PROMPT, [1], "http://busy")
@@ -58,7 +69,7 @@ class FakeEngines:
     def __init__(self) -> None:
         self.urls: list[str] = []
 
-    async def post(self, url: str, request: dict) -> dict:
+    async def post(self, url: str, request: dict, max_retries: int = 60) -> dict:
         self.urls.append(url)
         meta = {"output_token_logprobs": [(-1.0, 11), (-1.0, 12)], "finish_reason": {"type": "stop"}}
         return {"meta_info": meta}
@@ -99,3 +110,24 @@ async def test_without_affinity_the_router_places_every_request(monkeypatch):
     await MilesBackend(None, "http://router").sample(_payload(PROMPT), None)
 
     assert engines.urls == ["http://router/generate"]
+
+
+async def test_a_failing_pinned_engine_hands_the_sample_to_the_router(monkeypatch):
+    engines = FakeEngines()
+
+    async def post(url: str, request: dict, max_retries: int = 60) -> dict:
+        if url.startswith("http://engine-a"):
+            raise httpx.ConnectError("engine down")
+        return await engines.post(url, request)
+
+    monkeypatch.setattr("miles.tinker.runtime.post", post)
+    backend = MilesBackend(None, "http://router", rank_affinity=RankAffinity())
+
+    async def engine_loads():
+        return [_load("http://engine-a", 0)]
+
+    backend.engine_loads = engine_loads
+    result = await backend.sample(_payload(PROMPT), None)
+
+    assert engines.urls == ["http://router/generate"]
+    assert result["sequences"][0]["tokens"] == [11, 12]

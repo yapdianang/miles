@@ -49,19 +49,30 @@ def test_an_engine_without_swa_or_hicache_reports_only_the_full_pool():
     assert (load.swa_kv, load.host_kv) == (None, None)
 
 
-def test_room_is_the_fewer_of_free_request_slots_and_free_kv():
-    pool = KvPool(used_tokens=0, evictable_tokens=0, total_tokens=1_000)
+def test_room_is_the_fewer_of_free_request_slots_and_kv_not_held_by_running_requests():
+    pool = KvPool(used_tokens=0, evictable_tokens=600, total_tokens=1_000)
     load = EngineLoad(0, "http://engine-a", 2, 1, 8, pool, None, None)
 
     assert load.measure_room(100) == 5
     assert load.measure_room(500) == 2
 
 
-def _router_and_engines(requests: list[str]) -> httpx.MockTransport:
+WORKERS = {
+    "workers": [
+        {"url": "http://engine-b", "is_healthy": True},
+        {"url": "http://engine-a", "is_healthy": True},
+        {"url": "http://engine-sick", "is_healthy": False},
+    ]
+}
+
+
+def _router_and_engines(requests: list[str], down: str = "") -> httpx.MockTransport:
     def handle(request: httpx.Request) -> httpx.Response:
         requests.append(str(request.url))
         if request.url.path == "/workers":
-            return httpx.Response(200, json={"workers": [{"url": "http://engine-b"}, {"url": "http://engine-a"}]})
+            return httpx.Response(200, json=WORKERS)
+        if request.url.host == down:
+            return httpx.Response(502)
         if request.url.path == "/v1/loads":
             return httpx.Response(200, json=LOADS)
         return httpx.Response(200, text=METRICS)
@@ -69,7 +80,7 @@ def _router_and_engines(requests: list[str]) -> httpx.MockTransport:
     return httpx.MockTransport(handle)
 
 
-async def test_the_monitor_ranks_engines_by_url_and_reuses_a_fresh_snapshot():
+async def test_the_monitor_ranks_healthy_engines_by_url_and_reuses_a_fresh_snapshot():
     requests: list[str] = []
     monitor = EngineLoadMonitor("http://router", httpx.AsyncClient(transport=_router_and_engines(requests)))
 
@@ -80,9 +91,22 @@ async def test_the_monitor_ranks_engines_by_url_and_reuses_a_fresh_snapshot():
     assert len(requests) == 5
 
 
-async def test_an_unreachable_router_reports_the_engines_unavailable():
-    failing = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(502)))
-    monitor = EngineLoadMonitor("http://router", failing)
+async def test_an_engine_that_does_not_answer_is_left_out():
+    monitor = EngineLoadMonitor("http://router", httpx.AsyncClient(transport=_router_and_engines([], "engine-b")))
 
-    with pytest.raises(EngineUnavailableError):
-        await monitor.get_loads()
+    assert [load.url for load in await monitor.get_loads()] == ["http://engine-a"]
+
+
+async def test_an_unreachable_router_is_reported_once_per_interval():
+    requests: list[str] = []
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(502)
+
+    monitor = EngineLoadMonitor("http://router", httpx.AsyncClient(transport=httpx.MockTransport(refuse)))
+
+    for _ in range(2):
+        with pytest.raises(EngineUnavailableError):
+            await monitor.get_loads()
+    assert requests == ["http://router/workers"]

@@ -1,6 +1,7 @@
 """Live load of each SGLang engine the router serves, for rollout admission and placement."""
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 
@@ -9,6 +10,8 @@ from prometheus_client.parser import text_string_to_metric_families
 
 from miles.tinker.core.types import EngineUnavailableError
 from miles.utils.http_utils import router_worker_base_urls
+
+logger = logging.getLogger(__name__)
 
 # SGLang publishes scheduler gauges about once per decode-log interval; polling faster only repeats them.
 _REFRESH_SECONDS = 1.0
@@ -24,7 +27,8 @@ class KvPool:
 
     @property
     def free_tokens(self) -> int:
-        return self.total_tokens - self.used_tokens - self.evictable_tokens
+        # The engine evicts prefix cache to admit new requests, so only running requests hold KV.
+        return self.total_tokens - self.used_tokens
 
 
 @dataclass(frozen=True)
@@ -96,19 +100,38 @@ class EngineLoadMonitor:
         self._client = client or httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS)
         self._lock = asyncio.Lock()
         self._loads: list[EngineLoad] = []
+        self._error: EngineUnavailableError | None = None
         self._refreshed_at = float("-inf")
 
     async def get_loads(self) -> list[EngineLoad]:
+        """The latest snapshot; a router failure is also kept for one interval so callers do not queue on it."""
         async with self._lock:
             if time.monotonic() - self._refreshed_at >= _REFRESH_SECONDS:
-                self._loads = await self._fetch_loads()
                 self._refreshed_at = time.monotonic()
+                try:
+                    self._loads, self._error = await self._fetch_loads(), None
+                except EngineUnavailableError as error:
+                    self._loads, self._error = [], error
+            if self._error is not None:
+                raise self._error
             return self._loads
 
     async def _fetch_loads(self) -> list[EngineLoad]:
+        """Healthy engines ranked by URL; an engine that does not answer is left out of this snapshot."""
         workers = (await self._get(f"{self.router_url}/workers")).json()["workers"]
-        urls = sorted(router_worker_base_urls([worker["url"] for worker in workers]))
-        return list(await asyncio.gather(*(self._fetch_engine(rank, url) for rank, url in enumerate(urls))))
+        urls = sorted(router_worker_base_urls([worker["url"] for worker in workers if worker["is_healthy"]]))
+        results = await asyncio.gather(
+            *(self._fetch_engine(rank, url) for rank, url in enumerate(urls)), return_exceptions=True
+        )
+        loads = []
+        for url, result in zip(urls, results, strict=True):
+            if isinstance(result, EngineUnavailableError):
+                logger.warning(f"engine {url} left out of engine load: {result}")
+            elif isinstance(result, BaseException):
+                raise result
+            else:
+                loads.append(result)
+        return loads
 
     async def _fetch_engine(self, rank: int, url: str) -> EngineLoad:
         loads, metrics = await asyncio.gather(self._get(f"{url}/v1/loads?include=core"), self._get(f"{url}/metrics"))

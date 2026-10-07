@@ -1,6 +1,6 @@
 """Keep every turn of a rollout on the engine that holds its KV cache."""
 
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 import numpy as np
 
@@ -25,13 +25,20 @@ class RankAffinity:
         self._engines: OrderedDict[int, str] = OrderedDict()
         self._keys = np.empty(0, dtype=np.uint64)
         self.mean_context_tokens = 0.0
+        # Rollouts started since the snapshot was taken, which its load does not show yet.
+        self._snapshot: list[EngineLoad] | None = None
+        self._started: Counter[str] = Counter()
 
     def choose_engine(self, prompt_tokens: list[int], loads: list[EngineLoad]) -> str:
+        if loads is not self._snapshot:
+            self._snapshot, self._started = loads, Counter()
         engine = self._find_engine(prompt_tokens)
         if engine is not None and any(load.url == engine for load in loads):
             return engine
         rollout_tokens = max(self.mean_context_tokens, len(prompt_tokens), 1)
-        return max(loads, key=lambda load: load.measure_room(rollout_tokens)).url
+        engine = max(loads, key=lambda load: load.measure_room(rollout_tokens) - self._started[load.url]).url
+        self._started[engine] += 1
+        return engine
 
     def record(self, prompt_tokens: list[int], output_tokens: list[int], engine: str) -> None:
         context = np.asarray(prompt_tokens + output_tokens, dtype=np.int64)

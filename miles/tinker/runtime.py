@@ -25,6 +25,9 @@ from tinker.types.topk_logprobs import MASK_LOGPROB
 
 logger = logging.getLogger(__name__)
 
+# A pinned engine that keeps failing hands its sample to the router after this many attempts.
+_PINNED_ENGINE_ATTEMPTS = 3
+
 # internal datum key -> trainer batch key
 DATUM_TO_BATCH_KEYS = {"weights": "loss_weights", "advantages": "advantages", "sampling_logprobs": "rollout_log_probs"}
 
@@ -271,6 +274,19 @@ class MilesBackend:
             return self.router_url
         return self.rank_affinity.choose_engine(prompt_tokens, loads)
 
+    async def _generate(self, prompt_tokens: list[int], request: dict, num_samples: int) -> tuple[str, list[dict]]:
+        """Sample on the rollout's engine; when that engine keeps failing, the router places the request."""
+        requests = [_with_sample_seed(request, index) for index in range(num_samples)]
+        engine_url = await self._choose_engine(prompt_tokens)
+        if engine_url != self.router_url:
+            try:
+                return engine_url, await asyncio.gather(
+                    *[post(f"{engine_url}/generate", item, max_retries=_PINNED_ENGINE_ATTEMPTS) for item in requests]
+                )
+            except httpx.HTTPError as error:
+                logger.warning(f"rank affinity: {engine_url} failed ({error}); the router places this sample")
+        return self.router_url, await asyncio.gather(*[post(f"{self.router_url}/generate", item) for item in requests])
+
     async def sample(
         self, payload: dict, lora_name: str | None, lora_path: str | None = None, sequence_ids: list[str] | None = None
     ) -> dict:
@@ -282,9 +298,8 @@ class MilesBackend:
                 # the engine returns routes only past the prompt prefix an earlier sample already recorded
                 parent = records.route_parent(prompt_hashes, lora_name)
                 request["routed_experts_start_len"] = parent.covered_len if parent is not None else 0
-        engine_url = await self._choose_engine(payload["prompt_tokens"])
         try:
-            responses = await asyncio.gather(*[post(f"{engine_url}/generate", _with_sample_seed(request, index)) for index in range(payload["num_samples"])])
+            engine_url, responses = await self._generate(payload["prompt_tokens"], request, payload["num_samples"])
         except httpx.HTTPError as error:
             return {"error": str(error)}
         sequences = [_to_sequence(response) for response in responses]
