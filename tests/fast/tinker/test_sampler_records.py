@@ -5,9 +5,11 @@ import logging
 import numpy as np
 import pybase64
 import pytest
+import torch
 
 from miles.tinker.core.types import UserInputError
-from miles.tinker.runtime import MilesBackend, _build_train_data
+from miles.tinker.expert_load import expert_counts
+from miles.tinker.runtime import MilesBackend, _batches, _build_train_data
 from miles.tinker.sampler_records import SamplerRecordStore, SequenceRecord, parse_supports, prefix_hashes
 
 NUM_LAYERS, TOPK = 2, 3
@@ -318,3 +320,189 @@ class TestTrainData:
         with caplog.at_level(logging.WARNING, logger="miles.tinker.runtime"):
             _build_train_data([(0, _datum(DIALOGUE, advantages=advantages))], sampler_records=backend.sampler_records)
         assert "2/5 loss positions in 1 datums have no engine support" in caplog.text
+
+
+def _b64(array: np.ndarray) -> str:
+    return pybase64.b64encode(array.tobytes()).decode("ascii")
+
+
+class KeepingEngine(FakeEngine):
+    """A request with keep_rollout_record leaves its routes and supports in the engine under its rid.
+
+    Its response carries each output token's selected log-probability instead of its support.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.kept: dict[str, dict] = {}
+        self.collected: list[list[str]] = []
+
+    async def post(self, url: str, request: dict, max_retries: int = 60) -> dict:
+        if url.endswith("/collect_rollout_records"):
+            self.collected.append(list(request["rids"]))
+            return {"records": {rid: self.kept.pop(rid) for rid in request["rids"] if rid in self.kept}}
+        if not self.outputs:
+            self.outputs.append(([0], [[0]]))  # a one-token greedy sample
+        response = await super().post(url, request)
+        if not request.get("keep_rollout_record"):
+            return response
+        meta = response["meta_info"]
+        kept = dict.fromkeys(["routes", "routes_shape", "support_lengths", "support_ids", "support_logprobs"])
+        kept["routes_start"] = request.get("routed_experts_start_len", 0)
+        if "routed_experts" in meta:
+            routes = np.frombuffer(pybase64.b64decode(meta.pop("routed_experts")), dtype=np.int32)
+            routes = routes.reshape(-1, NUM_LAYERS, TOPK).astype(np.int16)
+            kept["routes"], kept["routes_shape"] = _b64(routes), list(routes.shape)
+        if "output_token_sampling_mask" in meta:
+            rows, values = meta.pop("output_token_sampling_mask"), meta["output_token_sampling_logprobs"]
+            kept["support_lengths"] = _b64(np.array([len(row) for row in rows], dtype=np.int32))
+            kept["support_ids"] = _b64(np.array([token for row in rows for token in row], dtype=np.int32))
+            kept["support_logprobs"] = _b64(np.array([value for row in values for value in row], dtype=np.float32))
+            tokens = [entry[1] for entry in meta["output_token_logprobs"]]
+            meta["output_token_sampling_logprobs"] = [
+                row_values[row.index(token)] for row, row_values, token in zip(rows, values, tokens, strict=True)
+            ]
+        self.kept[request["rid"]] = kept
+        return response
+
+
+@pytest.fixture
+def keeping_engine(monkeypatch) -> KeepingEngine:
+    fake = KeepingEngine()
+    monkeypatch.setattr("miles.tinker.runtime.post", fake.post)
+    return fake
+
+
+def _collecting_backend(*, supports: bool = True, routes: bool = True) -> MilesBackend:
+    async def engine_urls() -> list[str]:
+        return ["http://engine"]
+
+    store = SamplerRecordStore(2**30, supports=supports, routes=routes, collect=True)
+    return MilesBackend(None, "http://router", num_layers=NUM_LAYERS, sampler_records=store, engine_urls=engine_urls)
+
+
+async def _train_data(backend: MilesBackend, datums: list[dict], loss_fn: str = "score_centering") -> dict:
+    """What forward_backward hands the trainer."""
+    slot_datums = [(0, datum) for datum in datums]
+    if backend.sampler_records.collect:
+        await backend._collect_rollout_records(datums)
+    return _build_train_data(slot_datums, sampler_records=backend.sampler_records, loss_fn=loss_fn)
+
+
+class TestCollection:
+    async def test_turns_leave_routes_and_supports_in_the_engine(self, keeping_engine):
+        backend = _collecting_backend()
+        result = await _sample(backend, keeping_engine, PROMPT, [(TURN_1, TURN_1_SUPPORTS)])
+        assert keeping_engine.requests[0]["rid"] == "seq-0-0" and keeping_engine.requests[0]["keep_rollout_record"]
+        assert result["sequences"][0]["logprobs"] == pytest.approx([-0.2, -0.1, -0.1])
+        record = backend.sampler_records.get("seq-0-0")
+        assert record.routes is None and record.support_ids is None
+        assert record.pending_routes and record.pending_supports
+        assert list(keeping_engine.kept) == ["seq-0-0"]
+
+    async def test_a_later_turn_still_requests_routes_past_the_recorded_prefix(self, keeping_engine):
+        backend = _collecting_backend()
+        await _dialogue(backend, keeping_engine)
+        starts = [request["routed_experts_start_len"] for request in keeping_engine.requests]
+        assert starts == [0, 0, len(PROMPT) + len(TURN_1) - 1]
+
+    async def test_collected_records_equal_the_per_turn_ones(self, engine):
+        per_turn = _backend()
+        await _dialogue(per_turn, engine)
+        expected = await _train_data(per_turn, [_datum(DIALOGUE)])
+
+        keeping = KeepingEngine()
+        collecting = _collecting_backend()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr("miles.tinker.runtime.post", keeping.post)
+            await _dialogue(collecting, keeping)
+            collected = await _train_data(collecting, [_datum(DIALOGUE)])
+        for key in ("rollout_routed_experts", "rollout_sampling_mask_ids", "rollout_sampling_mask_offsets"):
+            np.testing.assert_array_equal(np.asarray(collected[key][0]), np.asarray(expected[key][0]))
+        np.testing.assert_array_equal(
+            collected["rollout_sampling_mask_log_probs"][0].numpy(),
+            expected["rollout_sampling_mask_log_probs"][0].numpy(),
+        )
+
+    async def test_a_datum_collects_only_the_records_it_draws_on_and_only_once(self, keeping_engine):
+        backend = _collecting_backend()
+        await _dialogue(backend, keeping_engine)
+        await _sample(backend, keeping_engine, [9, 9], [([8], [[8]])])
+        await _train_data(backend, [_datum(DIALOGUE)])
+        # the dialogue's turns, not the unrelated sample nor the second sample of the first prompt
+        assert keeping_engine.collected == [["seq-2-0", "seq-0-0"]]
+        assert set(keeping_engine.kept) == {"seq-1-0", "seq-3-0"}
+        await _train_data(backend, [_datum(DIALOGUE)])
+        assert len(keeping_engine.collected) == 1, "collected payloads stay with the gateway's records"
+        assert backend.sampler_records.num_collected == 2
+
+    async def test_routes_the_engine_lost_are_recomputed_and_lost_supports_counted(self, keeping_engine, caplog):
+        backend = _collecting_backend()
+        await _dialogue(backend, keeping_engine)
+        del keeping_engine.kept["seq-0-0"]  # evicted before collection
+        advantages = [0.0] * 2 + [1.0] * 3 + [0.0] * 2 + [1.0] * 2
+        with caplog.at_level(logging.WARNING, logger="miles.tinker.runtime"):
+            train_data = await _train_data(backend, [_datum(DIALOGUE, advantages=advantages)])
+        np.testing.assert_array_equal(
+            train_data["rollout_routed_experts"][0], keeping_engine.routes("m@1", DIALOGUE[:-1])
+        )
+        recompute = keeping_engine.requests[-1]
+        assert recompute["input_ids"] == DIALOGUE[:-1] and recompute["sampling_params"]["max_new_tokens"] == 1
+        records = backend.sampler_records
+        assert (records.num_collected, records.num_missing, records.num_recomputed) == (1, 1, 1)
+        assert records.get("seq-2-0").parent is None, "the recomputed record covers the whole prefix"
+        assert "3/5 loss positions in 1 datums have no engine support" in caplog.text
+
+    async def test_a_failed_collection_counts_as_missing(self, keeping_engine, monkeypatch):
+        backend = _collecting_backend(routes=False)
+        await _sample(backend, keeping_engine, PROMPT, [(TURN_1, TURN_1_SUPPORTS)])
+
+        async def failing(url, request, max_retries=60):
+            raise RuntimeError("engine down")
+
+        monkeypatch.setattr("miles.tinker.runtime.post", failing)
+        train_data = await _train_data(backend, [_datum(PROMPT + TURN_1)])
+        assert "rollout_sampling_mask_ids" not in train_data
+        assert backend.sampler_records.num_missing == 1
+
+    async def test_collection_reads_every_engine(self, monkeypatch):
+        engines = {"http://a": KeepingEngine(), "http://b": KeepingEngine()}
+        serving = iter(engines.values())
+
+        async def post(url, request, max_retries=60):
+            engine = next(serving) if url == "http://router/generate" else engines[url.rsplit("/", 1)[0]]
+            return await engine.post(url, request)
+
+        async def engine_urls() -> list[str]:
+            return list(engines)
+
+        monkeypatch.setattr("miles.tinker.runtime.post", post)
+        backend = _collecting_backend(routes=False)
+        backend.engine_urls = engine_urls
+        engines["http://a"].outputs.append((TURN_1, TURN_1_SUPPORTS))
+        engines["http://b"].outputs.append(([8], [[8]]))
+        await backend.sample(_payload(PROMPT), "m@1", sequence_ids=["first"])
+        await backend.sample(_payload([9, 9]), "m@1", sequence_ids=["second"])
+        train_data = await _train_data(backend, [_datum(PROMPT + TURN_1)])
+        ids, offsets = train_data["rollout_sampling_mask_ids"][0], train_data["rollout_sampling_mask_offsets"][0]
+        assert _rows(ids.numpy(), offsets.numpy()) == [[], [], *TURN_1_SUPPORTS]
+        assert [engine.collected for engine in engines.values()] == [[["first"]], [["first"]]]
+
+    async def test_forward_backward_trains_and_measures_expert_load_on_collected_routes(self, keeping_engine):
+        backend = _collecting_backend()
+        backend.moe_layers, backend.num_experts = [0, 1], 64
+        await _dialogue(backend, keeping_engine)
+        trained = {}
+
+        async def fake_call_trainer(method, batch_id, train_data):
+            trained.update(train_data)
+            return [{"per_datum": [{"sample_index": 0, "loss": 1.0, "logprobs": torch.zeros(len(DIALOGUE) - 1)}]}]
+
+        backend._call_trainer = fake_call_trainer
+        [output] = await backend.forward_backward(1, [(0, _datum(DIALOGUE))], "cross_entropy", {})
+        expected = keeping_engine.routes("m@1", DIALOGUE[:-1])
+        np.testing.assert_array_equal(trained["rollout_routed_experts"][0], expected)
+        np.testing.assert_array_equal(output["expert_counts"], expert_counts(expected, [0, 1], 64))
+
+    def test_collection_calls_split_by_rows(self):
+        assert _batches(["a", "b", "c", "d"], [3, 2, 9, 1], max_size=5) == [["a", "b"], ["c"], ["d"]]

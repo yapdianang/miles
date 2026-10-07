@@ -7,6 +7,7 @@ import os
 import tempfile
 import uuid
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import httpx
@@ -17,7 +18,7 @@ import torch
 from miles.ray.rollout.train_data_conversion import ROLLOUT_DATA_VALUE_SPEC
 from miles.tinker.core.types import UserInputError
 from miles.tinker.expert_load import expert_counts
-from miles.tinker.sampler_records import SamplerRecordStore, SequenceRecord, parse_supports, prefix_hashes
+from miles.tinker.sampler_records import SamplerRecordStore, SequenceRecord, parse_supports, prefix_hashes, support_csr
 from miles.utils import object_store
 from miles.utils.http_utils import post
 from tinker.types.topk_logprobs import MASK_LOGPROB
@@ -26,6 +27,9 @@ logger = logging.getLogger(__name__)
 
 # internal datum key -> trainer batch key
 DATUM_TO_BATCH_KEYS = {"weights": "loss_weights", "advantages": "advantages", "sampling_logprobs": "rollout_log_probs"}
+
+# route and support rows one /collect_rollout_records call asks an engine for
+_COLLECT_ROWS_PER_CALL = 1 << 16
 
 
 def _tokens_key(tokens: list[int]) -> bytes:
@@ -175,6 +179,7 @@ class MilesBackend:
         sampler_records: SamplerRecordStore | None = None,
         moe_layers: list[int] | None = None,
         num_experts: int | None = None,
+        engine_urls: Callable[[], Awaitable[list[str]]] | None = None,
     ) -> None:
         self.trainer = trainer
         self.router_url = router_url
@@ -185,6 +190,10 @@ class MilesBackend:
         self.sampler_records = sampler_records
         self.moe_layers = moe_layers
         self.num_experts = num_experts
+        # with sampler_records.collect: the engines /collect_rollout_records reads from
+        self.engine_urls = engine_urls
+        # adapter backfill paths, for recomputing the routes of a sample whose records the engine lost
+        self._lora_paths: dict[str, str] = {}
 
     async def trainer_dead(self) -> bool:
         return await self.trainer.has_errored_cell()
@@ -202,9 +211,10 @@ class MilesBackend:
         return await self._execute_batch("forward_only", batch_id, slot_datums, loss_fn, loss_fn_config)
 
     async def _execute_batch(self, method: str, batch_id: int, slot_datums: list, loss_fn: str, loss_fn_config: dict) -> list[dict] | dict:
-        train_data = _build_train_data(
-            _pad_to_dp_multiple(slot_datums, self.dp_size), self.routed_experts, self.sampler_records, loss_fn
-        )
+        padded = _pad_to_dp_multiple(slot_datums, self.dp_size)
+        if self.sampler_records is not None and self.sampler_records.collect:
+            await self._collect_rollout_records([datum for _, datum in padded])
+        train_data = _build_train_data(padded, self.routed_experts, self.sampler_records, loss_fn)
         train_data["loss_fn"] = loss_fn
         train_data["loss_fn_config"] = loss_fn_config
         worker_results = await self._call_trainer(method, batch_id, train_data)
@@ -234,6 +244,110 @@ class MilesBackend:
             return await getattr(self.trainer, method)(batch_id=batch_id, data_ref=data_ref)
         finally:
             store.remove(data_ref)
+
+    async def _collect_rollout_records(self, datums: list[dict]) -> None:
+        """Fetch what the engines kept for the samples these datums train on; recompute routes they lost."""
+        records = self.sampler_records
+        hashes = [
+            prefix_hashes(np.asarray(datum["tokens"][: datum["target_len"]], dtype=np.int64)) for datum in datums
+        ]
+        pending = list(
+            dict.fromkeys(
+                record
+                for datum, datum_hashes in zip(datums, hashes, strict=True)
+                for record in records.pending_records(datum, datum_hashes)
+            )
+        )
+        kept = await self._collect_from_engines([record.sequence_id for record in pending], _row_counts(pending))
+        for record in pending:
+            records.attach(record, *self._decode_kept(kept.get(record.sequence_id), record))
+        missing = sum(record.sequence_id not in kept for record in pending)
+        recomputed = 0
+        if records.routes:
+            for datum, datum_hashes in zip(datums, hashes, strict=True):
+                record = records.route_record(datum, datum_hashes)
+                if record is None or records.datum_routes(datum, datum_hashes) is not None:
+                    continue
+                routes = await self._recompute_routes(datum["tokens"][: datum["target_len"]], record.lora_name)
+                if routes is not None:
+                    records.replace_routes(record, routes)
+                    recomputed += 1
+        records.num_collected += len(pending) - missing
+        records.num_missing += missing
+        records.num_recomputed += recomputed
+        if pending or recomputed:
+            logger.info(
+                f"rollout records: collected {len(pending) - missing}/{len(pending)}, routes recomputed for "
+                f"{recomputed}/{len(datums)} datums (run totals: {records.num_collected} collected, "
+                f"{records.num_missing} missing, {records.num_recomputed} recomputed)"
+            )
+
+    async def _collect_from_engines(self, rids: list[str], row_counts: list[int]) -> dict[str, dict]:
+        """Every engine returns and drops what it kept for these rids, a bounded number of rows per call."""
+        urls = await self.engine_urls() if rids else []
+        kept = {}
+        for batch in _batches(rids, row_counts, _COLLECT_ROWS_PER_CALL):
+            responses = await asyncio.gather(
+                *[post(f"{url}/collect_rollout_records", {"rids": batch}, max_retries=1) for url in urls],
+                return_exceptions=True,
+            )
+            for url, response in zip(urls, responses, strict=True):
+                if isinstance(response, BaseException):
+                    logger.warning(f"rollout records: collecting {len(batch)} records from {url} failed: {response!r}")
+                else:
+                    kept.update(response["records"])
+        return kept
+
+    def _decode_kept(self, kept: dict | None, record: SequenceRecord) -> tuple[np.ndarray | None, tuple | None]:
+        """The record's routes and CSR supports as the engine kept them, each None if absent or inconsistent."""
+        if kept is None:
+            return None, None
+        routes = supports = None
+        if record.pending_routes and kept["routes"] is not None:
+            routes = _b64_array(kept["routes"], np.int16).reshape(kept["routes_shape"])
+            if kept["routes_start"] != record.routes_start or len(routes) != record.covered_len - record.routes_start:
+                logger.warning(
+                    f"routing replay: kept routes from {kept['routes_start']} with {len(routes)} rows do not cover "
+                    f"[{record.routes_start}, {record.covered_len}); not recorded"
+                )
+                routes = None
+        if record.pending_supports and kept["support_lengths"] is not None:
+            try:
+                ids, offsets, log_probs, _ = support_csr(
+                    record.tokens,
+                    _b64_array(kept["support_lengths"], np.int32).astype(np.int64),
+                    _b64_array(kept["support_ids"], np.int32),
+                    _b64_array(kept["support_logprobs"], np.float32),
+                )
+                supports = ids, offsets, log_probs
+            except ValueError as error:
+                logger.warning(f"sampling-support replay: kept supports of {record.sequence_id} are invalid: {error}")
+        return routes, supports
+
+    async def _recompute_routes(self, tokens: list[int], lora_name: str | None) -> np.ndarray | None:
+        """Routes of ``tokens`` from a one-token greedy sample, which reuses the engine's cached prefix."""
+        rid = f"routes-{uuid.uuid4().hex}"
+        request = {
+            "rid": rid,
+            "input_ids": tokens,
+            "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
+            "return_routed_experts": True,
+            "keep_rollout_record": True,
+        }
+        if lora_name is not None:
+            request["lora_path"] = lora_name
+            if lora_name in self._lora_paths:
+                request["lora_backfill_paths"] = {lora_name: self._lora_paths[lora_name]}
+        try:
+            await post(f"{self.router_url}/generate", request)
+        except httpx.HTTPError as error:
+            logger.warning(f"routing replay: recomputing routes failed: {error!r}")
+            return None
+        kept = (await self._collect_from_engines([rid], [len(tokens)])).get(rid)
+        if kept is None or kept["routes"] is None:
+            return None
+        routes = _b64_array(kept["routes"], np.int16).reshape(kept["routes_shape"])
+        return routes if len(routes) == len(tokens) else None
 
     async def optim_step(self, adam_params_by_slot: dict[int, dict]) -> dict[int, dict]:
         worker_results = await self.trainer.optim_step(adam_params_by_slot=adam_params_by_slot)
@@ -272,8 +386,16 @@ class MilesBackend:
                 # the engine returns routes only past the prompt prefix an earlier sample already recorded
                 parent = records.route_parent(prompt_hashes, lora_name)
                 request["routed_experts_start_len"] = parent.covered_len if parent is not None else 0
+        sequence_ids = sequence_ids or [f"seq-{uuid.uuid4().hex}" for _ in range(payload["num_samples"])]
+        sample_requests = [_with_sample_seed(request, index) for index in range(payload["num_samples"])]
+        if records is not None and records.collect:
+            # the engine keeps each sample's routes and supports under its sequence id until collected
+            for sample_request, sequence_id in zip(sample_requests, sequence_ids, strict=True):
+                sample_request.update(rid=sequence_id, keep_rollout_record=True)
+            if lora_name is not None and lora_path is not None:
+                self._lora_paths[lora_name] = lora_path
         try:
-            responses = await asyncio.gather(*[post(f"{self.router_url}/generate", _with_sample_seed(request, index)) for index in range(payload["num_samples"])])
+            responses = await asyncio.gather(*[post(f"{self.router_url}/generate", sample_request) for sample_request in sample_requests])
         except httpx.HTTPError as error:
             return {"error": str(error)}
         sequences = [_to_sequence(response) for response in responses]
@@ -284,7 +406,6 @@ class MilesBackend:
             for sequence, response in zip(sequences, responses, strict=True):
                 self._cache_routes(payload["prompt_tokens"], sequence["tokens"], response)
         if records is not None and payload["prompt_tokens"]:
-            sequence_ids = sequence_ids or [f"seq-{uuid.uuid4().hex}" for _ in sequences]
             try:
                 self._record_samples(
                     payload["prompt_tokens"], prompt_hashes, lora_name, parent, sequence_ids, sequences, responses, request
@@ -325,12 +446,17 @@ class MilesBackend:
             record = SequenceRecord(
                 sequence_id, lora_name, len(prompt_tokens), np.asarray(sequence["tokens"], dtype=np.int32), parent=parent
             )
-            if request.get("return_sampling_mask"):
+            if request.get("return_sampling_mask") and records.collect:
+                sequence["logprobs"] = _selected_logprobs(meta["output_token_sampling_logprobs"], sequence["tokens"])
+                record.pending_supports = True
+            elif request.get("return_sampling_mask"):
                 ids, offsets, log_probs, sequence["logprobs"] = parse_supports(
                     sequence["tokens"], meta["output_token_sampling_mask"], meta["output_token_sampling_logprobs"]
                 )
                 record.support_ids, record.support_offsets, record.support_log_probs = ids, offsets, log_probs
-            if records.routes:
+            if records.routes and records.collect:
+                record.pending_routes = True
+            elif records.routes:
                 record.routes = self._decode_routes(meta["routed_experts"], record)
             records.put(record, int(prompt_hashes[-1]))
 
@@ -402,6 +528,34 @@ def _draws_from_support(sampling_params: dict) -> bool:
             "top_p below 1 needs a top_k bound: the engine returns sampling supports only under a finite top_k"
         )
     return False
+
+
+def _selected_logprobs(values: list[float], tokens: list[int]) -> list[float]:
+    """The engine kept the supports; each output token's support-renormalized log-probability came back."""
+    if len(values) != len(tokens):
+        raise ValueError(f"{len(values)} selected sampling log-probabilities for {len(tokens)} output tokens")
+    return values
+
+
+def _b64_array(encoded: str, dtype) -> np.ndarray:
+    return np.frombuffer(pybase64.b64decode(encoded.encode("ascii")), dtype=dtype)
+
+
+def _row_counts(records: list[SequenceRecord]) -> list[int]:
+    """Route rows plus support rows the engine keeps for each record."""
+    return [record.covered_len - record.routes_start + len(record.tokens) for record in records]
+
+
+def _batches(items: list, sizes: list[int], max_size: int) -> list[list]:
+    """Consecutive runs of ``items`` whose sizes sum to at most ``max_size``; a larger item runs alone."""
+    batches, total = [], max_size
+    for item, size in zip(items, sizes, strict=True):
+        if total + size > max_size:
+            batches.append([])
+            total = 0
+        batches[-1].append(item)
+        total += size
+    return batches
 
 
 def _slot_failure(worker_results: list) -> dict | None:

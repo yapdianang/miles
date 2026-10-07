@@ -91,6 +91,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # Fused loss (section 6.4): the loss scores hidden states against the output weight in 4096-row chunks
     # that backward recomputes, so the trainer never holds [tokens, vocab/TP] logits.
     fused_loss: bool = True
+    # Section 6.4 context caching: each engine keeps routes and supports in this much host memory until a
+    # trained datum collects them; 0 returns them with every sample.
+    rollout_record_cache_gb: float = 0.0
     extra_args: str = ""
 
     def __post_init__(self) -> None:
@@ -197,6 +200,8 @@ def _serve(args: ScriptArgs) -> None:
         replay_args += "--tinker-routed-expert-deltas "
     if args.sampling_support_replay:
         replay_args += "--tinker-sampling-support-replay "
+    if args.rollout_record_cache_gb > 0:
+        replay_args += f"--sglang-rollout-record-cache-gb {args.rollout_record_cache_gb} "
     loss_args = "--tinker-fused-loss --log-probs-chunk-size 4096 " if args.fused_loss else ""
     train_args = (
         f"{checkpoint_args}{lora_args}{tinker_args}{topology_args}{parallel_args}{batching_args}"

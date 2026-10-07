@@ -10,6 +10,10 @@ its last token are a prefix of this record's prompt. The engine records a cached
 token's routes once, when it first computes them, so the parent chain concatenates to the
 routes of the full sequence. A new adapter version prefills afresh, so parents never cross
 adapters.
+
+With ``collect``, the engine keeps each sample's routes and supports under its sequence id
+(``--sglang-rollout-record-cache-gb``); a record holds only its tokens until a datum that draws
+on it is trained, when ``attach`` fills in what the engine returned.
 """
 
 from collections import OrderedDict
@@ -50,6 +54,17 @@ class SequenceRecord:
     routes: np.ndarray | None = None
     parent: "SequenceRecord | None" = None
     children: list["SequenceRecord"] = field(default_factory=list)
+    # The engine still keeps these parts of the record.
+    pending_routes: bool = False
+    pending_supports: bool = False
+
+    @property
+    def has_routes(self) -> bool:
+        return self.routes is not None or self.pending_routes
+
+    @property
+    def has_supports(self) -> bool:
+        return self.support_ids is not None or self.pending_supports
 
     @property
     def covered_len(self) -> int:
@@ -111,11 +126,14 @@ Segment = tuple[int, SequenceRecord, int, int]
 class SamplerRecordStore:
     """Records of recent samples by sequence id and by token prefix, evicted oldest chain first."""
 
-    def __init__(self, max_bytes: int, *, supports: bool, routes: bool) -> None:
+    def __init__(self, max_bytes: int, *, supports: bool, routes: bool, collect: bool = False) -> None:
         self.max_bytes = max_bytes
         self.supports = supports
         self.routes = routes
+        self.collect = collect
         self.num_bytes = 0
+        # collection outcomes: records filled, records the engine no longer held, datums whose routes were recomputed
+        self.num_collected = self.num_missing = self.num_recomputed = 0
         self._lru: OrderedDict[SequenceRecord, None] = OrderedDict()
         self._by_sequence: dict[str, SequenceRecord] = {}
         self._by_prompt = _KeyIndex()
@@ -132,14 +150,14 @@ class SamplerRecordStore:
         """The latest routed record of this adapter covering the longest prefix of the prompt."""
         for index in self._by_covered.hits(prompt_hashes)[::-1].tolist():
             for record in reversed(self._by_covered.get(int(prompt_hashes[index]))):
-                if record.lora_name == lora_name and record.covered_len == index + 1 and record.routes is not None:
+                if record.lora_name == lora_name and record.covered_len == index + 1 and record.has_routes:
                     return record
         return None
 
     def put(self, record: SequenceRecord, prompt_hash: int) -> None:
         if record.parent is not None and record.parent not in self._lru:
             # evicted while the engine sampled: the routes before routes_start are gone
-            record.parent, record.routes = None, None
+            record.parent, record.routes, record.pending_routes = None, None, False
         if record.parent is not None:
             record.parent.children.append(record)
             for ancestor in reversed(list(record.parent.chain())):
@@ -171,34 +189,78 @@ class SamplerRecordStore:
             del self._lru[record]
             self.num_bytes -= record.nbytes
 
+    def attach(self, record: SequenceRecord, routes: np.ndarray | None, supports: tuple | None) -> None:
+        """Fill a pending record with what the engine kept; a None part stays missing."""
+        held = record in self._lru
+        if held:
+            self.num_bytes -= record.nbytes
+        if record.pending_routes:
+            record.routes = routes
+        if record.pending_supports and supports is not None:
+            record.support_ids, record.support_offsets, record.support_log_probs = supports
+        record.pending_routes = record.pending_supports = False
+        if held:
+            self.num_bytes += record.nbytes
+
+    def replace_routes(self, record: SequenceRecord, routes: np.ndarray) -> None:
+        """Routes of the record's whole covered prefix, recomputed: it no longer builds on its parent."""
+        if record.parent is not None:
+            record.parent.children.remove(record)
+            record.parent = None
+        held = record in self._lru
+        if held:
+            self.num_bytes -= record.nbytes
+        record.routes, record.pending_routes = routes, False
+        if held:
+            self.num_bytes += record.nbytes
+
+    def pending_records(self, datum: dict, hashes: np.ndarray) -> list[SequenceRecord]:
+        """Records the datum's routes and supports draw on whose payload the engine still keeps."""
+        records = []
+        if self.routes and (record := self.route_record(datum, hashes)) is not None:
+            records.extend(record.chain())
+        if self.supports:
+            records.extend(record for _, record, _, _ in self._segments(datum, hashes))
+        return [record for record in records if record.pending_routes or record.pending_supports]
+
     # -------- per-datum assembly --------
 
-    def datum_routes(self, datum: dict, hashes: np.ndarray) -> np.ndarray | None:
-        """Routes of ``tokens[:-1]`` from the parent chain of the sample that ends the datum, if complete."""
+    def route_record(self, datum: dict, hashes: np.ndarray) -> SequenceRecord | None:
+        """The routed sample whose output ends the datum: the provenance's last span, else the latest match."""
         num_inputs = datum["target_len"]
         if not num_inputs:
             return None
         record = self._provenance_last_record(datum)
-        if record is None or record.covered_len != num_inputs or record.routes is None:
+        if record is None or record.covered_len != num_inputs or not record.has_routes:
             matches = [
                 candidate
                 for candidate in self._by_covered.get(int(hashes[-1]))
-                if candidate.covered_len == num_inputs and candidate.routes is not None
+                if candidate.covered_len == num_inputs and candidate.has_routes
             ]
             record = matches[-1] if matches else None
+        return record
+
+    def datum_routes(self, datum: dict, hashes: np.ndarray) -> np.ndarray | None:
+        """Routes of ``tokens[:-1]`` from the parent chain of the sample that ends the datum, if complete."""
+        record = self.route_record(datum, hashes)
         if record is None:
             return None
-        routes = np.concatenate([link.routes for link in reversed(list(record.chain()))])
-        return routes if len(routes) == num_inputs else None
+        chain = list(record.chain())
+        if any(link.routes is None for link in chain):
+            return None
+        routes = np.concatenate([link.routes for link in reversed(chain)])
+        return routes if len(routes) == datum["target_len"] else None
 
     def datum_supports(self, datum: dict, hashes: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """CSR ``(ids, offsets, log_probs)`` over the datum's targets; rows the engine did not sample are empty."""
+        segments = [segment for segment in self._segments(datum, hashes) if segment[1].support_ids is not None]
+        return _assemble(len(datum["target_tokens"]), segments)
+
+    def _segments(self, datum: dict, hashes: np.ndarray) -> list[Segment]:
         targets = np.asarray(datum["target_tokens"], dtype=np.int64)
         if datum.get("provenance") is not None:
-            segments = self._provenance_segments(datum["provenance"][1], targets)
-        else:
-            segments = self._prefix_segments(np.asarray(datum["tokens"], dtype=np.int64), targets, hashes)
-        return _assemble(len(targets), segments)
+            return self._provenance_segments(datum["provenance"][1], targets)
+        return self._prefix_segments(np.asarray(datum["tokens"], dtype=np.int64), targets, hashes)
 
     def _provenance_last_record(self, datum: dict) -> SequenceRecord | None:
         """The sample whose output ends the datum, as the client's provenance names it."""
@@ -215,7 +277,7 @@ class SamplerRecordStore:
         segments, row = [], 0
         for kind, sequence_id, offset, length in loss_spans:
             record = self._by_sequence.get(sequence_id)
-            if kind == "sampled" and record is not None and record.support_ids is not None:
+            if kind == "sampled" and record is not None and record.has_supports:
                 count = max(0, min(length, len(record.tokens) - offset))
                 agrees = targets[row : row + count] == record.tokens[offset : offset + count]
                 for start, end in _true_runs(agrees):
@@ -250,7 +312,7 @@ def _longest_match(
     and how many targets it covers: coverage also stops where a target leaves the sampled output."""
     best, best_count, available = None, 0, 0
     for record in records:
-        if record.prompt_len != prompt_len or record.support_ids is None:
+        if record.prompt_len != prompt_len or not record.has_supports:
             continue
         record_available = min(len(record.tokens), len(targets) - prompt_len + 1)
         count = _agreement(record.tokens[:record_available], tokens[prompt_len : prompt_len + record_available])
@@ -297,15 +359,25 @@ def parse_supports(
     if len(supports) != len(output_tokens) or len(support_log_probs) != len(output_tokens):
         raise ValueError(f"{len(supports)} sampling supports for {len(output_tokens)} output tokens")
     lengths = np.fromiter(map(len, supports), dtype=np.int64, count=len(supports))
-    if (lengths == 0).any() or (
-        np.fromiter(map(len, support_log_probs), dtype=np.int64, count=len(lengths)) != lengths
-    ).any():
+    if (np.fromiter(map(len, support_log_probs), dtype=np.int64, count=len(lengths)) != lengths).any():
+        raise ValueError("sampling supports and their log-probabilities must be non-empty and aligned")
+    ids = np.fromiter((token for row in supports for token in row), dtype=np.int32, count=int(lengths.sum()))
+    log_probs = np.fromiter((value for row in support_log_probs for value in row), dtype=np.float32, count=len(ids))
+    ids, offsets, log_probs, sampled = support_csr(output_tokens, lengths, ids, log_probs)
+    return ids, offsets, log_probs, sampled.astype(np.float64).tolist()
+
+
+def support_csr(
+    output_tokens: list[int], lengths: np.ndarray, ids: np.ndarray, log_probs: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Checked CSR ``(ids, offsets, log_probs)`` of per-token support rows and each sampled token's log-probability."""
+    if len(lengths) != len(output_tokens):
+        raise ValueError(f"{len(lengths)} sampling supports for {len(output_tokens)} output tokens")
+    if (lengths == 0).any() or len(ids) != lengths.sum() or len(log_probs) != len(ids):
         raise ValueError("sampling supports and their log-probabilities must be non-empty and aligned")
     offsets = np.zeros(len(lengths) + 1, dtype=np.int64)
     np.cumsum(lengths, out=offsets[1:])
-    ids = np.fromiter((token for row in supports for token in row), dtype=np.int32, count=int(offsets[-1]))
-    log_probs = np.fromiter((value for row in support_log_probs for value in row), dtype=np.float32, count=len(ids))
     sampled = ids == np.repeat(np.asarray(output_tokens, dtype=np.int32), lengths)
     if sampled.sum() != len(lengths) or (len(lengths) and not np.logical_or.reduceat(sampled, offsets[:-1]).all()):
         raise ValueError("each sampled token must occur exactly once in its sampling support")
-    return ids, offsets, log_probs, log_probs[sampled].astype(np.float64).tolist()
+    return ids, offsets, log_probs, log_probs[sampled]
