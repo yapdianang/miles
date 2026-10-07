@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+from megatron.bridge.peft.multi_lora_layers import expose_adapter_slot
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.emerging_optimizers import _create_emerging_optimizer
 from megatron.training.arguments import parse_args
@@ -226,6 +227,7 @@ class _Adapter(torch.nn.Module):
         super().__init__()
         self.linear_in, self.linear_out = torch.nn.Linear(1, 1, bias=False), torch.nn.Linear(1, 1, bias=False)
         self.linear_in.weight, self.linear_out.weight = torch.nn.Parameter(a.clone()), torch.nn.Parameter(b.clone())
+        self.alpha = 1.0
 
 
 def _dora_layer(w0, factors, magnitudes=None, *, rank, input_is_parallel=False, sequence_parallel=False):
@@ -325,8 +327,9 @@ def test_exported_dora_delta_is_d_minus_one_in_column_zero_of_lora_b(tp1, factor
     b, a, _ = factors
     layer = _dora_layer(torch.randn(M, N), [(a, b), (a, b)], [torch.rand(M) + 0.5] * 2, rank=R)
     expected = (layer.adapters[1].weight_magnitude / layer.row_norm(1) - 1).detach()
-    with dora.dora_deltas_as_lora_b([layer], 1):
-        exported = layer.adapters[1].linear_out.weight.detach().clone()
+    # In the order the adapter export enters them: the delta needs the slot list that exposure hides
+    with dora.dora_deltas_as_lora_b([layer], 1), expose_adapter_slot([layer], 1):
+        exported = layer.adapter.linear_out.weight.detach().clone()
     assert torch.equal(exported[:, 0], expected) and not exported[:, 1:].any()
     assert torch.equal(layer.adapters[1].linear_out.weight, b)
 
