@@ -44,6 +44,12 @@ app = typer.Typer()
 
 # SGLang slices the official fused qkv_proj into 4 kv-head shards, so engine attention TP is 4.
 _ENGINE_GPUS = 4
+# Muown for LoRA (MiMo-V2.6 section 5.1): DoRA row magnitudes on Adam, Muon on the LoRA tangent space.
+# Extra scale 0.1 is the paper's 0.5 times Muown's Adam-matching 0.2.
+_MUOWN_ARGS = (
+    "--lora-type dora --muon-momentum 0.95 --muon-nesterov --muon-num-ns-steps 10 --muon-coefficient-type simple "
+    "--muon-extra-scale-factor 0.1 "
+)
 
 
 @dataclass
@@ -72,6 +78,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     lora_alpha: int = 32
     n_adapters: int = 4
     target_modules: str = "attn"
+    # "muown": clients send section 5.1's lr 3e-6, betas 0.95/0.95, eps 1e-8, no weight decay, clip 1.0 as AdamParams.
+    optimizer: str = "adam"
 
     tinker_port: int = 10613
     # 256K needs fused_loss: the logits path runs the TP4 trainer out of memory on a 250K-token datum.
@@ -121,6 +129,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
             raise ValueError("trainer GPUs must be a multiple of tp * cp")
         if self.target_modules != "attn":
             raise ValueError("MXFP4 engine experts cannot take LoRA; train attention adapters only")
+        if self.optimizer not in ("adam", "muown"):
+            raise ValueError(f"optimizer must be adam or muown, not {self.optimizer}")
 
 
 def _is_converted(path: str) -> bool:
@@ -216,8 +226,10 @@ def _serve(args: ScriptArgs) -> None:
     sglang_args = _sglang_args(args)
     model_args = (
         "--attention-dropout 0.0 --hidden-dropout 0.0 --attention-softmax-in-fp32 --attention-backend fused "
-        "--accumulate-allreduce-grads-in-fp32 --optimizer adam --lr 1e-6 "
+        f"--accumulate-allreduce-grads-in-fp32 --optimizer {args.optimizer} --lr 1e-6 "
     )
+    if args.optimizer == "muown":
+        model_args += _MUOWN_ARGS
     replay_args = "--use-rollout-routing-replay " if args.routing_replay else ""
     if args.routing_replay and args.routed_expert_deltas:
         replay_args += "--tinker-routed-expert-deltas "

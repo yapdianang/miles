@@ -43,8 +43,9 @@ def add_lora_arguments(parser):
         "--lora-type",
         type=str,
         default="lora",
-        choices=["lora", "canonical_lora"],
-        help="LoRA variant to use: 'lora' (standard) or 'canonical_lora' (split Q/K/V) (default: lora)",
+        choices=["lora", "canonical_lora", "dora"],
+        help="LoRA variant to use: 'lora' (standard), 'canonical_lora' (split Q/K/V) or 'dora' (multi-LoRA only: "
+        "per-slot row magnitudes g, W = g (W0 + s B A) / ||W0 + s B A||) (default: lora)",
     )
     parser.add_argument(
         "--target-modules",
@@ -226,6 +227,7 @@ def validate_multi_lora_args(args: Any) -> None:
     """Set ``args.multi_lora``, then validate the trainer-side constraints of
     the slot machinery. A no-op for normal runs."""
     args.multi_lora = getattr(args, "multi_lora_n_adapters", 0) > 0
+    assert args.multi_lora or getattr(args, "lora_type", "lora") != "dora", "--lora-type dora needs multi-LoRA slots"
     if not args.multi_lora:
         return
 
@@ -272,8 +274,14 @@ def validate_multi_lora_args(args: Any) -> None:
         "(sample-mean); per-token loss normalization would make adapter batch weights "
         "depend on batch contents. Drop --calculate-per-token-loss."
     )
-    assert (getattr(args, "optimizer", "adam") or "adam").lower() == "adam", (
-        "Multi-LoRA requires --optimizer adam: the per-slot SlotOptimizer only "
-        f"implements Adam semantics; got --optimizer {args.optimizer}"
+    assert (getattr(args, "optimizer", "adam") or "adam").lower() in ("adam", "muown"), (
+        "Multi-LoRA requires --optimizer adam or muown: the per-slot SlotOptimizer only "
+        f"implements those; got --optimizer {args.optimizer}"
     )
+    if args.lora_type == "dora":
+        # The engine scales each adapter's LoRA output rows by the exported d - 1 (lora_dora_delta)
+        assert hasattr(
+            args, "sglang_enable_lora_dora"
+        ), "--lora-type dora needs an SGLang build with --enable-lora-dora (docker/compat/sglang_lora_dora.patch)"
+        args.sglang_enable_lora_dora = True
     args.megatron_to_hf_mode = "bridge"

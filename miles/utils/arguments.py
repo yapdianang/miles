@@ -132,6 +132,13 @@ def reset_arg(parser, name, **kwargs):
         parser.add_argument(name, **kwargs)
 
 
+def add_arg_choices(parser, name, *choices):
+    """Accept more values for an existing argument with choices, such as a Megatron flag; no-op if it is absent."""
+    action = parser._option_string_actions.get(name)
+    if action is not None and action.choices is not None:
+        action.choices = [*action.choices, *choices]
+
+
 _FT_CHOICES = ["rollout", "train"]
 _DEFAULT_FT_API_SERVER_PORT = 18080
 
@@ -139,6 +146,8 @@ _DEFAULT_FT_API_SERVER_PORT = 18080
 def get_miles_extra_args_provider(add_custom_arguments=None):
     def add_miles_arguments(parser):
         parser.set_defaults(entry="train")
+        # Before any partial parse below, which would otherwise reject the value
+        add_arg_choices(parser, "--optimizer", "muown")
 
         def add_run_uuid_arguments(parser):
             parser.add_argument(

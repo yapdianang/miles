@@ -59,11 +59,20 @@ class HfWeightIteratorBridge(MegatronHfWeightIteratorBase):
 
         from megatron.bridge.peft.multi_lora_layers import expose_adapter_slot
 
+        from ..lora.dora import DORA_DELTA_SUFFIX, dora_deltas_as_lora_b, iter_dora_layers
         from ..lora.slots import slice_lora_to_rank
 
         with expose_adapter_slot(self.model, adapter.slot):
-            named_tensors = self._export_current_adapter()
-        return [(h, slice_lora_to_rank(h, w, adapter.rank)) for h, w in named_tensors]
+            named_tensors = [(h, slice_lora_to_rank(h, w, adapter.rank)) for h, w in self._export_current_adapter()]
+        if next(iter_dora_layers(self.model), None) is not None:
+            # DoRA's d - 1 rides through the LoRA-B export in column 0, so it gets B's row layout
+            with dora_deltas_as_lora_b(self.model, adapter.slot), expose_adapter_slot(self.model, adapter.slot):
+                named_tensors += [
+                    (h.replace(".lora_B.weight", DORA_DELTA_SUFFIX), w[:, 0].contiguous())
+                    for h, w in self._export_current_adapter()
+                    if ".lora_B." in h
+                ]
+        return named_tensors
 
     def _export_current_adapter(self) -> list:
         with megatron_bridge_utils.patch_megatron_model(self.model):
