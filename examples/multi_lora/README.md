@@ -124,6 +124,38 @@ python examples/multi_lora/run_multi_tenant_example.py --base-model /root/models
 python examples/multi_lora/run_multi_tenant_example.py --base-model /root/models/Qwen3-30B-A3B --mode multi --clients 4
 ```
 
+## MiMo-V2.6-Flash dev loop and gates
+
+`serve_mimo_v26_flash_tinker.py prepare` builds the engine and trainer checkpoints that are missing
+(its docstring lists the commands). `tools/mimo_dev.py` runs the service on one B300 dev pod from
+`tools/mimo_dev_pod.yaml`; `restart`, `stop` and `gate` send this checkout's copy of the tools to the
+pod, and `sync` copies this checkout over the image's Miles checkout:
+
+```bash
+python examples/multi_lora/tools/mimo_dev.py up mimo-dev --node <node> --image <miles-mimo-tinker image>
+python examples/multi_lora/tools/mimo_dev.py sync mimo-dev        # only to test local changes the image lacks
+python examples/multi_lora/tools/mimo_dev.py restart mimo-dev [serve args, e.g. --sglang-mem-fraction-static 0.85]
+python examples/multi_lora/tools/mimo_dev.py gate mimo-dev <gate> [gate args]
+kubectl cp replay.json.gz mimo-dev:/root/replay.json.gz             # workload for the --workload gates
+```
+
+`tools/mimo_gates.py <gate> --base-url <gateway>` (`mimo_dev.py gate` adds `--base-url`) prints one
+JSON summary on stdout and one line on stderr; a gate with a bar exits 1 when it fails. d is the
+trainer − sampler log-prob of a sampled token, and k3 = mean(exp(d) − d − 1).
+
+| Gate | Measures | Bar |
+| --- | --- | --- |
+| `parity` | k3 and mean \|d\| before and after one LoRA update at top-p 0.97 / top-k 1024 | k3 ≤ 0.001 before and after |
+| `kl-decompose --workload W` | k3, mean \|d\| and mean d of prefill → repeated prefill, decode → prefill, prefill → trainer and decode → trainer at top-p 1.0 | decode → trainer k3 ≤ 0.0015 |
+| `parity-by-length --workload W` | top-p 0.97 k3 and mean \|d\| per prompt-length bucket | none |
+| `long-train --workload W` | forward and forward_backward time on the longest contexts | completes |
+| `replay --workload W [--copies N --concurrency C --env-delay S --engine-log L]` | trajectories/min, generated tok/s and turn latency; with `--engine-log`, the engine's prefix-cache hit rate during the replay | none |
+| `engine-stats [LOG ...]` | prefix-cache hit rate, decode tok/s, queue and DFlash accept length from SGLang batch log lines | none |
+
+A replay workload is a JSON (or `.json.gz`) list of trajectories; each trajectory is a list of
+turns `{"prompt": [token ids], "output_len": n}`. The service log is `/tmp/mimo-dev/service.log`
+in the pod. To compare launcher arms, run `restart` with each arm's serve args and then the gates.
+
 ## Supported inputs
 
 Training accepts text with 1-D loss inputs. 2-D soft targets, including SDFT,
