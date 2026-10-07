@@ -1,12 +1,15 @@
 """Final gate before a live MiMo-V2.6-Flash-RL run, on a dev pod booted from the integrated image.
 
 Restarts the pod's service once per phase with mimo_dev.py, runs each check in the pod, prints one line
-per check and writes one JSON summary; exits 1 unless every selected check passes.
+per check and writes one JSON summary; exits 1 unless every selected blocking check passes.
 
   base: launcher defaults (Adam) and --serve-args
     kl-decompose   mimo_gates kl-decompose at top-p 1.0: decode->trainer k3 <= 0.0015
     parity         mimo_gates parity at top-p 0.97 without top_k (bitmap supports): k3 <= 0.001 before and after
     dflash-probe   dflash_support_check.py on the first engine passes; masks-on/off decode tok/s ratio >= 0.95
+    dflash-top-k-free  (non-blocking) the probe's masks-on decode tok/s at top_p 0.97 without top_k (case f,
+                   a dense full-vocabulary DFlash target) >= 0.95x that at top_k 1024 (case a); if not, keep
+                   top_k=1024 in the client config
     long-train     mimo_gates long-train on one 250K-token datum trains (fused loss); its forward_backward
                    metrics include expert_load/*
     replay         mimo_gates replay at concurrency 64: >= 700 generated tok/s
@@ -48,6 +51,7 @@ PHASE_ARGS = {
 KL_MAX_K3 = 0.0015
 PARITY_MAX_K3 = 0.001
 MIN_MASKS_ON_OVER_OFF = 0.95
+MIN_TOP_K_FREE_OVER_TOP_K = 0.95
 LONG_DATUM_TOKENS = 250_000
 REPLAY_CONCURRENCY = 64
 MIN_REPLAY_TOKENS_PER_SECOND = 700.0
@@ -68,6 +72,8 @@ class Check:
     # measure(args) -> result runs in the pod; failures(result) applies the bar.
     measure: Callable[[argparse.Namespace], dict]
     failures: Callable[[dict], list[str]]
+    # A failed non-blocking check informs a config choice and leaves the gate passing.
+    blocking: bool = True
 
 
 def _run(argv: list[str], timeout: float | None = None, capture: bool = True) -> tuple[int, str]:
@@ -106,11 +112,21 @@ def _engine_load(args) -> dict:
     return json.loads(stdout)
 
 
-def _dflash_probe(args) -> dict:
+def _dflash_probe(args, *probe_args: str) -> dict:
     engine = _engine_load(args)["engines"][0]["url"]
-    probe = ["--url", engine, "--tokenizer-path", args.tokenizer_path]
+    probe = ["--url", engine, "--tokenizer-path", args.tokenizer_path, *probe_args]
     _, stdout = _run(_dev("run", args.pod, str(TOOLS_DIR / "dflash_support_check.py"), *probe), args.check_timeout)
     return trailing_json(stdout)
+
+
+def _dflash_top_k_free(args) -> dict:
+    """Probe throughput of case (a) and case (f); dflash-probe already ran the sweep, so these skip it."""
+    throughput = {
+        case: _dflash_probe(args, "--sweep-requests", "0", "--throughput-case", case)["throughput"]
+        for case in ("a_support", "f_top_p")
+    }
+    rates = {case: values["on"]["decode_tokens_per_second"] for case, values in throughput.items()}
+    return throughput | {"f_top_p_over_a_support": rates["f_top_p"] / rates["a_support"]}
 
 
 def _records_check(args) -> dict:
@@ -151,6 +167,13 @@ def _dflash_bar(report: dict) -> list[str]:
     if ratio < MIN_MASKS_ON_OVER_OFF:
         failures.append(f"masks-on/off decode tok/s ratio {ratio:.3f} < {MIN_MASKS_ON_OVER_OFF}")
     return failures
+
+
+def _top_k_free_bar(result: dict) -> list[str]:
+    ratio = result["f_top_p_over_a_support"]
+    if ratio >= MIN_TOP_K_FREE_OVER_TOP_K:
+        return []
+    return [f"top_k-free decode tok/s is {ratio:.3f}x top_k 1024's, < {MIN_TOP_K_FREE_OVER_TOP_K}: keep top_k=1024"]
 
 
 def _records_bar(result: dict) -> list[str]:
@@ -217,6 +240,14 @@ CHECKS = (
         _dflash_bar,
     ),
     Check(
+        "dflash-top-k-free",
+        "base",
+        f"masks-on decode tok/s at top_p 0.97 without top_k >= {MIN_TOP_K_FREE_OVER_TOP_K}x that with top_k 1024",
+        _dflash_top_k_free,
+        _top_k_free_bar,
+        blocking=False,
+    ),
+    Check(
         "records-check",
         "collect",
         'bench_rollout_records.py --check prints "mismatching datums: none"',
@@ -265,6 +296,7 @@ def _outcome(check: Check, result: dict | None, failures: list[str], seconds: fl
         "name": check.name,
         "phase": check.phase,
         "bar": check.bar,
+        "blocking": check.blocking,
         "passed": not failures,
         "failures": failures,
         "seconds": seconds,
@@ -298,11 +330,11 @@ def run_gate(args, checks: list[Check]) -> dict:
             else:
                 outcomes[check.name] = _outcome(check, None, [f"the {phase} service did not start"], 0.0)
             outcome = outcomes[check.name]
-            print(
-                f"{'PASS' if outcome['passed'] else 'FAIL'} {check.name}: {'; '.join(outcome['failures'])}", flush=True
-            )
+            verdict = "PASS" if outcome["passed"] else "FAIL" if check.blocking else "FAIL (non-blocking)"
+            print(f"{verdict} {check.name}: {'; '.join(outcome['failures'])}", flush=True)
     ordered = [outcomes[check.name] for check in checks]
-    return {"pod": args.pod, "passed": all(outcome["passed"] for outcome in ordered), "checks": ordered}
+    passed = all(outcome["passed"] or not outcome["blocking"] for outcome in ordered)
+    return {"pod": args.pod, "passed": passed, "checks": ordered}
 
 
 def build_parser() -> argparse.ArgumentParser:

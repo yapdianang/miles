@@ -36,10 +36,16 @@ RECORDS_LINE = "check: 64 datums, 513 records collected, 0 missing, 0 recomputed
 class FakePod:
     """Answers the gate's mimo_dev and kubectl commands; `gate_outputs` overrides a gate's stdout."""
 
-    def __init__(self, gate_outputs=None, failing_phase_arg=None):
+    def __init__(self, gate_outputs=None, failing_phase_arg=None, top_k_free_rate=980.0):
         self.gate_outputs = {name: json.dumps(summary) for name, summary in PASSING.items()} | (gate_outputs or {})
         self.failing_phase_arg = failing_phase_arg
+        self.rates = {"a_support": 1000.0, "f_top_p": top_k_free_rate}
         self.calls = []
+
+    def probe(self, argv) -> str:
+        case = argv[argv.index("--throughput-case") + 1] if "--throughput-case" in argv else "a_support"
+        on = {"decode_tokens_per_second": self.rates[case], "accept_length": 3.2}
+        return json.dumps(PROBE | {"throughput": PROBE["throughput"] | {"case": case, "on": on}}, indent=2)
 
     def __call__(self, argv, timeout=None, capture=True):
         self.calls.append(argv)
@@ -54,7 +60,7 @@ class FakePod:
         return (
             0,
             {
-                "dflash_support_check.py": json.dumps(PROBE, indent=2),
+                "dflash_support_check.py": self.probe(argv),
                 "bench_rollout_records.py": f"progress\n{RECORDS_LINE}\n",
                 "run_dora_parity_check.py": "step 1: {'loss': 1.0} {'grad_norm': 0.4}\n" + json.dumps(DORA, indent=2),
             }[Path(argv[4]).name],
@@ -85,7 +91,9 @@ def test_a_passing_run_restarts_once_per_phase_and_lists_checks_in_the_requested
     assert restarts == [
         ["--hf-checkpoint", "/ckpt", *final.PHASE_ARGS[phase]] for phase in ("base", "collect", "muown")
     ]
-    assert summary["checks"][3]["result"]["router_url"] == "http://10.42.9.87:20033"
+    results = {check["name"]: check["result"] for check in summary["checks"]}
+    assert results["records-check"]["router_url"] == "http://10.42.9.87:20033"
+    assert results["dflash-top-k-free"]["f_top_p_over_a_support"] == 0.98
 
 
 def test_gate_commands_parse_with_the_bars_settings(monkeypatch, tmp_path):
@@ -100,9 +108,11 @@ def test_gate_commands_parse_with_the_bars_settings(monkeypatch, tmp_path):
     assert (parsed["parity"].top_p, parsed["parity"].top_k, parsed["parity"].max_k3) == (0.97, -1, 0.001)
     assert parsed["long-train"].context_tokens == 250_000
     assert (parsed["replay"].concurrency, str(parsed["replay"].engine_log)) == (64, final.SERVICE_LOG)
-    probe, bench, dora = (dev.build_parser().parse_args(argv[2:]) for argv in pod.commands("run"))
+    probe, top_k, top_k_free, bench, dora = (dev.build_parser().parse_args(argv[2:]) for argv in pod.commands("run"))
     assert probe.script == final.TOOLS_DIR / "dflash_support_check.py" and probe.script.exists()
     assert probe.script_args[:2] == ["--url", ENGINE["url"]]
+    for throughput, case in ((top_k, "a_support"), (top_k_free, "f_top_p")):
+        assert throughput.script_args[-4:] == ["--sweep-requests", "0", "--throughput-case", case]
     assert bench.script == final.TOOLS_DIR.parent / "bench_rollout_records.py" and bench.script.exists()
     assert bench.script_args == [
         "--router-url",
@@ -113,7 +123,10 @@ def test_gate_commands_parse_with_the_bars_settings(monkeypatch, tmp_path):
         "--concurrency",
         "64",
     ]
-    assert dora.script == final.TOOLS_DIR.parent / "run_dora_parity_check.py"
+    assert dora.script == final.TOOLS_DIR.parent / "run_dora_parity_check.py" and dora.script.exists()
+    # the flags the gate passes exist in the scripts it runs
+    for script, flags in ((probe, ("--sweep-requests", "--throughput-case")), (dora, dora.script_args[::2])):
+        assert all(f'"{flag}"' in script.script.read_text() for flag in flags), script.script
     assert dora.script_args == [
         "--base-url",
         dev.GATEWAY_URL,
@@ -146,9 +159,19 @@ def test_a_phase_whose_service_does_not_start_fails_only_its_checks(monkeypatch,
     failed = {check["name"]: check["failures"] for check in summary["checks"] if not check["passed"]}
     assert code == 1 and failed == {"records-check": ["the collect service did not start"]}
     assert [Path(argv[4]).name for argv in pod.commands("run")] == [
-        "dflash_support_check.py",
+        *["dflash_support_check.py"] * 3,
         "run_dora_parity_check.py",
     ]
+
+
+def test_a_slow_top_k_free_path_is_reported_without_failing_the_gate(monkeypatch, tmp_path):
+    pod = FakePod(top_k_free_rate=900.0)
+    summary, code = run_final(monkeypatch, tmp_path, pod)
+
+    check = next(check for check in summary["checks"] if check["name"] == "dflash-top-k-free")
+    assert code == 0 and summary["passed"] and not check["passed"] and not check["blocking"]
+    assert check["failures"] == ["top_k-free decode tok/s is 0.900x top_k 1024's, < 0.95: keep top_k=1024"]
+    assert check["result"]["f_top_p"]["on"] == {"decode_tokens_per_second": 900.0, "accept_length": 3.2}
 
 
 def test_selected_checks_restart_only_their_phases(monkeypatch, tmp_path):
