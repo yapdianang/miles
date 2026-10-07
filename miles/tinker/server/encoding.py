@@ -9,6 +9,7 @@ import pydantic
 
 from miles.tinker.core.input_validation import validate_save_options
 from miles.tinker.core.types import LOSS_INPUT_KEYS, UserInputError
+from miles.tinker.expert_load import expert_load_metrics
 from tinker import types as tinker_types
 from tinker.types.topk_logprobs import MASK_LOGPROB
 
@@ -178,7 +179,7 @@ def render_result(result: dict) -> dict:
                 {"loss:sum": _tensor_json([output["loss"]]), "logprobs": _tensor_json(output["logprobs"])}
                 for output in outputs
             ],
-            "metrics": {"loss:sum": float(sum(output["loss"] for output in outputs))},
+            "metrics": forward_backward_metrics(outputs),
         }
     if op == "sample":
         rendered = {"type": "sample", "sequences": result["sequences"]}
@@ -212,6 +213,14 @@ def render_result(result: dict) -> dict:
     if op == "optim_step":
         return {"type": "optim_step", "metrics": result["metrics"]}
     raise AssertionError(f"unrenderable result op {op!r}")
+
+
+def forward_backward_metrics(outputs: list[dict]) -> dict[str, float]:
+    """The summed loss, and the expert load when every datum replayed engine routes."""
+    metrics = {"loss:sum": float(sum(output["loss"] for output in outputs))}
+    if all("expert_counts" in output for output in outputs):
+        metrics |= expert_load_metrics(sum(output["expert_counts"] for output in outputs))
+    return metrics
 
 
 def _tensor_json(values: list[float]) -> dict:

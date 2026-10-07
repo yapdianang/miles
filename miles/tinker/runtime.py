@@ -16,6 +16,7 @@ import torch
 
 from miles.ray.rollout.train_data_conversion import ROLLOUT_DATA_VALUE_SPEC
 from miles.tinker.core.types import UserInputError
+from miles.tinker.expert_load import expert_counts
 from miles.tinker.sampler_records import SamplerRecordStore, SequenceRecord, parse_supports, prefix_hashes
 from miles.utils import object_store
 from miles.utils.http_utils import post
@@ -172,6 +173,8 @@ class MilesBackend:
         routed_experts: RoutedExpertsCache | None = None,
         num_layers: int | None = None,
         sampler_records: SamplerRecordStore | None = None,
+        moe_layers: list[int] | None = None,
+        num_experts: int | None = None,
     ) -> None:
         self.trainer = trainer
         self.router_url = router_url
@@ -180,6 +183,8 @@ class MilesBackend:
         self.routed_experts = routed_experts
         self.num_layers = num_layers
         self.sampler_records = sampler_records
+        self.moe_layers = moe_layers
+        self.num_experts = num_experts
 
     async def trainer_dead(self) -> bool:
         return await self.trainer.has_errored_cell()
@@ -214,7 +219,13 @@ class MilesBackend:
                         "loss": float(datum_output["loss"]),
                         "logprobs": datum_output["logprobs"].tolist(),
                     }
-        return [by_index[index] for index in range(len(slot_datums))]
+        outputs = [by_index[index] for index in range(len(slot_datums))]
+        routes = train_data.get("rollout_routed_experts")
+        if routes is not None and self.moe_layers:
+            # each request sums its datums' counts into the expert-load metrics of its result
+            for output, datum_routes in zip(outputs, routes, strict=False):
+                output["expert_counts"] = expert_counts(datum_routes, self.moe_layers, self.num_experts)
+        return outputs
 
     async def _call_trainer(self, method: str, batch_id: int, train_data: dict) -> list:
         store = object_store.get_instance()
