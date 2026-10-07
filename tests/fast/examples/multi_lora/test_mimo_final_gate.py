@@ -23,10 +23,14 @@ ENGINE = {
     "host_kv": None,
 }
 PASSING = {
-    "kl-decompose": {"passed": True, "failures": [], "pairs": {}},
-    "parity": {"passed": True, "failures": []},
-    "long-train": {"datum_lengths": [250_255], "forward_backward_metrics": {"expert_load/cv/layer_mean:mean": 0.4}},
-    "replay": {"generated_tokens_per_second": 812.0},
+    "kl-decompose": {"passed": True, "failures": [], "pairs": {"dec->tr": {"k3": 0.0009}}},
+    "parity": {"passed": True, "failures": [], "base": {"k3": 0.00043}, "updated": {"k3": 0.00044}},
+    "long-train": {
+        "datum_lengths": [250_255],
+        "forward_backward_metrics": {"expert_load/cv/layer_mean:mean": 0.4},
+        "seconds": {"forward_backward": 300.0},
+    },
+    "replay": {"generated_tokens_per_second": 812.0, "trajectories_per_minute": 12.5},
 }
 PROBE = {"passed": True, "failures": [], "throughput": {"masks_on_over_off": 0.98}}
 DORA = {"tokens": 4096, "k3_engine_trainer_step_0": 8e-4, "k3_engine_trainer": 1.1e-3, "k3_trainer_movement": 0.05}
@@ -36,7 +40,8 @@ RECORDS_LINE = "check: 64 datums, 513 records collected, 0 missing, 0 recomputed
 class FakePod:
     """Answers the gate's mimo_dev and kubectl commands; `gate_outputs` overrides a gate's stdout."""
 
-    def __init__(self, gate_outputs=None, failing_phase_arg=None, top_k_free_rate=980.0):
+    def __init__(self, gate_outputs=None, failing_phase_arg=None, top_k_free_rate=980.0, noise=("", "")):
+        self.noise = noise
         self.gate_outputs = {name: json.dumps(summary) for name, summary in PASSING.items()} | (gate_outputs or {})
         self.failing_phase_arg = failing_phase_arg
         self.rates = {"a_support": 1000.0, "f_top_p": top_k_free_rate}
@@ -48,6 +53,11 @@ class FakePod:
         return json.dumps(PROBE | {"throughput": PROBE["throughput"] | {"case": case, "on": on}}, indent=2)
 
     def __call__(self, argv, timeout=None, capture=True):
+        code, stdout = self.answer(argv)
+        before, after = self.noise
+        return code, before + stdout + after
+
+    def answer(self, argv):
         self.calls.append(argv)
         if argv[0] == "kubectl":
             command = argv[4]
@@ -81,8 +91,17 @@ def run_final(monkeypatch, tmp_path, pod: FakePod, *extra: str) -> tuple[dict, i
     return json.loads(output.read_text()), code
 
 
-def test_a_passing_run_restarts_once_per_phase_and_lists_checks_in_the_requested_order(monkeypatch, tmp_path):
-    pod = FakePod()
+NOISE = (
+    "<stdin>:233: DeprecationWarning: The 'name' parameter is deprecated\n",
+    "\nException ignored in: <function _close_poller_threadsafe>\n{'not': 'json'}\nshutting down\n",
+)
+
+
+@pytest.mark.parametrize("noise", [("", ""), NOISE])
+def test_a_passing_run_restarts_once_per_phase_and_lists_checks_in_the_requested_order(
+    monkeypatch, tmp_path, capsys, noise
+):
+    pod = FakePod(noise=noise)
     summary, code = run_final(monkeypatch, tmp_path, pod)
 
     assert code == 0 and summary["passed"]
@@ -94,6 +113,11 @@ def test_a_passing_run_restarts_once_per_phase_and_lists_checks_in_the_requested
     results = {check["name"]: check["result"] for check in summary["checks"]}
     assert results["records-check"]["router_url"] == "http://10.42.9.87:20033"
     assert results["dflash-top-k-free"]["f_top_p_over_a_support"] == 0.98
+    lines = capsys.readouterr().out.splitlines()
+    assert "PASS kl-decompose: dec->tr k3 0.00090" in lines
+    assert "PASS parity: base k3 0.00043, updated k3 0.00044" in lines
+    assert "PASS dflash-top-k-free: a_support 1000 tok/s accept 3.2, f_top_p 980 tok/s accept 3.2; f/a 0.980" in lines
+    assert "PASS replay: 812 tok/s, 12.5 trajectories/min" in lines
 
 
 def test_gate_commands_parse_with_the_bars_settings(monkeypatch, tmp_path):
@@ -149,7 +173,7 @@ def test_a_check_below_its_bar_fails_the_gate_but_the_others_still_run(monkeypat
     failed = {check["name"]: check["failures"] for check in summary["checks"] if not check["passed"]}
     assert failed.keys() == {"replay", "parity"}
     assert failed["replay"] == ["650 tok/s < 700"]
-    assert failed["parity"][0].startswith("IndexError")
+    assert failed["parity"] == ["ValueError: no JSON object on stdout; its last lines: []"]
 
 
 def test_a_phase_whose_service_does_not_start_fails_only_its_checks(monkeypatch, tmp_path):
@@ -218,9 +242,12 @@ def test_bars(bar, result, failure):
         assert len(failures) == 1 and failure in failures[0], failures
 
 
-def test_trailing_json_skips_progress_lines():
-    assert final.trailing_json("step 1: {'loss': 1.0}\n" + json.dumps(DORA, indent=2)) == DORA
-    assert final.trailing_json(json.dumps(PROBE, indent=2)) == PROBE
+def test_last_json_finds_the_summary_among_other_output():
+    summary = {"passed": True, "pairs": {"dec->tr": {"k3": 0.0009}}}
+    assert final.last_json(f"warning\n{json.dumps(summary)}\nException ignored\n{{'repr': 1}}\n") == summary
+    assert final.last_json("step 1: {'loss': 1.0}\n" + json.dumps(DORA, indent=2) + "\ndone\n") == DORA
+    with pytest.raises(ValueError, match="its last lines: \\['parity top-p 0.97: base k3 0.00043'\\]"):
+        final.last_json("parity top-p 0.97: base k3 0.00043\n")
 
 
 def test_router_url_takes_the_last_router_ready_line():

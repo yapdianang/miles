@@ -72,6 +72,8 @@ class Check:
     # measure(args) -> result runs in the pod; failures(result) applies the bar.
     measure: Callable[[argparse.Namespace], dict]
     failures: Callable[[dict], list[str]]
+    # The measured values printed on the check's PASS or FAIL line.
+    describe: Callable[[dict], str]
     # A failed non-blocking check informs a config choice and leaves the gate passing.
     blocking: bool = True
 
@@ -95,28 +97,36 @@ def router_url(log_lines: str) -> str:
     return f"http://{host}:{port}"
 
 
-def trailing_json(stdout: str) -> dict:
-    """The indented JSON report a script prints after any progress lines."""
-    return json.loads(stdout[stdout.rfind("\n{") + 1 :])
+def last_json(stdout: str) -> dict:
+    """The last JSON object that starts a line of stdout, on one line or indented; any text after it is ignored."""
+    decoder = json.JSONDecoder()
+    for match in reversed(list(re.finditer(r"^\{", stdout, re.MULTILINE))):
+        try:
+            value, _ = decoder.raw_decode(stdout, match.start())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ValueError(f"no JSON object on stdout; its last lines: {stdout.strip().splitlines()[-5:]}")
 
 
 def _gate(args, gate: str, *gate_args: str) -> dict:
     """The JSON summary a mimo_gates gate prints as its last stdout line."""
     _, stdout = _run(_dev("gate", args.pod, gate, *gate_args), args.check_timeout)
-    return json.loads(stdout.strip().splitlines()[-1])
+    return last_json(stdout)
 
 
 def _engine_load(args) -> dict:
     request = ["curl", "-sS", "-H", "X-API-Key: tml-dummy", f"{GATEWAY_URL}/api/v1/engine_load"]
     _, stdout = _run(_pod_shell(args.pod, *request), args.check_timeout)
-    return json.loads(stdout)
+    return last_json(stdout)
 
 
 def _dflash_probe(args, *probe_args: str) -> dict:
     engine = _engine_load(args)["engines"][0]["url"]
     probe = ["--url", engine, "--tokenizer-path", args.tokenizer_path, *probe_args]
     _, stdout = _run(_dev("run", args.pod, str(TOOLS_DIR / "dflash_support_check.py"), *probe), args.check_timeout)
-    return trailing_json(stdout)
+    return last_json(stdout)
 
 
 def _dflash_top_k_free(args) -> dict:
@@ -154,7 +164,7 @@ def _dora_parity(args) -> dict:
     ]
     script = str(TOOLS_DIR.parent / "run_dora_parity_check.py")
     _, stdout = _run(_dev("run", args.pod, script, *check), args.check_timeout)
-    return trailing_json(stdout)
+    return last_json(stdout)
 
 
 def _gate_bar(summary: dict) -> list[str]:
@@ -217,6 +227,43 @@ def _engine_load_bar(load: dict) -> list[str]:
     ]
 
 
+def _rounded(value: float | None, digits: int = 2) -> float | None:
+    return None if value is None else round(value, digits)
+
+
+def _describe_probe(report: dict) -> str:
+    on = report["throughput"]["on"]
+    return (
+        f"masks on/off decode tok/s {report['throughput']['masks_on_over_off']:.3f}, "
+        f"masks-on {on['decode_tokens_per_second']:.0f} tok/s, accept {_rounded(on['accept_length'])}"
+    )
+
+
+def _describe_top_k_free(result: dict) -> str:
+    cases = ", ".join(
+        f"{case} {result[case]['on']['decode_tokens_per_second']:.0f} tok/s accept "
+        f"{_rounded(result[case]['on']['accept_length'])}"
+        for case in ("a_support", "f_top_p")
+    )
+    return f"{cases}; f/a {result['f_top_p_over_a_support']:.3f}"
+
+
+def _describe_long_train(summary: dict) -> str:
+    metrics = [key for key in summary["forward_backward_metrics"] if key.startswith("expert_load/")]
+    return (
+        f"{max(summary['datum_lengths'])}-token datum, forward_backward {summary['seconds']['forward_backward']:.0f}s, "
+        f"{len(metrics)} expert_load metrics"
+    )
+
+
+def _describe_engine_load(load: dict) -> str:
+    engines = load.get("engines") or []
+    return f"{len(engines)} engines: " + ", ".join(
+        f"{engine.get('url')} {engine.get('running_requests')} running/{engine.get('queued_requests')} queued"
+        for engine in engines
+    )
+
+
 CHECKS = (
     Check(
         "kl-decompose",
@@ -224,6 +271,7 @@ CHECKS = (
         f"decode->trainer k3 <= {KL_MAX_K3} at top-p 1.0",
         lambda args: _gate(args, "kl-decompose", "--workload", args.workload, "--max-k3", str(KL_MAX_K3)),
         _gate_bar,
+        lambda summary: f"dec->tr k3 {summary['pairs']['dec->tr']['k3']:.5f}",
     ),
     Check(
         "parity",
@@ -231,6 +279,7 @@ CHECKS = (
         f"k3 <= {PARITY_MAX_K3} before and after an update at top-p 0.97 without top_k",
         lambda args: _gate(args, "parity", "--top-p", "0.97", "--top-k", "-1", "--max-k3", str(PARITY_MAX_K3)),
         _gate_bar,
+        lambda summary: f"base k3 {summary['base']['k3']:.5f}, updated k3 {summary['updated']['k3']:.5f}",
     ),
     Check(
         "dflash-probe",
@@ -238,6 +287,7 @@ CHECKS = (
         f"probe passes and masks-on/off decode tok/s >= {MIN_MASKS_ON_OVER_OFF}",
         _dflash_probe,
         _dflash_bar,
+        _describe_probe,
     ),
     Check(
         "dflash-top-k-free",
@@ -245,6 +295,7 @@ CHECKS = (
         f"masks-on decode tok/s at top_p 0.97 without top_k >= {MIN_TOP_K_FREE_OVER_TOP_K}x that with top_k 1024",
         _dflash_top_k_free,
         _top_k_free_bar,
+        _describe_top_k_free,
         blocking=False,
     ),
     Check(
@@ -253,6 +304,7 @@ CHECKS = (
         'bench_rollout_records.py --check prints "mismatching datums: none"',
         _records_check,
         _records_bar,
+        lambda result: result["check_line"] or "",
     ),
     Check(
         "long-train",
@@ -262,6 +314,7 @@ CHECKS = (
             args, "long-train", "--workload", args.workload, "--context-tokens", str(LONG_DATUM_TOKENS)
         ),
         _long_train_bar,
+        _describe_long_train,
     ),
     Check(
         "replay",
@@ -278,8 +331,19 @@ CHECKS = (
             SERVICE_LOG,
         ),
         _replay_bar,
+        lambda summary: (
+            f"{summary['generated_tokens_per_second']:.0f} tok/s, "
+            f"{summary['trajectories_per_minute']:.1f} trajectories/min"
+        ),
     ),
-    Check("engine-load", "base", "/api/v1/engine_load reports every engine's load", _engine_load, _engine_load_bar),
+    Check(
+        "engine-load",
+        "base",
+        "/api/v1/engine_load reports every engine's load",
+        _engine_load,
+        _engine_load_bar,
+        _describe_engine_load,
+    ),
     Check(
         "muown-parity",
         "muown",
@@ -287,11 +351,15 @@ CHECKS = (
         f"{DORA_MIN_MOVEMENT_K3}",
         _dora_parity,
         _dora_bar,
+        lambda report: (
+            f"engine/trainer k3 {report['k3_engine_trainer']:.2e}, "
+            f"trainer movement k3 {report['k3_trainer_movement']:.2e}"
+        ),
     ),
 )
 
 
-def _outcome(check: Check, result: dict | None, failures: list[str], seconds: float) -> dict:
+def _outcome(check: Check, result: dict | None, failures: list[str], measured: str, seconds: float) -> dict:
     return {
         "name": check.name,
         "phase": check.phase,
@@ -299,6 +367,7 @@ def _outcome(check: Check, result: dict | None, failures: list[str], seconds: fl
         "blocking": check.blocking,
         "passed": not failures,
         "failures": failures,
+        "measured": measured,
         "seconds": seconds,
         "result": result,
     }
@@ -310,8 +379,12 @@ def run_check(check: Check, args) -> dict:
         result = check.measure(args)
         failures = check.failures(result)
     except Exception as error:  # a crashed, timed-out or unparsable check fails the gate, not the run
-        result, failures = None, [f"{type(error).__name__}: {error}"]
-    return _outcome(check, result, failures, time.monotonic() - start)
+        return _outcome(check, None, [f"{type(error).__name__}: {error}"], "", time.monotonic() - start)
+    try:
+        measured = check.describe(result)
+    except Exception as error:  # the bar has already decided; an odd result shape only loses the summary line
+        measured = f"no summary line: {type(error).__name__}: {error}"
+    return _outcome(check, result, failures, measured, time.monotonic() - start)
 
 
 def run_gate(args, checks: list[Check]) -> dict:
@@ -328,10 +401,11 @@ def run_gate(args, checks: list[Check]) -> dict:
                 print(f"== {check.name}: {check.bar}", file=sys.stderr, flush=True)
                 outcomes[check.name] = run_check(check, args)
             else:
-                outcomes[check.name] = _outcome(check, None, [f"the {phase} service did not start"], 0.0)
+                outcomes[check.name] = _outcome(check, None, [f"the {phase} service did not start"], "", 0.0)
             outcome = outcomes[check.name]
             verdict = "PASS" if outcome["passed"] else "FAIL" if check.blocking else "FAIL (non-blocking)"
-            print(f"{verdict} {check.name}: {'; '.join(outcome['failures'])}", flush=True)
+            details = "; ".join(filter(None, [outcome["measured"], *outcome["failures"]]))
+            print(f"{verdict} {check.name}: {details}", flush=True)
     ordered = [outcomes[check.name] for check in checks]
     passed = all(outcome["passed"] or not outcome["blocking"] for outcome in ordered)
     return {"pod": args.pod, "passed": passed, "checks": ordered}

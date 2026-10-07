@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import gzip
 import itertools
 import json
@@ -229,7 +230,7 @@ def run_parity(args) -> tuple[dict, str]:
     ]
     params = types.SamplingParams(max_tokens=args.max_tokens, temperature=1.0, top_p=args.top_p, top_k=args.top_k)
     seconds = {}
-    sampler = _timed(seconds, "save_s0", lambda: training.save_weights_and_get_sampling_client("s0"))
+    sampler = _timed(seconds, "save_s0", lambda: training.save_weights_and_get_sampling_client())
     samples = _timed(seconds, "sample_s0", lambda: _sample(sampler, prompts, params, num_samples=2))
     # One sample per prompt is pushed up, the other down.
     advantages = [1.0 if index % 2 == 0 else -1.0 for index in range(len(samples))]
@@ -240,7 +241,7 @@ def run_parity(args) -> tuple[dict, str]:
     )
     base = _trainer_gap(samples, result)
     _timed(seconds, "optim_step", lambda: training.optim_step(types.AdamParams(learning_rate=args.lr)).result())
-    updated = _timed(seconds, "save_s1", lambda: training.save_weights_and_get_sampling_client("s1"))
+    updated = _timed(seconds, "save_s1", lambda: training.save_weights_and_get_sampling_client())
     new_samples = _timed(seconds, "sample_s1", lambda: _sample(updated, prompts, params, num_samples=2))
     result = _timed(
         seconds,
@@ -282,7 +283,7 @@ def run_kl_decompose(args) -> tuple[dict, str]:
     """At top-p 1.0, splits the sampler/trainer gap into engine noise, decode vs prefill, and engine vs trainer."""
     prompts = kl_contexts(load_workload(args.workload), args.contexts, args.min_prompt, args.max_prompt)
     training = _training_client(args)
-    sampler = training.save_weights_and_get_sampling_client("decompose")
+    sampler = training.save_weights_and_get_sampling_client()
     samples = _sample(sampler, prompts, types.SamplingParams(max_tokens=args.max_tokens, temperature=1.0))
     series = {"dec": [], "pre1": [], "pre2": [], "tr": []}
     for prompt, sequence in samples:
@@ -312,7 +313,7 @@ def run_kl_decompose(args) -> tuple[dict, str]:
 def run_parity_by_length(args) -> tuple[dict, str]:
     buckets = length_buckets(load_workload(args.workload), args.contexts)
     training = _training_client(args)
-    sampler = training.save_weights_and_get_sampling_client("parity")
+    sampler = training.save_weights_and_get_sampling_client()
     params = types.SamplingParams(max_tokens=args.max_tokens, temperature=1.0, top_p=args.top_p, top_k=args.top_k)
     rows = []
     for label, contexts in buckets:
@@ -331,7 +332,7 @@ def run_long_train(args) -> tuple[dict, str]:
     else:
         contexts = longest_contexts(workload, args.contexts)
     training = _training_client(args)
-    sampler = training.save_weights_and_get_sampling_client("repro")
+    sampler = training.save_weights_and_get_sampling_client()
     params = types.SamplingParams(max_tokens=args.max_tokens, temperature=1.0, top_p=args.top_p, top_k=args.top_k)
     seconds = {}
     samples = _timed(seconds, "sample", lambda: _sample(sampler, contexts, params))
@@ -373,7 +374,7 @@ async def _replay(args) -> dict:
     jobs = replay_jobs(load_workload(args.workload), args.copies, rng)
     concurrency = args.concurrency or len(jobs)
     training = await _service(args).create_lora_training_client_async(args.model, rank=args.rank)
-    sampler = await training.save_weights_and_get_sampling_client_async("replay")
+    sampler = await training.save_weights_and_get_sampling_client_async()
     log_offset = args.engine_log.stat().st_size if args.engine_log else 0
     latencies: list[float] = []
     semaphore = asyncio.Semaphore(concurrency)
@@ -496,8 +497,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    summary, line = args.run(args)
-    print(json.dumps(summary))
+    # Library output goes to stderr, so the summary is the only line on stdout.
+    with contextlib.redirect_stdout(sys.stderr):
+        summary, line = args.run(args)
+    print(json.dumps(summary), flush=True)
     print(line, file=sys.stderr)
     if summary.get("passed") is False:
         sys.exit(1)

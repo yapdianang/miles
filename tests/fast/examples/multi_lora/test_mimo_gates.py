@@ -85,10 +85,10 @@ class FakeTraining:
     def __init__(self, gateway):
         self.gateway = gateway
 
-    def save_weights_and_get_sampling_client(self, name):
+    def save_weights_and_get_sampling_client(self):
         return FakeSampler(self.gateway)
 
-    async def save_weights_and_get_sampling_client_async(self, name):
+    async def save_weights_and_get_sampling_client_async(self):
         return FakeSampler(self.gateway)
 
     def forward(self, datums, loss_fn):
@@ -119,16 +119,23 @@ class FakeTokenizer:
         return " ".join(map(str, tokens))
 
 
+def _noisy_tokenizer(*args, **kwargs) -> FakeTokenizer:
+    print("a library writing to stdout")
+    return FakeTokenizer()
+
+
 def run_gate(monkeypatch, capsys, argv, gateway) -> tuple[dict, str, int]:
     monkeypatch.setattr(gates.tinker, "ServiceClient", gateway)
-    monkeypatch.setattr(gates.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: FakeTokenizer())
+    monkeypatch.setattr(gates.AutoTokenizer, "from_pretrained", _noisy_tokenizer)
     code = 0
     try:
         gates.main([argv[0], "--base-url", "http://gateway", *argv[1:]])
     except SystemExit as exit:
         code = exit.code
     out, err = capsys.readouterr()
-    return json.loads(out), err.strip(), code
+    # stdout carries the summary alone; library output goes to stderr
+    assert out.count("\n") == 1, out
+    return json.loads(out), err.strip().splitlines()[-1], code
 
 
 def test_gap_is_k3_mean_abs_and_mean_of_target_minus_reference():
