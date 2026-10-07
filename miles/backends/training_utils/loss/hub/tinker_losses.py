@@ -12,6 +12,7 @@ import torch
 from miles.backends.training_utils.loss.hub.logit_processors import _iter_response_chunks, get_log_probs_and_entropy
 from miles.backends.training_utils.loss.hub.score_centering import (
     ScoreCenteringInputs,
+    output_selected_log_probs_and_entropy,
     score_centering_loss,
     selected_log_probs,
 )
@@ -34,6 +35,8 @@ def _label_tokens(batch: RolloutBatch) -> list[torch.Tensor]:
 
 
 def _target_logprobs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> list[torch.Tensor]:
+    if "output_weight" in batch:
+        return _fused_target_logprobs(args, batch, logits)
     outputs = get_log_probs_and_entropy(
         logits,
         args=args,
@@ -61,19 +64,75 @@ def _sampling_supports(batch: RolloutBatch) -> list[PartialSamplingMask] | None:
 
 def _support_head(batch: RolloutBatch, index: int, rows: range) -> tuple[torch.Tensor, torch.Tensor]:
     """Recorded supports of these target rows as ``[rows, width]`` ids (-1 padding) and sampler log-probs."""
+    head_log_probs = _padded_supports(batch, "rollout_sampling_mask_log_probs", index, rows, -torch.inf)
+    return _support_ids(batch, index, rows), head_log_probs.float()
+
+
+def _support_ids(batch: RolloutBatch, index: int, rows: range) -> torch.Tensor:
+    return _padded_supports(batch, "rollout_sampling_mask_ids", index, rows, -1).long()
+
+
+def _padded_supports(batch: RolloutBatch, key: str, index: int, rows: range, fill: float) -> torch.Tensor:
+    """One CSR field of these target rows' recorded supports as ``[rows, width]``, padded with ``fill``."""
     if batch.get("rollout_sampling_mask_ids") is None:
-        return torch.full((len(rows), 0), -1, dtype=torch.long), torch.empty(len(rows), 0)
+        return torch.full((len(rows), 0), fill)
     offsets = torch.as_tensor(batch["rollout_sampling_mask_offsets"][index])[rows.start : rows.stop + 1]
     begin, end = int(offsets[0]), int(offsets[-1])
     lengths = offsets[1:] - offsets[:-1]
     row = torch.repeat_interleave(torch.arange(len(rows)), lengths)
     column = torch.arange(end - begin) - torch.repeat_interleave(offsets[:-1] - begin, lengths)
     width = int(lengths.max()) if len(rows) else 0
-    head_ids = torch.full((len(rows), width), -1, dtype=torch.long)
-    head_ids[row, column] = torch.as_tensor(batch["rollout_sampling_mask_ids"][index])[begin:end].long()
-    head_log_probs = torch.full((len(rows), width), -torch.inf)
-    head_log_probs[row, column] = torch.as_tensor(batch["rollout_sampling_mask_log_probs"][index])[begin:end].float()
-    return head_ids, head_log_probs
+    values = torch.as_tensor(batch[key][index])[begin:end]
+    padded = torch.full((len(rows), width), fill, dtype=values.dtype)
+    padded[row, column] = values
+    return padded
+
+
+def _fused_target_logprobs(args: Namespace, batch: RolloutBatch, hidden: torch.Tensor) -> list[torch.Tensor]:
+    """``_target_logprobs`` from hidden states: each recorded support renormalizes as the masked logits do."""
+    log_probs = []
+    for index, (chunk, labels, rows) in enumerate(_response_chunks(args, batch, hidden)):
+        head_ids = _support_ids(batch, index, rows).to(labels.device)
+        labels = labels.unsqueeze(-1).long()
+        # padded vocabulary entries stay in the normalizer, as in Megatron's vocab-parallel cross entropy
+        selected = _selected_log_probs(args, batch, chunk, torch.cat([labels, head_ids], dim=-1), vocab_size=None)
+        head = head_ids >= 0
+        has_head = head.any(-1)
+        # a masked target logit is -inf, so a target outside its recorded support has log-prob -inf
+        target = selected[:, 0].masked_fill(has_head & ~(head_ids == labels).any(-1), -torch.inf)
+        log_probs.append(target - torch.where(has_head, _logsumexp_where(selected[:, 1:], head).squeeze(-1), 0.0))
+    return log_probs
+
+
+def _response_chunks(args: Namespace, batch: RolloutBatch, logits: torch.Tensor):
+    for chunk, labels, rows in _iter_response_chunks(
+        logits,
+        args=args,
+        unconcat_tokens=_label_tokens(batch),
+        total_lengths=batch["total_lengths"],
+        response_lengths=batch["response_lengths"],
+        max_seq_lens=batch.get("max_seq_lens", None),
+        include_response_indices=True,
+    ):
+        if not isinstance(rows, range):
+            raise NotImplementedError("scoring recorded supports needs every target row of a datum on one rank")
+        yield chunk, labels, rows
+
+
+def _selected_log_probs(
+    args: Namespace, batch: RolloutBatch, chunk: torch.Tensor, token_ids: torch.Tensor, vocab_size: int | None
+) -> torch.Tensor:
+    """Log-probs ``[rows, K]`` at global ids from response logits, or from hidden states under --tinker-fused-loss."""
+    parallel = get_parallel_state()
+    kwargs = dict(
+        group=parallel.tp.group if parallel.tp.size > 1 else None,
+        vocab_size=vocab_size,
+        temperature=1.0 if args.true_on_policy_mode else args.rollout_temperature,
+        chunk_size=args.log_probs_chunk_size,
+    )
+    if "output_weight" in batch:
+        return output_selected_log_probs_and_entropy(chunk, batch["output_weight"], token_ids, **kwargs)[0]
+    return selected_log_probs(chunk, token_ids, **kwargs)
 
 
 def _logsumexp_where(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -211,29 +270,16 @@ def score_centering_loss_function(
     distribution. A target without a recorded support has an empty head: no correction term.
     """
     config = SCORE_CENTERING_DEFAULTS | (batch.get("loss_fn_config") or {})
-    parallel = get_parallel_state()
-    chunks = _iter_response_chunks(
-        logits,
-        args=args,
-        unconcat_tokens=_label_tokens(batch),
-        total_lengths=batch["total_lengths"],
-        response_lengths=batch["response_lengths"],
-        max_seq_lens=batch.get("max_seq_lens", None),
-        include_response_indices=True,
-    )
     log_probs, per_datum_losses = [], []
-    for index, (chunk, labels, rows) in enumerate(chunks):
-        if not isinstance(rows, range):
-            raise NotImplementedError("score_centering needs every target row of a datum on one rank")
+    for index, (chunk, labels, rows) in enumerate(_response_chunks(args, batch, logits)):
         head_ids, head_log_probs = _support_head(batch, index, rows)
         head_ids = head_ids.to(labels.device)
-        selected = selected_log_probs(
+        selected = _selected_log_probs(
+            args,
+            batch,
             chunk,
             torch.cat([labels.unsqueeze(-1).long(), head_ids], dim=-1),
-            group=parallel.tp.group if parallel.tp.size > 1 else None,
             vocab_size=getattr(args, "vocab_size", None),
-            temperature=1.0 if args.true_on_policy_mode else args.rollout_temperature,
-            chunk_size=args.log_probs_chunk_size,
         )
         head = head_ids >= 0
         has_head = head.any(-1, keepdim=True)

@@ -1,9 +1,12 @@
 """Selected-token log-probabilities from vocabulary-sharded logits."""
 
+from functools import partial
 from typing import Any
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class _SelectedLogProbs(torch.autograd.Function):
@@ -175,3 +178,31 @@ def selected_log_probs_and_entropy(
         else:
             chunks.append(_SelectedLogProbs.apply(chunk.to(dtype) / temperature, ids, group, vocab_size, with_entropy))
     return torch.cat([chunk[0] for chunk in chunks]), torch.cat([chunk[1] for chunk in chunks])
+
+
+def output_selected_log_probs_and_entropy(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    token_ids: torch.Tensor,
+    *,
+    chunk_size: int = -1,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``selected_log_probs_and_entropy`` of the logits ``hidden [T, H] @ weight [V/TP, H].T``.
+
+    Logits exist for one row chunk at a time: backward recomputes each chunk instead of storing [T, V/TP].
+    """
+    score = partial(_output_selected_log_probs_and_entropy, **kwargs)
+    chunk_size = chunk_size if chunk_size > 0 else max(hidden.size(0), 1)
+    chunks = [
+        checkpoint(score, rows, weight, ids, use_reentrant=False, preserve_rng_state=False)
+        for rows, ids in zip(hidden.split(chunk_size), token_ids.split(chunk_size), strict=True)
+    ]
+    return torch.cat([chunk[0] for chunk in chunks]), torch.cat([chunk[1] for chunk in chunks])
+
+
+def _output_selected_log_probs_and_entropy(
+    hidden: torch.Tensor, weight: torch.Tensor, token_ids: torch.Tensor, **kwargs: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # the output layer's GEMM in model precision, as the unfused logits are
+    return selected_log_probs_and_entropy(F.linear(hidden, weight), token_ids, **kwargs)

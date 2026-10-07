@@ -50,10 +50,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     target_modules: str = "attn"
 
     tinker_port: int = 10613
-    # The client caps a trajectory's context at 128K (Tau3 MiMo configs); a 250K-token datum runs the TP4
-    # trainer out of memory in the unfused fp32 cross entropy.
-    context_length: int = 131072
-    max_tokens_per_gpu: int = 131072
+    # 256K needs fused_loss: the logits path runs the TP4 trainer out of memory on a 250K-token datum.
+    context_length: int = 262144
+    max_tokens_per_gpu: int = 262144
     # Activation recompute: "full" (every layer), "selective" (core attention only) or "none".
     recompute: str = "full"
     # DFlash speculative decoding with the drafter shipped in the checkpoint's dflash/ directory.
@@ -71,6 +70,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # Top-p candidate-set replay (section 6.4): the trainer renormalizes within each sampled token's support.
     # Clients sampling with top_p < 1 must also pass a top_k bound (at most --sglang-sampling-mask-max-tokens).
     sampling_support_replay: bool = True
+    # Fused loss (section 6.4): the loss scores hidden states against the output weight in 4096-row chunks
+    # that backward recomputes, so the trainer never holds [tokens, vocab/TP] logits.
+    fused_loss: bool = True
     extra_args: str = ""
 
     def __post_init__(self) -> None:
@@ -154,9 +156,10 @@ def _serve(args: ScriptArgs) -> None:
         replay_args += "--tinker-routed-expert-deltas "
     if args.sampling_support_replay:
         replay_args += "--tinker-sampling-support-replay "
+    loss_args = "--tinker-fused-loss --log-probs-chunk-size 4096 " if args.fused_loss else ""
     train_args = (
         f"{checkpoint_args}{lora_args}{tinker_args}{topology_args}{parallel_args}{batching_args}"
-        f"{sglang_args}{model_args}{replay_args}{args.extra_args}"
+        f"{sglang_args}{model_args}{replay_args}{loss_args}{args.extra_args}"
     )
     args.create_backend().execute_train(
         train_args=train_args,

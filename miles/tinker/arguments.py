@@ -49,6 +49,14 @@ def add_tinker_arguments(parser):
         ),
     )
     add_argument(
+        "fused-loss",
+        action="store_true",
+        help=(
+            "Compute losses from the output layer's input in --log-probs-chunk-size row chunks that backward "
+            "recomputes, instead of storing [tokens, vocab/TP] logits"
+        ),
+    )
+    add_argument(
         "sampler-record-cache-gb",
         type=float,
         default=64.0,
@@ -60,6 +68,9 @@ def add_tinker_arguments(parser):
 def configure_tinker_args(args):
     assert args.train_backend == "megatron", "Tinker requires the Megatron backend"
     assert args.exclude_modules is None, "Tinker selects complete training groups; --exclude-modules is not supported"
+    if args.tinker_fused_loss:
+        assert args.log_probs_chunk_size > 0, "--tinker-fused-loss bounds its logits by --log-probs-chunk-size"
+        assert not args.true_on_policy_mode, "--tinker-fused-loss does not score the true-on-policy full vocabulary"
     groups = parse_lora_targets(args.target_modules)
     if groups is None:
         groups = list(LORA_TARGET_GROUPS)
