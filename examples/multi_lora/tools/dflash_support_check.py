@@ -1,13 +1,16 @@
 """Probe an SGLang engine (DFLASH, sglang#34201) for per-token sampling supports.
 
-Runs against one SGLang ``/generate`` endpoint with DFLASH speculative decoding:
+Runs against one SGLang ``/generate`` endpoint with DFLASH speculative decoding and, unless
+``--packed-ids``, full-vocabulary support bitmaps (docker/compat/sglang_support_bitmap.patch):
 
 1. Cases, ``--case-requests`` each, checked token by token:
    (a) T=1, top_p 0.97, top_k 1024, support mode; (b) the same, selected mode; (c) T=0;
    (d) top_k 50, top_p 1, support mode; (e) case (a) with ``--stop-text``'s token as a stop token,
-   so generation stops inside a verify block.
-2. A sweep of ``--sweep-requests`` requests over cases (a), (b) and (d), counting INVALID and
-   OVERFLOW aborts.
+   so generation stops inside a verify block. Bitmaps only, without a top_k bound: (f) T=1, top_p
+   0.97, support mode; (g) the same, selected mode; (h) top_p 1, selected mode, 4 tokens, where
+   each support spans the vocabulary, wider than the packed path's 4096-id cap.
+2. A sweep of ``--sweep-requests`` requests over cases (a), (b), (d) and, with bitmaps, (f) and
+   (g), counting INVALID and OVERFLOW aborts.
 3. ``--throughput-requests`` requests of case (a) at ``--concurrency`` with ``ignore_eos``, masks off
    and then on: decode tok/s, and the DFLASH accept length from each response's ``spec_verify_ct``.
 
@@ -15,8 +18,9 @@ Token checks: mask count == output_token_logprobs count == completion tokens; ev
 its mask; masks have no duplicates and at most top_k ids, except support-mode masks whose ids from
 rank top_k on tie the top_k-th log-prob (the samplers keep cutoff ties); support-mode rows sum to one within
 ``--tolerance``; selected-mode values are at least the full-vocabulary log-probability; greedy rows
-are singletons with log-probability 0. Exits non-zero if any check fails or the accept lengths
-with and without masks differ by more than ``--accept-z`` standard errors.
+are singletons with log-probability 0. With bitmaps, mask ids are ascending and case (h) masks
+exceed 4096 ids. Exits non-zero if any check fails or the accept lengths with and without masks
+differ by more than ``--accept-z`` standard errors.
 """
 
 from __future__ import annotations
@@ -45,8 +49,10 @@ PROMPTS = (
     "Given the SQL table orders(id, customer, total, created_at), write a query for monthly revenue.",
 )
 TIE_TOLERANCE = 1e-6
+PACKED_CAP = 4096  # the packed path's default --sampling-mask-max-tokens
 ABORT_KINDS = (
     ("OVERFLOW", "exceeds --sampling-mask-max-tokens"),
+    ("OVERFLOW", "exceed their buffer"),
     ("INVALID", "outside its captured sampling support"),
     ("INVALID", "did not return captured sampling support"),
 )
@@ -54,7 +60,8 @@ ABORT_KINDS = (
 
 def cases(args, stop_token: int) -> dict[str, dict]:
     filtered = {"temperature": 1.0, "top_p": args.top_p, "top_k": args.top_k}
-    return {
+    top_p_only = {"temperature": 1.0, "top_p": args.top_p, "top_k": -1}
+    probe_cases = {
         "a_support": {"params": filtered, "mode": "support", "top_k": args.top_k},
         "b_selected": {"params": filtered, "mode": "selected", "top_k": args.top_k},
         "c_greedy": {"params": {"temperature": 0.0}, "mode": "selected", "top_k": 1, "greedy": True},
@@ -66,6 +73,18 @@ def cases(args, stop_token: int) -> dict[str, dict]:
             "stop_token": stop_token,
         },
     }
+    if not args.packed_ids:
+        probe_cases |= {
+            "f_top_p": {"params": top_p_only, "mode": "support", "top_k": None},
+            "g_top_p_selected": {"params": top_p_only, "mode": "selected", "top_k": None},
+            "h_full_vocab": {
+                "params": {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "max_new_tokens": 4},
+                "mode": "selected",
+                "top_k": None,
+                "min_mask": PACKED_CAP + 1,
+            },
+        }
+    return {name: case | {"ascending": not args.packed_ids} for name, case in probe_cases.items()}
 
 
 def _logsumexp(values: list[float]) -> float:
@@ -104,8 +123,13 @@ def check_response(meta: dict, case: dict, tolerance: float) -> list[str]:
         if token not in mask:
             failures.append(f"{where} is not in its mask of {len(mask)}")
             continue
-        if len(set(mask)) != len(mask) or (len(mask) > case["top_k"] and not _tied_at_top_k(value, case)):
+        past_top_k = case["top_k"] is not None and len(mask) > case["top_k"]
+        if len(set(mask)) != len(mask) or (past_top_k and not _tied_at_top_k(value, case)):
             failures.append(f"{where}: mask of {len(mask)} ids, {len(set(mask))} distinct, top_k {case['top_k']}")
+        if case["ascending"] and mask != sorted(mask):
+            failures.append(f"{where}: mask ids are not ascending, as bitmaps unpack them")
+        if len(mask) < case.get("min_mask", 0):
+            failures.append(f"{where}: mask of {len(mask)} ids, expected at least {case['min_mask']}")
         if case["mode"] == "support":
             if len(value) != len(mask) or abs(_logsumexp([float(entry) for entry in value])) > tolerance:
                 failures.append(f"{where}: support log-probs do not sum to one over the mask")
@@ -143,7 +167,13 @@ async def generate(client, url: str, prompt: list[int], case: dict, args, masks:
 async def run_cases(client, args, prompts: list[list[int]], requests: list[tuple[str, dict]]) -> dict:
     """Send (case name, case) requests over the prompts at the configured concurrency and check each."""
     semaphore = asyncio.Semaphore(args.concurrency)
-    report = {"requests": Counter(), "aborts": Counter(), "failures": [], "stopped_on_stop_token": 0}
+    report = {
+        "requests": Counter(),
+        "aborts": Counter(),
+        "failures": [],
+        "stopped_on_stop_token": 0,
+        "widest_mask": Counter(),
+    }
 
     async def one(index: int, name: str, case: dict) -> None:
         async with semaphore:
@@ -156,6 +186,8 @@ async def run_cases(client, args, prompts: list[list[int]], requests: list[tuple
             report["failures"].append(f"{name} #{index}: aborted: {message[:200]}")
             return
         report["stopped_on_stop_token"] += meta["finish_reason"].get("matched") == case.get("stop_token", object())
+        widest = max(map(len, meta.get("output_token_sampling_mask") or []), default=0)
+        report["widest_mask"][name] = max(report["widest_mask"][name], widest)
         report["failures"].extend(
             f"{name} #{index}: {failure}" for failure in check_response(meta, case, args.tolerance)[:3]
         )
@@ -234,7 +266,9 @@ async def run(args) -> dict:
             prompts,
             [(name, case) for name, case in probe_cases.items() for _ in range(args.case_requests)],
         )
-        sweep = [("a_support", "b_selected", "d_top_k")[index % 3] for index in range(args.sweep_requests)]
+        sweep_names = ("a_support", "b_selected", "d_top_k", "f_top_p", "g_top_p_selected")
+        sweep_cases = [name for name in sweep_names if name in probe_cases]
+        sweep = [sweep_cases[index % len(sweep_cases)] for index in range(args.sweep_requests)]
         report["sweep"] = await run_cases(client, args, prompts, [(name, probe_cases[name]) for name in sweep])
         throughput_case = probe_cases["a_support"]
         await run_throughput(client, args, prompts, throughput_case, masks=False, requests=args.concurrency)  # warm up
@@ -283,6 +317,11 @@ def main() -> None:
     parser.add_argument("--accept-z", type=float, default=3.0)
     parser.add_argument("--timeout-seconds", type=float, default=3600.0)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--packed-ids",
+        action="store_true",
+        help="the engine runs SGLANG_SAMPLING_MASK_PACKED_IDS=1: skip cases (f)-(h) and the ascending-id check",
+    )
     args = parser.parse_args()
 
     report = asyncio.run(run(args))

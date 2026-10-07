@@ -46,10 +46,18 @@ def fake_engine(breakage: str | None = None):
         }
         if body.get("return_sampling_mask"):
             masks = [[token] if greedy else [token, token + 100] for token in tokens]
+            if params.get("top_k") == -1 and params.get("top_p") == 1.0:
+                # The whole vocabulary; the packed path would cap it at 4096 ids.
+                masks = [list(range(4096 if breakage == "capped" else 5000)) for _ in tokens]
             if breakage == "missing_token":
                 masks[1] = [999, 998]
+            if breakage == "descending" and params.get("top_k") == -1:
+                masks = [mask[::-1] for mask in masks]
             if body.get("sampling_logprobs_mode") == "support":
-                values = [[0.0] if greedy else [math.log(0.6), math.log(0.4)] for _ in tokens]
+                values = [
+                    [0.0] if greedy else [math.log(0.6 if entry == token else 0.4) for entry in mask]
+                    for token, mask in zip(tokens, masks, strict=True)
+                ]
             else:
                 values = [0.0 if greedy else math.log(0.6) for _ in tokens]
             if breakage == "trimmed_wrong":
@@ -60,7 +68,7 @@ def fake_engine(breakage: str | None = None):
     return handler
 
 
-def run_probe(monkeypatch, breakage=None) -> tuple[dict, list[str]]:
+def run_probe(monkeypatch, breakage=None, packed_ids=False) -> tuple[dict, list[str]]:
     transport = httpx.MockTransport(fake_engine(breakage))
     real_client = httpx.AsyncClient
     monkeypatch.setattr(probe.httpx, "AsyncClient", lambda **kwargs: real_client(transport=transport, **kwargs))
@@ -79,6 +87,7 @@ def run_probe(monkeypatch, breakage=None) -> tuple[dict, list[str]]:
         tolerance=1e-5,
         accept_z=3.0,
         timeout_seconds=30.0,
+        packed_ids=packed_ids,
     )
     report = probe.asyncio.run(probe.run(args))
     return report, probe.failures_of(report, args)
@@ -89,7 +98,15 @@ def test_a_consistent_engine_passes(monkeypatch):
     assert failures == []
     json.dumps(report)  # prompts are plain token ids, not a BatchEncoding
     assert report["cases"]["stopped_on_stop_token"] == 4
+    assert report["cases"]["widest_mask"]["h_full_vocab"] == 5000
+    assert set(report["sweep"]["requests"]) == {"a_support", "b_selected", "d_top_k", "f_top_p", "g_top_p_selected"}
     assert report["throughput"]["on"]["accept_length"] == report["throughput"]["off"]["accept_length"] == 4.0
+
+
+def test_packed_ids_skip_bitmap_only_checks(monkeypatch):
+    report, failures = run_probe(monkeypatch, "descending", packed_ids=True)
+    assert failures == []
+    assert set(report["cases"]["requests"]) == {"a_support", "b_selected", "c_greedy", "d_top_k", "e_stop"}
 
 
 @pytest.mark.parametrize(
@@ -99,17 +116,19 @@ def test_a_consistent_engine_passes(monkeypatch):
         ("trimmed_wrong", "masks,"),
         ("overflow", "aborted: Sampling support exceeds"),
         ("slower_accept", "accept length with masks differs"),
+        ("descending", "not ascending"),
+        ("capped", "expected at least 4097"),
     ],
 )
 def test_each_broken_contract_fails(monkeypatch, breakage, expected):
     report, failures = run_probe(monkeypatch, breakage)
     assert any(expected in failure for failure in failures), failures[:5]
     if breakage == "overflow":
-        assert report["sweep"]["aborts"]["OVERFLOW"] == 4
+        assert report["sweep"]["aborts"]["OVERFLOW"] == report["sweep"]["requests"]["d_top_k"] == 2
 
 
 def test_check_response_rejects_unnormalized_support_and_non_singleton_greedy():
-    support = {"mode": "support", "top_k": 1024}
+    support = {"mode": "support", "top_k": 1024, "ascending": True}
     meta = {
         "output_token_logprobs": [(-1.0, 7, None)],
         "completion_tokens": 1,
@@ -118,7 +137,7 @@ def test_check_response_rejects_unnormalized_support_and_non_singleton_greedy():
         "output_token_sampling_logprobs": [[math.log(0.5), math.log(0.4)]],
     }
     assert "do not sum to one" in probe.check_response(meta, support, 1e-5)[0]
-    greedy = {"mode": "selected", "top_k": 1, "greedy": True}
+    greedy = {"mode": "selected", "top_k": 1, "greedy": True, "ascending": True}
     meta |= {"output_token_sampling_mask": [[7]], "output_token_sampling_logprobs": [-0.1]}
     assert "greedy mask" in probe.check_response(meta, greedy, 1e-5)[0]
 
@@ -131,7 +150,7 @@ def test_check_response_rejects_unnormalized_support_and_non_singleton_greedy():
     ],
 )
 def test_masks_past_top_k_pass_only_for_cutoff_ties(probabilities, passes):
-    case = {"mode": "support", "top_k": 3}
+    case = {"mode": "support", "top_k": 3, "ascending": True}
     meta = {
         "output_token_logprobs": [(math.log(0.4), 7, None)],
         "completion_tokens": 1,
@@ -142,6 +161,7 @@ def test_masks_past_top_k_pass_only_for_cutoff_ties(probabilities, passes):
     failures = probe.check_response(meta, case, 1e-5)
     assert (failures == []) is passes, failures
     selected = meta | {"output_token_sampling_logprobs": [math.log(0.4)]}
-    assert probe.check_response(selected, {"mode": "selected", "top_k": 3}, 1e-5), "selected mode has no tie evidence"
+    selected_case = {"mode": "selected", "top_k": 3, "ascending": True}
+    assert probe.check_response(selected, selected_case, 1e-5), "selected mode has no tie evidence"
     short_row = meta | {"output_token_sampling_logprobs": [[math.log(0.4), math.log(0.6)]]}
     assert probe.check_response(short_row, case, 1e-5), "a row shorter than its mask is reported, not raised"

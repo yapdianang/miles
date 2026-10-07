@@ -1,0 +1,1123 @@
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index f890cc20f2..8ac0da0502 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -100,7 +100,12 @@ class SamplingMaskStatus(IntEnum):
+ 
+ @dataclasses.dataclass
+ class SamplingMaskOutput:
+-    """Sampling-support IDs and optional full-support behavior logprobs."""
++    """Sampling-support IDs and optional full-support behavior logprobs.
++
++    With support bitmaps (sampling/support_bitmap.py), token_ids is a uint8
++    [..., bitmap_width(V)] bitmap, lengths holds the full support sizes, and
++    support_logprobs is one flat buffer over support-mode positions.
++    """
+ 
+     token_ids: torch.Tensor
+     lengths: torch.Tensor
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index e77b853de0..b637345ed0 100644
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -22,6 +22,12 @@ from sglang.srt.layers.logprob_processor import (
+ from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.sampling.sampling_params import TOP_K_ALL
++from sglang.srt.sampling.support_bitmap import (
++    bitmap_from_tokens,
++    pack_support_bitmap,
++    support_bitmap_enabled,
++    support_members,
++)
+ from sglang.srt.true_on_policy import resolve_true_on_policy_runtime_policy
+ from sglang.srt.utils.async_probe import sanitize_nan_logits
+ from sglang.srt.utils.common import (
+@@ -108,6 +114,9 @@ def _select_sampling_mask_rows(
+ 
+ 
+ class Sampler(nn.Module):
++    # Sampling masks as full-vocabulary bitmaps instead of packed top ids.
++    support_bitmap: bool = False
++
+     def __init__(self):
+         super().__init__()
+         self.tp_sync_group = get_parallel().tp_group.device_group
+@@ -127,6 +136,7 @@ class Sampler(nn.Module):
+         self.use_log_softmax_logprob = true_on_policy.enabled
+         self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
+         self.sampling_mask_max_tokens = get_exec().features.sampling_mask_max_tokens
++        self.support_bitmap = support_bitmap_enabled()
+ 
+         self.output_logprob_processor = OutputLogprobProcessor()
+ 
+@@ -298,6 +308,7 @@ class Sampler(nn.Module):
+                         sampling_mask_batch_indices,
+                         batch_next_token_ids,
+                         sampling_support_logprobs_capture_indices,
++                        vocab_size=logits.shape[-1],
+                     )
+                 )
+             else:
+@@ -464,11 +475,17 @@ class Sampler(nn.Module):
+         batch_indices: torch.Tensor,
+         batch_next_token_ids: torch.Tensor,
+         support_capture_indices: Optional[torch.Tensor],
++        *,
++        vocab_size: int,
+     ) -> SamplingMaskOutput:
+         token_ids = batch_next_token_ids.index_select(0, batch_indices).to(torch.int32)
+         num_requests = batch_indices.numel()
+         return SamplingMaskOutput(
+-            token_ids=token_ids.view(-1, 1),
++            token_ids=(
++                bitmap_from_tokens(token_ids, vocab_size)
++                if self.support_bitmap
++                else token_ids.view(-1, 1)
++            ),
+             lengths=torch.ones(
+                 num_requests, dtype=torch.int32, device=token_ids.device
+             ),
+@@ -477,7 +494,11 @@ class Sampler(nn.Module):
+             ),
+             support_logprobs=(
+                 torch.zeros(
+-                    (support_capture_indices.numel(), 1),
++                    (
++                        (support_capture_indices.numel(),)
++                        if self.support_bitmap
++                        else (support_capture_indices.numel(), 1)
++                    ),
+                     dtype=torch.float32,
+                     device=token_ids.device,
+                 )
+@@ -503,6 +524,10 @@ class Sampler(nn.Module):
+         weights = sampling_mask_capture.weights
+         token_ids = sampling_mask_capture.token_ids
+         selected_weight = sampling_mask_capture.selected_weight
++        if self.support_bitmap and token_ids is not None:
++            # Bitmaps index weights by token id; the PyTorch producer sorts them.
++            weights = torch.zeros_like(weights).scatter_(1, token_ids.long(), weights)
++            token_ids = None
+         sampled_tokens = batch_next_token_ids.index_select(0, batch_indices).view(-1, 1)
+         sampled_tokens_int32 = sampled_tokens.to(torch.int32)
+         if token_ids is None:
+@@ -535,7 +560,24 @@ class Sampler(nn.Module):
+             & torch.isfinite(selected_logprobs)
+         )
+         realized_lengths = support.sum(dim=-1, dtype=torch.int32)
+-        overflow = realized_lengths > self.sampling_mask_max_tokens
++        if self.support_bitmap:
++            # Bitmaps hold any support; only the shared support-mode log-prob
++            # buffer can run out.
++            overflow = torch.zeros_like(invalid)
++            support_logprobs = None
++            if support_capture_indices is not None:
++                vocab_size = weights.shape[-1]
++                members, fits = support_members(
++                    _select_sampling_mask_rows(support, support_capture_indices),
++                    self.sampling_mask_max_tokens,
++                )
++                rows = support_capture_indices[members // vocab_size]
++                support_logprobs = torch.log(
++                    weights[rows, members % vocab_size].float() / support_mass[rows]
++                )
++                overflow[support_capture_indices] = ~fits
++        else:
++            overflow = realized_lengths > self.sampling_mask_max_tokens
+         statuses = torch.where(
+             invalid,
+             SamplingMaskStatus.INVALID,
+@@ -560,6 +602,15 @@ class Sampler(nn.Module):
+                     statuses, op=dist.ReduceOp.MAX, group=self.cp_sync_group
+                 )
+ 
++        if self.support_bitmap:
++            return SamplingMaskOutput(
++                token_ids=pack_support_bitmap(support),
++                lengths=realized_lengths,
++                selected_logprobs=selected_logprobs,
++                support_logprobs=support_logprobs,
++                statuses=statuses,
++            )
++
+         packed_size = min(self.sampling_mask_max_tokens, weights.shape[-1])
+         if token_ids is None:
+             packed_weights, packed_positions = torch.topk(
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index d119988274..8ce590e2d3 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -326,6 +326,7 @@ from sglang.srt.platforms import current_platform
+ from sglang.srt.plugins import load_plugins
+ from sglang.srt.rust_server.server import RustServer
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
++from sglang.srt.sampling.support_bitmap import support_bitmap_enabled
+ from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
+ from sglang.srt.session.session_controller import SessionController
+ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+@@ -2976,7 +2977,12 @@ class Scheduler(
+                 return
+             top_k = req.sampling_params.top_k
+             sampling_mask_cap = self.server_args.sampling_mask_max_tokens
+-            if top_k != 1 and not (1 < top_k <= sampling_mask_cap):
++            # Bitmaps carry supports of any size.
++            if (
++                not support_bitmap_enabled()
++                and top_k != 1
++                and not (1 < top_k <= sampling_mask_cap)
++            ):
+                 error_msg = (
+                     "return_sampling_mask requires top_k=1 for greedy sampling "
+                     f"or finite 1 < top_k <= {sampling_mask_cap}; got top_k="
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index 5cc34fa917..b0e0c446e5 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -49,6 +49,10 @@ from sglang.srt.runtime_context import (
+ from sglang.srt.sampling.sampling_params import (
+     get_request_reasoning_end_token_ids,
+ )
++from sglang.srt.sampling.support_bitmap import (
++    support_bitmap_enabled,
++    unpack_sampling_masks,
++)
+ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+ from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+@@ -1209,12 +1213,12 @@ class SchedulerBatchResultProcessor:
+             if status == SamplingMaskStatus.OK:
+                 row_lengths = lengths[row][:num_tokens]
+                 masks[batch_index] = [
+-                    token_ids[row, token, :length]
++                    token_ids[row][token][:length]
+                     for token, length in enumerate(row_lengths)
+                 ]
+                 if returns_support_logprobs:
+                     logprobs[batch_index] = [
+-                        support_logprobs[support_row, token, :length]
++                        support_logprobs[support_row][token][:length]
+                         for token, length in enumerate(row_lengths)
+                     ]
+                 else:
+@@ -1251,11 +1255,23 @@ class SchedulerBatchResultProcessor:
+             if sampling_output.support_logprobs is None
+             else sampling_output.support_logprobs.cpu().numpy()
+         )
+-        if sampling_output.num_accept_tokens is not None:
++        num_accept_tokens = (
++            None
++            if sampling_output.num_accept_tokens is None
++            else sampling_output.num_accept_tokens.tolist()
++        )
++        if token_ids.dtype == np.uint8:
++            token_ids, lengths, support_logprobs = unpack_sampling_masks(
++                token_ids,
++                [reqs[i].sampling_logprobs_mode == "support" for i in batch_indices],
++                support_logprobs,
++                num_accept_tokens,
++            )
++        if num_accept_tokens is not None:
+             SchedulerBatchResultProcessor._fill_speculative_sampling_mask_rows(
+                 reqs=reqs,
+                 batch_indices=batch_indices,
+-                num_accept_tokens=sampling_output.num_accept_tokens.tolist(),
++                num_accept_tokens=num_accept_tokens,
+                 lengths=lengths,
+                 statuses=statuses,
+                 token_ids=token_ids,
+@@ -1280,9 +1296,9 @@ class SchedulerBatchResultProcessor:
+             length = int(lengths[row])
+             status_by_batch[batch_index] = status
+             if status == SamplingMaskStatus.OK:
+-                masks[batch_index] = token_ids[row, :length]
++                masks[batch_index] = token_ids[row][:length]
+                 if returns_support_logprobs:
+-                    logprobs[batch_index] = support_logprobs[support_row, :length]
++                    logprobs[batch_index] = support_logprobs[support_row][:length]
+                 else:
+                     logprobs[batch_index] = selected_logprobs[row : row + 1]
+             if returns_support_logprobs:
+@@ -1300,6 +1316,15 @@ class SchedulerBatchResultProcessor:
+     ) -> Optional[FINISH_ABORT]:
+         if status == SamplingMaskStatus.OK:
+             return None
++        if status == SamplingMaskStatus.OVERFLOW and support_bitmap_enabled():
++            return FINISH_ABORT(
++                "Support-mode log-probs of this batch exceed their buffer of "
++                "positions x --sampling-mask-max-tokens="
++                f"{get_exec().features.sampling_mask_max_tokens} + vocabulary size "
++                "entries. Increase the server limit or use selected mode.",
++                HTTPStatus.BAD_REQUEST,
++                "BadRequestError",
++            )
+         if status == SamplingMaskStatus.OVERFLOW:
+             return FINISH_ABORT(
+                 "Sampling support exceeds --sampling-mask-max-tokens="
+diff --git a/python/sglang/srt/sampling/support_bitmap.py b/python/sglang/srt/sampling/support_bitmap.py
+new file mode 100644
+index 0000000000..90fdf15de7
+--- /dev/null
++++ b/python/sglang/srt/sampling/support_bitmap.py
+@@ -0,0 +1,132 @@
++"""Sampling supports as full-vocabulary bitmaps.
++
++The device packs each support into a bitmap of fixed shape and full vocabulary width, so the
++device-to-host copy needs no synchronization and never truncates a support, even one that spans
++the vocabulary. The host unpacks the bitmaps to sparse token ids. Support-mode log-probs share one
++buffer of ``positions * budget + vocab_size`` entries per batch, positions in order and ids
++ascending, where budget is --sampling-mask-max-tokens (DFlash: at most the batch's top_k). A
++position may take the room others leave, so a support that spans the vocabulary always fits
++while the other positions keep within their budget.
++"""
++
++from typing import List, Optional, Sequence, Tuple
++
++import numpy as np
++import torch
++
++from sglang.srt.runtime_context import get_disagg
++from sglang.srt.utils.common import get_bool_env_var
++
++
++def support_bitmap_enabled() -> bool:
++    """Bitmaps unless SGLANG_SAMPLING_MASK_PACKED_IDS=1. Disaggregated serving keeps packed ids:
++    its prefill-to-decode buffer holds at most --sampling-mask-max-tokens ids per token.
++    """
++    return (
++        not get_bool_env_var("SGLANG_SAMPLING_MASK_PACKED_IDS")
++        and get_disagg().disaggregation_mode == "null"
++    )
++
++
++def bitmap_width(vocab_size: int) -> int:
++    """Bytes per bitmap, in whole 64-bit words for the host scan."""
++    return -(-vocab_size // 64) * 8
++
++
++def pack_support_bitmap(support: torch.Tensor) -> torch.Tensor:
++    """bool [..., V] -> uint8 [..., bitmap_width(V)]; bit b of byte j marks token 8 * j + b."""
++    vocab_size = support.shape[-1]
++    width = bitmap_width(vocab_size)
++    bits = support.to(torch.uint8)
++    if width * 8 != vocab_size:
++        bits = torch.nn.functional.pad(bits, (0, width * 8 - vocab_size))
++    shifts = torch.arange(8, dtype=torch.uint8, device=support.device)
++    return (bits.reshape(*support.shape[:-1], width, 8) << shifts).sum(
++        dim=-1, dtype=torch.uint8
++    )
++
++
++def bitmap_from_tokens(token_ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
++    """Singleton supports: int [...] -> uint8 [..., bitmap_width(V)]."""
++    tokens = token_ids.long().unsqueeze(-1)
++    bitmap = torch.zeros(
++        (*token_ids.shape, bitmap_width(vocab_size)),
++        dtype=torch.uint8,
++        device=token_ids.device,
++    )
++    return bitmap.scatter_(-1, tokens // 8, (1 << (tokens % 8)).to(torch.uint8))
++
++
++def support_members(
++    support: torch.Tensor, budget: int
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Flat indices into ``support`` [..., V] of its members, positions in order and ids ascending,
++    filling a buffer of positions * budget + V entries. ``fits`` [...] is False where a
++    position's members run past the buffer."""
++    vocab_size = support.shape[-1]
++    size = support.numel() // vocab_size * budget + vocab_size
++    members = torch.nonzero_static(support.reshape(-1), size=size, fill_value=0)
++    ends = support.sum(dim=-1).reshape(-1).cumsum(dim=0)
++    return members.squeeze(1), (ends <= size).view(support.shape[:-1])
++
++
++def unpack_support_bitmap(bitmap: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
++    """uint8 [rows, W] -> (int32 ids, int64 offsets [rows + 1]); row r's ids, ascending, are
++    ``ids[offsets[r]:offsets[r + 1]]``. Only nonzero 64-bit words are expanded."""
++    words = np.ascontiguousarray(bitmap).view("<u8")
++    rows, columns = np.nonzero(words)
++    bits = np.unpackbits(
++        words[rows, columns].view(np.uint8).reshape(-1, 8), axis=-1, bitorder="little"
++    )
++    hits, bit = np.nonzero(bits)
++    ids = (columns[hits] * 64 + bit).astype(np.int32)
++    offsets = np.zeros(len(words) + 1, dtype=np.int64)
++    np.cumsum(np.bincount(rows[hits], minlength=len(words)), out=offsets[1:])
++    return ids, offsets
++
++
++def unpack_sampling_masks(
++    bitmap: np.ndarray,
++    returns_support_logprobs: Sequence[bool],
++    support_logprobs: Optional[np.ndarray],
++    num_accept_tokens: Optional[Sequence[int]] = None,
++) -> Tuple[list, list, list]:
++    """Host rows of a bitmap SamplingMaskOutput: per mask row its support ids and lengths, and per
++    support-mode row its log-probs, cut from the shared buffer in device order. Speculative bitmaps
++    [rows, draft, W] keep each row's first num_accept_tokens positions, as lists over tokens.
++    """
++    speculative = num_accept_tokens is not None
++    counts = np.asarray(
++        num_accept_tokens if speculative else [1] * len(bitmap), dtype=np.int64
++    )
++    positions = bitmap
++    if speculative:
++        rows = np.repeat(np.arange(len(bitmap)), counts)
++        tokens = np.arange(len(rows)) - np.repeat(np.cumsum(counts) - counts, counts)
++        positions = bitmap[rows, tokens]
++    ids, offsets = unpack_support_bitmap(positions)
++    supports = [ids[offsets[i] : offsets[i + 1]] for i in range(len(positions))]
++    lengths = np.diff(offsets).tolist()
++    support_rows = np.asarray(returns_support_logprobs, dtype=bool)
++    logprobs = []
++    if support_logprobs is not None:
++        end = 0
++        for keep, length in zip(np.repeat(support_rows, counts).tolist(), lengths):
++            if keep:
++                # A position past the buffer end is OVERFLOW and never read.
++                logprobs.append(support_logprobs[end : end + length])
++                end += length
++    if not speculative:
++        return supports, lengths, logprobs
++    counts = counts.tolist()
++    support_counts = [count for count, keep in zip(counts, support_rows) if keep]
++    return (
++        _group(supports, counts),
++        _group(lengths, counts),
++        _group(logprobs, support_counts),
++    )
++
++
++def _group(values: list, counts: List[int]) -> List[list]:
++    ends = np.cumsum(counts, dtype=np.int64).tolist()
++    return [values[end - count : end] for count, end in zip(counts, ends)]
+diff --git a/python/sglang/srt/speculative/spec_sampling_mask.py b/python/sglang/srt/speculative/spec_sampling_mask.py
+index ee75275333..a1a425daae 100644
+--- a/python/sglang/srt/speculative/spec_sampling_mask.py
++++ b/python/sglang/srt/speculative/spec_sampling_mask.py
+@@ -7,7 +7,12 @@ import torch
+ 
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.logits_processor import SamplingMaskOutput, SamplingMaskStatus
+-from sglang.srt.runtime_context import get_spec
++from sglang.srt.runtime_context import get_exec, get_spec
++from sglang.srt.sampling.support_bitmap import (
++    pack_support_bitmap,
++    support_bitmap_enabled,
++    support_members,
++)
+ from sglang.srt.speculative.dflash_utils import (
+     build_speculative_verify_target_probs,
+     is_dflash_sampling_verify_available,
+@@ -61,6 +66,9 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
+     max_top_k: int
+     greedy_mask: torch.Tensor | None = None
+     support_capture_indices: torch.Tensor | None = None
++    # Vocabulary width of full-vocabulary support bitmaps; None packs the top
++    # max_top_k ids instead.
++    bitmap_vocab_size: int | None = None
+ 
+     @classmethod
+     def from_logits(
+@@ -93,6 +101,9 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
+             max_top_k=max(sampling_info.sampling_mask_top_ks),
+             greedy_mask=greedy_mask,
+             support_capture_indices=sampling_info.sampling_support_logprobs_capture_indices,
++            bitmap_vocab_size=(
++                next_token_logits.shape[-1] if support_bitmap_enabled() else None
++            ),
+         )
+ 
+     def build_output(
+@@ -109,6 +120,10 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
+             if self.greedy_mask is None
+             else self.greedy_mask.index_select(0, batch_indices).clone()
+         )
++        if self.bitmap_vocab_size is not None:
++            return self._build_bitmap_output(
++                output_tokens, num_accept_tokens, greedy_mask
++            )
+ 
+         support_logprobs = None
+         if self.target_probs is None:
+@@ -177,3 +192,86 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
+             statuses=statuses,
+             num_accept_tokens=num_accept_tokens,
+         )
++
++    def _build_bitmap_output(
++        self,
++        output_tokens: torch.Tensor,
++        num_accept_tokens: torch.Tensor,
++        greedy_mask: torch.Tensor | None,
++    ) -> SamplingMaskOutput:
++        """Full-vocabulary bitmaps [rows, draft, W]; support-mode log-probs of
++        the committed positions share one buffer, in row and token order."""
++        vocab_size = self.bitmap_vocab_size
++        num_rows, num_draft = output_tokens.shape
++        tokens = output_tokens.long()
++        if self.target_probs is None or greedy_mask is not None:
++            singletons = torch.zeros(
++                (num_rows, num_draft, vocab_size),
++                dtype=torch.bool,
++                device=output_tokens.device,
++            ).scatter_(-1, tokens.unsqueeze(-1), True)
++        if self.target_probs is None:
++            support = singletons
++            selected_logprobs = torch.zeros_like(output_tokens, dtype=torch.float32)
++        else:
++            support = (self.target_probs > 0).index_select(0, self.batch_indices)
++            positions = torch.arange(num_draft, device=output_tokens.device)
++            selected_logprobs = torch.log(
++                self.target_probs[self.batch_indices[:, None], positions, tokens]
++            )
++            if greedy_mask is not None:
++                support = torch.where(greedy_mask[:, None, None], singletons, support)
++                selected_logprobs = torch.where(
++                    greedy_mask[:, None],
++                    torch.zeros_like(selected_logprobs),
++                    selected_logprobs,
++                )
++
++        overflow = torch.zeros_like(output_tokens, dtype=torch.bool)
++        support_logprobs = None
++        if self.support_capture_indices is not None:
++            rows = self.support_capture_indices
++            committed = torch.arange(
++                num_draft, device=output_tokens.device
++            ) < num_accept_tokens.index_select(0, rows).unsqueeze(-1)
++            members, fits = support_members(
++                support.index_select(0, rows) & committed.unsqueeze(-1),
++                min(get_exec().features.sampling_mask_max_tokens, self.max_top_k),
++            )
++            overflow[rows] = ~fits & committed
++            position = members // vocab_size
++            if self.target_probs is None:
++                support_logprobs = torch.zeros_like(members, dtype=torch.float32)
++            else:
++                row = rows[position // num_draft]
++                support_logprobs = torch.log(
++                    self.target_probs[
++                        self.batch_indices[row],
++                        position % num_draft,
++                        members % vocab_size,
++                    ]
++                )
++                if greedy_mask is not None:
++                    support_logprobs = torch.where(
++                        greedy_mask[row],
++                        torch.zeros_like(support_logprobs),
++                        support_logprobs,
++                    )
++
++        statuses = torch.where(
++            torch.isfinite(selected_logprobs),
++            torch.where(
++                overflow,
++                int(SamplingMaskStatus.OVERFLOW),
++                int(SamplingMaskStatus.OK),
++            ),
++            int(SamplingMaskStatus.INVALID),
++        ).to(torch.int8)
++        return SamplingMaskOutput(
++            token_ids=pack_support_bitmap(support),
++            lengths=support.sum(dim=-1, dtype=torch.int32),
++            selected_logprobs=selected_logprobs,
++            support_logprobs=support_logprobs,
++            statuses=statuses,
++            num_accept_tokens=num_accept_tokens,
++        )
+diff --git a/test/registered/sampling/test_sampling_mask.py b/test/registered/sampling/test_sampling_mask.py
+index 7aeec97cc1..265da9a0eb 100644
+--- a/test/registered/sampling/test_sampling_mask.py
++++ b/test/registered/sampling/test_sampling_mask.py
+@@ -700,6 +700,7 @@ class TestSamplingMaskPacking(CustomTestCase):
+                 torch.tensor([0, 2], device="cuda"),
+                 tokens,
+                 support_capture_indices=torch.tensor([0, 1], device="cuda"),
++                vocab_size=8,
+             ),
+         )
+         result = GenerationBatchResult(
+diff --git a/test/registered/unit/managers/test_batch_result_processor_hidden_states.py b/test/registered/unit/managers/test_batch_result_processor_hidden_states.py
+index 8122187d51..616bb7a1cf 100644
+--- a/test/registered/unit/managers/test_batch_result_processor_hidden_states.py
++++ b/test/registered/unit/managers/test_batch_result_processor_hidden_states.py
+@@ -385,12 +385,16 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
+     def test_overflow_and_invalid_have_distinct_http_errors(self):
+         processor = _make_processor(self)
+ 
+-        overflow = processor.get_sampling_mask_finish_reason(
+-            status=SamplingMaskStatus.OVERFLOW
+-        )
+-        self.assertEqual(overflow.status_code, 400)
+-        self.assertEqual(overflow.err_type, "BadRequestError")
+-        self.assertIn("cutoff ties", overflow.message)
++        for packed_ids, message in (("1", "cutoff ties"), ("0", "log-probs")):
++            with patch.dict(
++                "os.environ", {"SGLANG_SAMPLING_MASK_PACKED_IDS": packed_ids}
++            ):
++                overflow = processor.get_sampling_mask_finish_reason(
++                    status=SamplingMaskStatus.OVERFLOW
++                )
++            self.assertEqual(overflow.status_code, 400)
++            self.assertEqual(overflow.err_type, "BadRequestError")
++            self.assertIn(message, overflow.message)
+ 
+         invalid = processor.get_sampling_mask_finish_reason(
+             status=SamplingMaskStatus.INVALID
+diff --git a/test/registered/unit/sampling/test_support_bitmap.py b/test/registered/unit/sampling/test_support_bitmap.py
+new file mode 100644
+index 0000000000..6d8492518b
+--- /dev/null
++++ b/test/registered/unit/sampling/test_support_bitmap.py
+@@ -0,0 +1,548 @@
++"""Unit tests for srt/sampling/support_bitmap.py and the bitmap sampling-mask path — no server."""
++
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=20, suite="base-a-test-cpu")
++
++import os
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import numpy as np
++import torch
++
++from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
++from sglang.srt.layers.sampler import Sampler, _SamplingMaskCapture
++from sglang.srt.managers.rollout_records import selected_logprobs_chunk
++from sglang.srt.managers.scheduler_components.batch_result_processor import (
++    SchedulerBatchResultProcessor,
++)
++from sglang.srt.runtime_context import get_context
++from sglang.srt.sampling import support_bitmap
++from sglang.srt.sampling.sampling_mask import SamplingMaskRows
++from sglang.srt.sampling.support_bitmap import (
++    bitmap_from_tokens,
++    bitmap_width,
++    pack_support_bitmap,
++    support_members,
++    unpack_support_bitmap,
++)
++from sglang.srt.speculative.spec_sampling_mask import SpeculativeSamplingMaskCapture
++from sglang.test.test_utils import CustomTestCase
++
++OLD_CAP = 4096
++
++
++def _support(vocab_size: int, ids) -> torch.Tensor:
++    support = torch.zeros(vocab_size, dtype=torch.bool)
++    support[torch.as_tensor(ids, dtype=torch.long)] = True
++    return support
++
++
++def _materialize(output, modes):
++    """Host rows through the result processor; modes holds None for rows without masks."""
++    reqs = [
++        SimpleNamespace(
++            return_sampling_mask=mode is not None, sampling_logprobs_mode=mode
++        )
++        for mode in modes
++    ]
++    logits_output = LogitsProcessorOutput(
++        next_token_logits=None, sampling_mask_output=output
++    )
++    SchedulerBatchResultProcessor.materialize_sampling_mask_output(reqs, logits_output)
++    return logits_output
++
++
++def _by_id(ids, values):
++    """Support ids and their values, ordered by id."""
++    order = np.argsort(np.asarray(ids), kind="stable")
++    return np.asarray(ids)[order].tolist(), np.asarray(values)[order]
++
++
++def _weights(generator, rows: int, vocab_size: int, sizes) -> torch.Tensor:
++    """Post-filter weights with the given support sizes and distinct values."""
++    weights = torch.zeros(rows, vocab_size)
++    for row, size in enumerate(sizes):
++        ids = torch.randperm(vocab_size, generator=generator)[:size]
++        weights[row, ids] = torch.rand(size, generator=generator) + 0.01
++    return weights
++
++
++class TestBitmapCodec(CustomTestCase):
++    def test_round_trip_for_support_sizes_from_one_to_the_vocabulary(self):
++        generator = torch.Generator().manual_seed(0)
++        for vocab_size in (1000, 152576):
++            sizes = [1, 2, 7, 63, 64, 65, 999, OLD_CAP + 1, vocab_size - 1, vocab_size]
++            sets = [
++                torch.randperm(vocab_size, generator=generator)[:size].sort().values
++                for size in sizes
++            ]
++            sets.append(torch.tensor([0, vocab_size - 1]))
++            support = torch.stack([_support(vocab_size, ids) for ids in sets])
++            bitmap = pack_support_bitmap(support)
++            self.assertEqual(bitmap.dtype, torch.uint8)
++            self.assertEqual(tuple(bitmap.shape), (len(sets), bitmap_width(vocab_size)))
++            self.assertEqual(bitmap.shape[-1] % 8, 0)
++            ids, offsets = unpack_support_bitmap(bitmap.numpy())
++            for row, expected in enumerate(sets):
++                with self.subTest(vocab_size=vocab_size, size=len(expected)):
++                    np.testing.assert_array_equal(
++                        ids[offsets[row] : offsets[row + 1]], expected.numpy()
++                    )
++            self.assertEqual(ids.dtype, np.int32)
++
++    def test_leading_dimensions_and_empty_rows(self):
++        support = torch.zeros(2, 3, 130, dtype=torch.bool)
++        support[1, 2, [0, 64, 129]] = True
++        bitmap = pack_support_bitmap(support)
++        self.assertEqual(tuple(bitmap.shape), (2, 3, 24))
++        ids, offsets = unpack_support_bitmap(bitmap.reshape(6, -1).numpy())
++        self.assertEqual(offsets.tolist(), [0, 0, 0, 0, 0, 0, 3])
++        self.assertEqual(ids.tolist(), [0, 64, 129])
++
++    def test_token_bitmaps_match_packed_singletons(self):
++        tokens = torch.tensor([[0, 5], [127, 999]])
++        expected = torch.zeros(2, 2, 1000, dtype=torch.bool).scatter_(
++            -1, tokens.unsqueeze(-1), True
++        )
++        torch.testing.assert_close(
++            bitmap_from_tokens(tokens.to(torch.int32), 1000),
++            pack_support_bitmap(expected),
++        )
++
++    def test_members_fill_one_buffer_in_position_order(self):
++        support = torch.stack(
++            [_support(100, [3, 1]), _support(100, range(100)), _support(100, range(40))]
++        )
++        members, fits = support_members(support, budget=10)
++        # 3 * 10 + 100 entries: the first two rows fit, the third runs past.
++        self.assertEqual(members.numel(), 130)
++        expected = torch.nonzero(support.reshape(-1)).squeeze(1)
++        torch.testing.assert_close(members, expected[:130])
++        self.assertEqual(fits.tolist(), [True, True, False])
++
++    def test_one_position_can_span_the_vocabulary(self):
++        support = torch.stack(
++            [_support(152576, [9]), torch.ones(152576, dtype=torch.bool)]
++        )
++        members, fits = support_members(support, budget=4)
++        self.assertEqual(fits.tolist(), [True, True])
++        torch.testing.assert_close(
++            members[1 : 152576 + 1], torch.arange(152576) + 152576
++        )
++
++    def test_switch(self):
++        disagg = SimpleNamespace(disaggregation_mode="null")
++        with patch.object(support_bitmap, "get_disagg", return_value=disagg):
++            self.assertTrue(support_bitmap.support_bitmap_enabled())
++            with patch.dict(os.environ, {"SGLANG_SAMPLING_MASK_PACKED_IDS": "1"}):
++                self.assertFalse(support_bitmap.support_bitmap_enabled())
++            disagg.disaggregation_mode = "prefill"
++            self.assertFalse(support_bitmap.support_bitmap_enabled())
++
++
++def _sampler(bitmap: bool, cap: int) -> Sampler:
++    sampler = Sampler.__new__(Sampler)
++    torch.nn.Module.__init__(sampler)
++    sampler.support_bitmap = bitmap
++    sampler.sampling_mask_max_tokens = cap
++    sampler.tp_sync_group = None
++    sampler.cp_sync_group = None
++    return sampler
++
++
++class TestSamplerBitmap(CustomTestCase):
++    def _build(self, bitmap, cap, capture, tokens, support_rows):
++        return _sampler(bitmap, cap)._build_sampling_mask_output(
++            tokens, capture, support_capture_indices=support_rows
++        )
++
++    def test_rows_and_logprobs_match_the_packed_path(self):
++        generator = torch.Generator().manual_seed(1)
++        vocab_size = 3000
++        weights = _weights(generator, 4, vocab_size, [1, 5, 300, 2999])
++        tokens = torch.multinomial(weights, 1, generator=generator).squeeze(1)
++        modes = ["support", "selected", "support", "support"]
++        support_rows = torch.tensor([0, 2, 3])
++        sorted_weights, sorted_ids = weights.sort(dim=-1, descending=True)
++        producers = {
++            "id order": dict(weights=weights, token_ids=None),
++            "sorted": dict(
++                weights=sorted_weights, token_ids=sorted_ids.to(torch.int32)
++            ),
++        }
++        for name, producer in producers.items():
++            for selected_weight in (
++                None,
++                weights.gather(1, tokens[:, None]).squeeze(1),
++            ):
++                with self.subTest(producer=name, synced=selected_weight is None):
++                    capture = _SamplingMaskCapture(
++                        batch_rows=torch.arange(4),
++                        selected_weight=selected_weight,
++                        **producer,
++                    )
++                    old = self._build(False, vocab_size, capture, tokens, support_rows)
++                    new = self._build(True, OLD_CAP, capture, tokens, support_rows)
++                    self.assertEqual(new.token_ids.dtype, torch.uint8)
++                    torch.testing.assert_close(
++                        new.selected_logprobs, old.selected_logprobs, rtol=0, atol=0
++                    )
++                    old_rows = _materialize(old, modes)
++                    new_rows = _materialize(new, modes)
++                    self.assertEqual(
++                        new_rows.next_token_sampling_mask_status,
++                        [SamplingMaskStatus.OK] * 4,
++                    )
++                    self.assertEqual(
++                        old_rows.next_token_sampling_mask_status,
++                        new_rows.next_token_sampling_mask_status,
++                    )
++                    for row, mode in enumerate(modes):
++                        old_ids = old_rows.next_token_sampling_mask_idx[row]
++                        values = old_rows.next_token_sampling_logprobs[row]
++                        if mode == "support":
++                            ids, values = _by_id(old_ids, values)
++                        else:
++                            ids = sorted(old_ids.tolist())
++                        self.assertEqual(
++                            new_rows.next_token_sampling_mask_idx[row].tolist(), ids
++                        )
++                        # Bitwise equal: the same float32 division and log.
++                        np.testing.assert_array_equal(
++                            new_rows.next_token_sampling_logprobs[row], values
++                        )
++
++    def test_bitmaps_have_no_cap(self):
++        vocab_size = 9000
++        weights = torch.full((1, vocab_size), 1.0 / vocab_size)
++        capture = _SamplingMaskCapture(
++            batch_rows=torch.tensor([0]),
++            weights=weights,
++            token_ids=None,
++            selected_weight=None,
++        )
++        tokens = torch.tensor([8999])
++        for mode, support_rows in (("selected", None), ("support", torch.tensor([0]))):
++            with self.subTest(mode=mode):
++                old = self._build(False, OLD_CAP, capture, tokens, support_rows)
++                self.assertEqual(old.statuses.tolist(), [SamplingMaskStatus.OVERFLOW])
++                rows = _materialize(
++                    self._build(True, OLD_CAP, capture, tokens, support_rows), [mode]
++                )
++                self.assertEqual(
++                    rows.next_token_sampling_mask_status, [SamplingMaskStatus.OK]
++                )
++                self.assertEqual(
++                    rows.next_token_sampling_mask_idx[0].tolist(),
++                    list(range(vocab_size)),
++                )
++                if mode == "support":
++                    np.testing.assert_allclose(
++                        rows.next_token_sampling_logprobs[0],
++                        np.full(
++                            vocab_size, np.log(np.float32(1.0 / vocab_size)), np.float32
++                        ),
++                        rtol=1e-6,
++                    )
++
++    def test_full_log_prob_buffer_aborts_only_positions_past_its_end(self):
++        generator = torch.Generator().manual_seed(2)
++        weights = _weights(generator, 3, 100, [100, 100, 2])
++        capture = _SamplingMaskCapture(
++            batch_rows=torch.arange(3),
++            weights=weights,
++            token_ids=None,
++            selected_weight=None,
++        )
++        tokens = weights.argmax(dim=-1)
++        rows = _materialize(
++            self._build(True, 30, capture, tokens, torch.arange(3)), ["support"] * 3
++        )
++        # 3 * 30 + 100 = 190 entries hold the first row's 100 but not the second's.
++        self.assertEqual(
++            rows.next_token_sampling_mask_status,
++            [
++                SamplingMaskStatus.OK,
++                SamplingMaskStatus.OVERFLOW,
++                SamplingMaskStatus.OVERFLOW,
++            ],
++        )
++        self.assertEqual(len(rows.next_token_sampling_logprobs[0]), 100)
++        selected = _materialize(
++            self._build(True, 30, capture, tokens, None), ["selected"] * 3
++        )
++        self.assertEqual(
++            selected.next_token_sampling_mask_status, [SamplingMaskStatus.OK] * 3
++        )
++
++    def test_rows_reach_the_host_queue_as_packed_rows_do(self):
++        """Request queues and rollout records see the same sparse rows, ids reordered."""
++        generator = torch.Generator().manual_seed(6)
++        weights = _weights(generator, 2, 500, [7, 300])
++        tokens = torch.multinomial(weights, 1, generator=generator).squeeze(1)
++        capture = _SamplingMaskCapture(
++            batch_rows=torch.arange(2),
++            weights=weights,
++            token_ids=None,
++            selected_weight=None,
++        )
++        chunks = []
++        for bitmap in (False, True):
++            output = _materialize(
++                self._build(bitmap, OLD_CAP, capture, tokens, torch.arange(2)),
++                ["support"] * 2,
++            )
++            rows = SamplingMaskRows()
++            for row in range(2):
++                rows.append(
++                    output.next_token_sampling_mask_idx[row],
++                    output.next_token_sampling_logprobs[row],
++                )
++            chunks.append(rows.take())
++        packed, bitmap = chunks
++        self.assertEqual(bitmap.token_ids.dtype, np.int32)
++        self.assertEqual(bitmap.logprobs.dtype, np.float32)
++        np.testing.assert_array_equal(bitmap.lengths, packed.lengths)
++        packed_masks, _ = packed.to_lists(True)
++        bitmap_masks, _ = bitmap.to_lists(True)
++        self.assertEqual([sorted(mask) for mask in packed_masks], bitmap_masks)
++        np.testing.assert_array_equal(
++            selected_logprobs_chunk(bitmap, tokens.numpy(), True).logprobs,
++            selected_logprobs_chunk(packed, tokens.numpy(), True).logprobs,
++        )
++
++    def test_greedy_rows(self):
++        sampler = _sampler(True, OLD_CAP)
++        output = sampler._build_greedy_sampling_mask_output(
++            torch.tensor([0, 2]),
++            torch.tensor([3, 4, 5]),
++            torch.tensor([0, 1]),
++            vocab_size=8,
++        )
++        rows = _materialize(output, ["support", None, "support"])
++        self.assertEqual(
++            [
++                None if row is None else row.tolist()
++                for row in rows.next_token_sampling_mask_idx
++            ],
++            [[3], None, [5]],
++        )
++        self.assertEqual(
++            [
++                None if row is None else row.tolist()
++                for row in rows.next_token_sampling_logprobs
++            ],
++            [[0.0], None, [0.0]],
++        )
++
++
++class TestSpeculativeBitmap(CustomTestCase):
++    def setUp(self):
++        override = get_context().override_server_args(sampling_mask_max_tokens=OLD_CAP)
++        override.install()
++        self.addCleanup(override.restore)
++
++    def _target_probs(self, generator, bs, draft, vocab_size, top_k):
++        logits = torch.randn(bs, draft, vocab_size, generator=generator)
++        kept = logits.topk(top_k, dim=-1)
++        probs = torch.zeros_like(logits).scatter_(
++            -1, kept.indices, kept.values.softmax(dim=-1)
++        )
++        return probs
++
++    def test_committed_rows_match_the_packed_path(self):
++        generator = torch.Generator().manual_seed(3)
++        bs, draft, vocab_size, top_k = 5, 4, 2000, 50
++        target_probs = self._target_probs(generator, bs, draft, vocab_size, top_k)
++        out_tokens = torch.multinomial(
++            target_probs.reshape(-1, vocab_size), 1, generator=generator
++        ).view(bs, draft)
++        commits = [1, 4, 2, 3, 4]
++        commit_lens = torch.tensor(commits)
++        # Rows 0, 2, 3 and 4 ask for masks, all but 3 in support mode; 2 is greedy.
++        batch_indices = torch.tensor([0, 2, 3, 4])
++        modes = ["support", None, "support", "selected", "support"]
++        greedy = torch.tensor([False, False, True, False, False])
++        out_tokens[2] = target_probs[2].argmax(dim=-1)
++        common = dict(
++            target_probs=target_probs,
++            batch_indices=batch_indices,
++            max_top_k=top_k,
++            greedy_mask=greedy,
++            support_capture_indices=torch.tensor([0, 1, 3]),
++        )
++        old = SpeculativeSamplingMaskCapture(**common).build_output(
++            out_tokens=out_tokens, commit_lens=commit_lens
++        )
++        new = SpeculativeSamplingMaskCapture(
++            **common, bitmap_vocab_size=vocab_size
++        ).build_output(out_tokens=out_tokens, commit_lens=commit_lens)
++        self.assertEqual(
++            tuple(new.token_ids.shape), (4, draft, bitmap_width(vocab_size))
++        )
++        # Each support-mode draft position budgets top_k entries, below the server limit.
++        self.assertEqual(new.support_logprobs.numel(), 3 * draft * top_k + vocab_size)
++        torch.testing.assert_close(
++            new.selected_logprobs, old.selected_logprobs, rtol=0, atol=0
++        )
++        old_rows = _materialize(old, modes)
++        new_rows = _materialize(new, modes)
++        self.assertEqual(
++            new_rows.next_token_sampling_mask_status,
++            old_rows.next_token_sampling_mask_status,
++        )
++        for row, mode in enumerate(modes):
++            if mode is None:
++                self.assertIsNone(new_rows.next_token_sampling_mask_idx[row])
++                continue
++            self.assertEqual(
++                len(new_rows.next_token_sampling_mask_idx[row]), commits[row]
++            )
++            for token in range(commits[row]):
++                with self.subTest(row=row, token=token):
++                    old_ids = old_rows.next_token_sampling_mask_idx[row][token]
++                    old_values = old_rows.next_token_sampling_logprobs[row][token]
++                    new_ids = new_rows.next_token_sampling_mask_idx[row][token]
++                    new_values = new_rows.next_token_sampling_logprobs[row][token]
++                    if mode == "support":
++                        ids, values = _by_id(old_ids, old_values)
++                    else:
++                        ids, values = sorted(old_ids.tolist()), old_values
++                    self.assertEqual(new_ids.tolist(), ids)
++                    np.testing.assert_array_equal(new_values, values)
++        self.assertEqual(
++            [ids.tolist() for ids in new_rows.next_token_sampling_mask_idx[2]],
++            [[out_tokens[2, token].item()] for token in range(2)],
++        )
++
++    def test_uncommitted_positions_take_no_buffer(self):
++        generator = torch.Generator().manual_seed(4)
++        bs, draft, vocab_size = 1, 4, 100
++        target_probs = self._target_probs(generator, bs, draft, vocab_size, top_k=60)
++        out_tokens = target_probs.argmax(dim=-1)
++        override = get_context().override_server_args(sampling_mask_max_tokens=20)
++        override.install()
++        self.addCleanup(override.restore)
++        capture = SpeculativeSamplingMaskCapture(
++            target_probs=target_probs,
++            batch_indices=torch.tensor([0]),
++            max_top_k=60,
++            support_capture_indices=torch.tensor([0]),
++            bitmap_vocab_size=vocab_size,
++        )
++        # 4 * 20 + 100 = 180 entries hold three committed positions of 60, not four.
++        cases = (
++            (1, SamplingMaskStatus.OK),
++            (3, SamplingMaskStatus.OK),
++            (4, SamplingMaskStatus.OVERFLOW),
++        )
++        for commit_len, status in cases:
++            with self.subTest(commit_len=commit_len):
++                output = capture.build_output(
++                    out_tokens=out_tokens, commit_lens=torch.tensor([commit_len])
++                )
++                rows = _materialize(output, ["support"])
++                self.assertEqual(rows.next_token_sampling_mask_status, [status])
++
++    def test_all_greedy_rows(self):
++        out_tokens = torch.tensor([[3, 9, 1], [4, 4, 4]])
++        output = SpeculativeSamplingMaskCapture(
++            target_probs=None,
++            batch_indices=torch.tensor([0, 1]),
++            max_top_k=1,
++            support_capture_indices=torch.tensor([1]),
++            bitmap_vocab_size=10,
++        ).build_output(out_tokens=out_tokens, commit_lens=torch.tensor([2, 3]))
++        rows = _materialize(output, ["selected", "support"])
++        self.assertEqual(
++            [
++                [ids.tolist() for ids in row]
++                for row in rows.next_token_sampling_mask_idx
++            ],
++            [[[3], [9]], [[4], [4], [4]]],
++        )
++        self.assertEqual(
++            [
++                [values.tolist() for values in row]
++                for row in rows.next_token_sampling_logprobs
++            ],
++            [[[0.0], [0.0]], [[0.0], [0.0], [0.0]]],
++        )
++
++
++@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
++class TestDeviceCaptureSync(CustomTestCase):
++    def setUp(self):
++        override = get_context().override_server_args(sampling_mask_max_tokens=OLD_CAP)
++        override.install()
++        self.addCleanup(override.restore)
++
++    def test_bitmap_capture_never_synchronizes(self):
++        generator = torch.Generator().manual_seed(5)
++        vocab_size, draft = 152576, 4
++        weights = _weights(
++            generator, 8, vocab_size, [1, 3, 50, 4097, 9000, 1, 2, vocab_size]
++        )
++        tokens = torch.multinomial(weights, 1, generator=generator).squeeze(1)
++        target_probs = weights[:, None, :].repeat(1, draft, 1)
++        target_probs /= target_probs.sum(dim=-1, keepdim=True)
++        weights, tokens, target_probs = (
++            weights.cuda(),
++            tokens.cuda(),
++            target_probs.cuda(),
++        )
++        capture = _SamplingMaskCapture(
++            batch_rows=torch.arange(8, device="cuda"),
++            weights=weights,
++            token_ids=None,
++            selected_weight=None,
++        )
++        spec_capture = SpeculativeSamplingMaskCapture(
++            target_probs=target_probs,
++            batch_indices=torch.arange(8, device="cuda"),
++            max_top_k=vocab_size,
++            greedy_mask=torch.arange(8, device="cuda") == 1,
++            support_capture_indices=torch.tensor([0, 2, 7], device="cuda"),
++            bitmap_vocab_size=vocab_size,
++        )
++        out_tokens = tokens[:, None].repeat(1, draft)
++        torch.cuda.synchronize()
++        torch.cuda.set_sync_debug_mode("error")
++        try:
++            plain = _sampler(True, OLD_CAP)._build_sampling_mask_output(
++                tokens,
++                capture,
++                support_capture_indices=torch.tensor([1, 3, 7], device="cuda"),
++            )
++            spec = spec_capture.build_output(
++                out_tokens=out_tokens,
++                commit_lens=torch.tensor([3, 3, 3, 3, 3, 3, 3, 1], device="cuda"),
++            )
++        finally:
++            torch.cuda.set_sync_debug_mode(0)
++        rows = _materialize(
++            plain,
++            ["selected", "support", "selected", "support"]
++            + ["selected"] * 3
++            + ["support"],
++        )
++        self.assertEqual(
++            rows.next_token_sampling_mask_status, [SamplingMaskStatus.OK] * 8
++        )
++        self.assertEqual(len(rows.next_token_sampling_mask_idx[7]), vocab_size)
++        self.assertEqual(len(rows.next_token_sampling_logprobs[7]), vocab_size)
++        rows = _materialize(
++            spec, ["support", "selected", "support"] + ["selected"] * 4 + ["support"]
++        )
++        self.assertEqual(
++            rows.next_token_sampling_mask_status, [SamplingMaskStatus.OK] * 8
++        )
++        self.assertEqual(len(rows.next_token_sampling_mask_idx[7][0]), vocab_size)
++        self.assertEqual(len(rows.next_token_sampling_logprobs[7][0]), vocab_size)
++
++
++if __name__ == "__main__":
++    unittest.main()
