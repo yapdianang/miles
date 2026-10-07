@@ -5,7 +5,8 @@ serve_mimo_v26_flash_tinker.py flags, ``--num-engines`` configurations at a time
 ``--rollouts`` (export_rollouts.py's heldout.jsonl) in order per trajectory, each sampled from its recorded prompt
 until EOS or ``--max-new-tokens`` with the Tau3 Miles rollout parameters, trajectories ``--concurrency`` at a
 time. Reports accept length (completion tokens / verify steps), the same without each request's first token (it
-comes from prefill, not a verify step; eval_offline's walk accept length counts this way), and output tok/s.
+comes from prefill, not a verify step; eval_offline's walk accept length counts this way), output tok/s, and the
+draft parameter count per dtype the engine loaded (draft_probe.py).
 
 python -m examples.multi_lora.dflash_rl.bench_engine \\
     --hf-checkpoint /data/model-cache/mimo-v26/MiMo-V2.6-Flash-RL-w4a16-linear \\
@@ -65,6 +66,16 @@ async def _gather(*coroutines):
     return await asyncio.gather(*coroutines)
 
 
+def _probe_flags(path: Path) -> tuple[str, ...]:
+    hook = {
+        "name": "draft_dtypes",
+        "target_modules": ["fc"],
+        "hook_factory": "examples.multi_lora.dflash_rl.draft_probe:record_draft_dtypes",
+        "config": {"path": str(path)},
+    }
+    return ("--forward-hooks", json.dumps([hook]))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--hf-checkpoint", required=True)
@@ -94,6 +105,9 @@ def main(argv: list[str] | None = None) -> None:
     for wave_start in range(0, len(configs), args.num_engines):
         wave = configs[wave_start : wave_start + args.num_engines]
         ports = [args.port + index for index in range(len(wave))]
+        log_dir = args.out / f"wave{wave_start // args.num_engines}"
+        log_dir.mkdir(exist_ok=True)
+        dtype_paths = [log_dir / f"draft_dtypes{index}.json" for index in range(len(wave))]
         argvs = [
             server_argv(
                 hf_checkpoint=args.hf_checkpoint,
@@ -103,15 +117,16 @@ def main(argv: list[str] | None = None) -> None:
                 mem_fraction=args.mem_fraction_static,
                 draft_quantization="fp8" if precision == "fp8" else None,
                 lora_path=args.lora_path,
+                extra=_probe_flags(dtype_path),
             )
-            for ((_, path), block_size, precision), port in zip(wave, ports, strict=True)
+            for ((_, path), block_size, precision), port, dtype_path in zip(wave, ports, dtype_paths, strict=True)
         ]
-        log_dir = args.out / f"wave{wave_start // args.num_engines}"
-        log_dir.mkdir(exist_ok=True)
         with running_servers(argvs, ports=ports, log_dir=log_dir) as urls:
             metrics = asyncio.run(_gather(*(replay(url, rollouts, args) for url in urls)))
-        for ((name, _), block_size, precision), metric in zip(wave, metrics, strict=True):
+        for ((name, _), block_size, precision), metric, dtype_path in zip(wave, metrics, dtype_paths, strict=True):
+            dtypes = json.loads(dtype_path.read_text()) if dtype_path.exists() else None
             results.append({"drafter": name, "block_size": block_size, "draft_precision": precision} | metric)
+            results[-1]["draft_param_numel_by_dtype"] = dtypes
             print(json.dumps(results[-1]), flush=True)
         (args.out / "bench.json").write_text(json.dumps(results, indent=2) + "\n")
 

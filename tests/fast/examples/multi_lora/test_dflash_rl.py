@@ -9,7 +9,14 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import torch
-from examples.multi_lora.dflash_rl import bench_engine, capture_hook, eval_offline, run_pipeline, train_drafter
+from examples.multi_lora.dflash_rl import (
+    bench_engine,
+    capture_hook,
+    draft_probe,
+    eval_offline,
+    run_pipeline,
+    train_drafter,
+)
 from examples.multi_lora.dflash_rl.data import (
     assemble_shard,
     context_spans,
@@ -462,3 +469,17 @@ def test_bench_replays_each_turn_prompt_and_counts_accept_length_after_the_first
     assert [request["input_ids"] for request in requests] == [[0, 1], [0, 1, 2, 3, 4, 5]]
     assert requests[0]["sampling_params"] == {"temperature": 1.0, "top_p": 0.97, "top_k": 1024, "max_new_tokens": 8192}
     assert metrics["accept_length"] == 10 / 4 and metrics["accept_length_after_first"] == 8 / 4
+
+
+def test_draft_probe_counts_the_draft_parameters_per_dtype(tmp_path: Path) -> None:
+    class DFlashDraftModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fc = torch.nn.Linear(4, 2, bias=False)
+            self.weight = torch.nn.Parameter(torch.zeros(3, dtype=torch.float8_e4m3fn), requires_grad=False)
+
+    model = DFlashDraftModel()
+    path = tmp_path / "dtypes.json"
+    assert draft_probe.record_draft_dtypes({"path": str(path)}) is None
+    assert json.loads(path.read_text()) == {"torch.float32": 8, "torch.float8_e4m3fn": 3}
+    del model
