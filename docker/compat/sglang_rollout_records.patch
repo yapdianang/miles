@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/arg_groups/fields/exec_.py b/python/sglang/srt/arg_groups/fields/exec_.py
-index 159d4b0..8397958 100644
+index 159d4b0..66d68e1 100644
 --- a/python/sglang/srt/arg_groups/fields/exec_.py
 +++ b/python/sglang/srt/arg_groups/fields/exec_.py
 @@ -105,6 +105,13 @@ class ExecFeatures(msgspec.Struct):
@@ -8,10 +8,10 @@ index 159d4b0..8397958 100644
      ] = 4096
 +    rollout_record_cache_gb: A[
 +        float,
-+        "Host memory for rollout records. A request with keep_rollout_record keeps "
-+        "its routed experts and sampling mask in the engine under its rid instead of "
-+        "returning them, and /collect_rollout_records returns them once. Its response "
-+        "keeps each output token's selected sampling log-probability.",
++        "Host memory for rollout records. When positive, a finished request keeps the "
++        "routed experts and sampling mask it asked for in the engine under its rid "
++        "instead of returning them, and /collect_rollout_records returns them once. "
++        "Its response keeps each output token's selected sampling log-probability.",
 +    ] = 0.0
      disable_outlines_disk_cache: A[
          bool,
@@ -82,7 +82,7 @@ index 17e7704..14c3316 100644
      # ===================================================================
      # Overlap scheduler and pipeline parallelism
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index 4ebce9c..f65cfb1 100644
+index 4ebce9c..c863e2f 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
 @@ -55,6 +55,7 @@ from sglang.srt.environ import envs
@@ -93,34 +93,7 @@ index 4ebce9c..f65cfb1 100644
  from sglang.srt.managers.schedule_batch import (
      Modality,
      MultimodalProcessorOutput,
-@@ -264,6 +265,9 @@ class GenerateReqInput:
-     # 0 = full sequence.
-     routed_experts_start_len: int = 0
-     return_indexer_topk: bool = False
-+    # Keep the routed experts and sampling mask in the engine under the rid until
-+    # /collect_rollout_records instead of returning them (--rollout-record-cache-gb).
-+    keep_rollout_record: bool = False
- 
-     # The modalities of the image data [image, multi-images, video]
-     modalities: Optional[List[str]] = None
-@@ -980,6 +984,7 @@ class GenerateReqInput:
-             return_routed_experts=self.return_routed_experts,
-             routed_experts_start_len=self.routed_experts_start_len,
-             return_indexer_topk=self.return_indexer_topk,
-+            keep_rollout_record=self.keep_rollout_record,
-             modalities=self.modalities[i] if self.modalities else None,
-             session_params=self.session_params,
-             lora_path=self.lora_path[i] if self.lora_path is not None else None,
-@@ -1153,6 +1158,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
-     # Shape of output_token_sampling_logprobs for each output token. This is a
-     # defaulted tail field so older IPC senders decode as selected mode.
-     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
-+    # See GenerateReqInput.keep_rollout_record; an append-only tail field.
-+    keep_rollout_record: bool = False
- 
-     def wrap_pickle_fields(self):
-         self.time_stats = wrap_as_pickle(self.time_stats)
-@@ -1804,6 +1811,16 @@ class ListExternalCorporaReqOutput(BaseReq, kw_only=True):
+@@ -1804,6 +1805,16 @@ class ListExternalCorporaReqOutput(BaseReq, kw_only=True):
      message: str = ""
  
  
@@ -228,28 +201,8 @@ index 0000000..a818f33
 +    def clear(self) -> None:
 +        self._records.clear()
 +        self.num_bytes = 0
-diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index a94a1df..7f1ba9e 100755
---- a/python/sglang/srt/managers/schedule_batch.py
-+++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -1025,6 +1025,7 @@ class Req(ReqDllmMixin):
-         return_routed_experts: bool = False,
-         routed_experts_start_len: int = 0,
-         return_indexer_topk: bool = False,
-+        keep_rollout_record: bool = False,
-         eos_token_ids: Optional[Set[int]] = None,
-         bootstrap_host: Optional[str] = None,
-         bootstrap_port: Optional[int] = None,
-@@ -1289,6 +1290,7 @@ class Req(ReqDllmMixin):
-         )
- 
-         self.return_indexer_topk = return_indexer_topk
-+        self.keep_rollout_record = keep_rollout_record
-         self.indexer_topk: Optional[torch.Tensor] = (
-             None  # cpu tensor: shape (seqlen, num_indexer_layers, index_topk)
-         )
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 2ddc48f..d119988 100644
+index 2ddc48f..6658a2c 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -132,6 +132,8 @@ from sglang.srt.managers.io_struct import (
@@ -299,15 +252,7 @@ index 2ddc48f..d119988 100644
          )
  
      def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
-@@ -2801,6 +2813,7 @@ class Scheduler(
-                 return_routed_experts=recv_req.return_routed_experts,
-                 routed_experts_start_len=recv_req.routed_experts_start_len,
-                 return_indexer_topk=recv_req.return_indexer_topk,
-+                keep_rollout_record=recv_req.keep_rollout_record,
-                 eos_token_ids=self.model_config.hf_eos_token_id,
-                 bootstrap_host=recv_req.bootstrap_host,
-                 bootstrap_port=recv_req.bootstrap_port,
-@@ -5201,6 +5214,8 @@ class Scheduler(
+@@ -5201,6 +5213,8 @@ class Scheduler(
              self.req_to_token_pool.reset_aux_cache_allocator()
              self.grammar_manager.clear()
              self.metrics_reporter.reset_metrics()
@@ -316,7 +261,7 @@ index 2ddc48f..d119988 100644
  
              if self.draft_worker:
                  self.draft_worker.clear_cache_pool()
-@@ -5221,6 +5236,16 @@ class Scheduler(
+@@ -5221,6 +5235,16 @@ class Scheduler(
              success = False
          return success
  
@@ -334,7 +279,7 @@ index 2ddc48f..d119988 100644
          # Resolved config (pristine server_args + post-publish overrides) so a
          # readback reflects values changed via /set_internal_state, not startup.
 diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
-index c394a9f..4feb290 100644
+index c394a9f..788e300 100644
 --- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
 +++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
 @@ -11,6 +11,7 @@ from typing import (
@@ -428,12 +373,14 @@ index c394a9f..4feb290 100644
      def _beam_admits(self, *, req: Req) -> bool:
          # Only the leader is ever streamed, and only at group finish.
          return req.is_beam_leader and req.finished()
-@@ -626,9 +674,15 @@ class _GenerationStreamAccumulator:
+@@ -626,9 +674,17 @@ class _GenerationStreamAccumulator:
                  self.output_token_ids_logprobs_val.append([])
                  self.output_token_ids_logprobs_idx.append([])
  
 +        kept_mask = None
-+        if self.rollout_records is not None and req.keep_rollout_record:
++        if self.rollout_records is not None and (
++            req.return_routed_experts or req.return_sampling_mask
++        ):
 +            kept_mask = self._keep_rollout_record(req, output_ids_)
 +
          if self.return_sampling_mask:
@@ -487,38 +434,16 @@ index 4abd64d..1529e7e 100644
          self: TokenizerManager, timeout_s: Optional[float] = None
      ) -> FlushCacheReqOutput:
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 110c1d9..434e312 100644
+index 110c1d9..b637a18 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -1406,6 +1406,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
-                     "sampling_logprobs_mode can only be set when "
-                     "return_sampling_mask=true."
-                 )
-+            if (
-+                obj.keep_rollout_record
-+                and get_exec().features.rollout_record_cache_gb <= 0
-+            ):
-+                raise ValueError(
-+                    "keep_rollout_record requires --rollout-record-cache-gb."
-+                )
- 
-     def _validate_mm_limits(
-         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
-@@ -1542,6 +1549,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
-                 return_routed_experts=obj.return_routed_experts,
-                 routed_experts_start_len=obj.routed_experts_start_len,
-                 return_indexer_topk=obj.return_indexer_topk,
-+                keep_rollout_record=obj.keep_rollout_record,
-                 routed_dp_rank=obj.routed_dp_rank,
-                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
-                 priority=obj.priority,
-@@ -2491,21 +2499,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -2491,21 +2491,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  and state.obj.return_sampling_mask
              ):
                  output_sampling_mask = recv_obj.output_token_sampling_mask
 +                # Kept masks stay in the engine; rows carry only selected logprobs.
 +                kept = (
-+                    state.obj.keep_rollout_record
++                    get_exec().features.rollout_record_cache_gb > 0
 +                    and not envs.SGLANG_ROLLOUT_RECORDS_ALSO_RETURN.get()
 +                )
                  if output_sampling_mask is not None:
@@ -550,10 +475,10 @@ index 110c1d9..434e312 100644
                  meta_info.update(
 diff --git a/test/registered/unit/managers/test_rollout_records.py b/test/registered/unit/managers/test_rollout_records.py
 new file mode 100644
-index 0000000..4b4d5c2
+index 0000000..55894ab
 --- /dev/null
 +++ b/test/registered/unit/managers/test_rollout_records.py
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,262 @@
 +import unittest
 +from types import SimpleNamespace
 +
@@ -593,7 +518,7 @@ index 0000000..4b4d5c2
 +
 +
 +class _FakeReq:
-+    def __init__(self, *, finished_reason=None, return_sampling_mask=True, keep=True):
++    def __init__(self, *, finished_reason=None, return_sampling_mask=True):
 +        self.rid = "seq-1"
 +        self.http_worker_ipc = None
 +        self.finished_reason = finished_reason
@@ -630,7 +555,6 @@ index 0000000..4b4d5c2
 +        self.return_hidden_states = False
 +        self.return_indexer_topk = False
 +        self.return_routed_experts = True
-+        self.keep_rollout_record = keep
 +        self.routed_experts_start_len = 1
 +        # The scheduler gathers rows [start_len, seqlen - 1) when the request finishes.
 +        self.routed_experts = (
@@ -804,17 +728,15 @@ index 0000000..4b4d5c2
 +            record.supports.to_lists(support_logprobs=True)[0], SUPPORT_IDS
 +        )
 +
-+    def test_a_request_that_does_not_keep_returns_everything(self):
-+        pool = RolloutRecordPool(max_bytes=1 << 20)
-+        accumulator = _accumulator(pool)
-+        req = _FakeReq(finished_reason=FINISH_LENGTH(length=3), keep=False)
++    def test_without_a_pool_the_response_carries_everything(self):
++        accumulator = _accumulator(None)
++        req = _FakeReq(finished_reason=FINISH_LENGTH(length=3))
 +        accumulator.accept(req=req)
 +        masks, _ = accumulator.output_token_sampling_mask[0].to_lists(
 +            support_logprobs=True
 +        )
 +        self.assertEqual(masks, SUPPORT_IDS)
 +        self.assertEqual(tuple(accumulator.routed_experts[0].shape), (3, 2, 4))
-+        self.assertEqual(len(pool), 0)
 +
 +
 +if __name__ == "__main__":

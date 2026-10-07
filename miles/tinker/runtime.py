@@ -332,7 +332,6 @@ class MilesBackend:
             "input_ids": tokens,
             "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
             "return_routed_experts": True,
-            "keep_rollout_record": True,
         }
         if lora_name is not None:
             request["lora_path"] = lora_name
@@ -389,9 +388,9 @@ class MilesBackend:
         sequence_ids = sequence_ids or [f"seq-{uuid.uuid4().hex}" for _ in range(payload["num_samples"])]
         sample_requests = [_with_sample_seed(request, index) for index in range(payload["num_samples"])]
         if records is not None and records.collect:
-            # the engine keeps each sample's routes and supports under its sequence id until collected
+            # the engine keeps each sample's routes and supports under its rid, the sequence id, until collected
             for sample_request, sequence_id in zip(sample_requests, sequence_ids, strict=True):
-                sample_request.update(rid=sequence_id, keep_rollout_record=True)
+                sample_request["rid"] = sequence_id
             if lora_name is not None and lora_path is not None:
                 self._lora_paths[lora_name] = lora_path
         try:

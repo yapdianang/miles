@@ -327,9 +327,9 @@ def _b64(array: np.ndarray) -> str:
 
 
 class KeepingEngine(FakeEngine):
-    """A request with keep_rollout_record leaves its routes and supports in the engine under its rid.
+    """--sglang-rollout-record-cache-gb: requests leave their routes and supports in the engine under their rid.
 
-    Its response carries each output token's selected log-probability instead of its support.
+    Responses carry each output token's selected log-probability instead of its support.
     """
 
     def __init__(self) -> None:
@@ -344,8 +344,6 @@ class KeepingEngine(FakeEngine):
         if not self.outputs:
             self.outputs.append(([0], [[0]]))  # a one-token greedy sample
         response = await super().post(url, request)
-        if not request.get("keep_rollout_record"):
-            return response
         meta = response["meta_info"]
         kept = dict.fromkeys(["routes", "routes_shape", "support_lengths", "support_ids", "support_logprobs"])
         kept["routes_start"] = request.get("routed_experts_start_len", 0)
@@ -393,7 +391,7 @@ class TestCollection:
     async def test_turns_leave_routes_and_supports_in_the_engine(self, keeping_engine):
         backend = _collecting_backend()
         result = await _sample(backend, keeping_engine, PROMPT, [(TURN_1, TURN_1_SUPPORTS)])
-        assert keeping_engine.requests[0]["rid"] == "seq-0-0" and keeping_engine.requests[0]["keep_rollout_record"]
+        assert keeping_engine.requests[0]["rid"] == "seq-0-0"
         assert result["sequences"][0]["logprobs"] == pytest.approx([-0.2, -0.1, -0.1])
         record = backend.sampler_records.get("seq-0-0")
         assert record.routes is None and record.support_ids is None

@@ -2,19 +2,19 @@
 
 Replays Tau3 trajectories through the gateway's sampling path (MilesBackend.sample) against the engines' router.
 Each turn samples the recorded output length and the next turn's context appends the sampled tokens and the
-recorded environment tokens, so turns build on their own samples as in a rollout. Arms, at each concurrency:
+recorded environment tokens, so turns build on their own samples as in a rollout. Modes, each on its own launch:
 
-  per_turn  every turn returns its route deltas and sampling supports (today's path)
-  keep      the engine keeps them; each batch of final datums collects them once, as forward_backward does
+  per_turn  engines without --sglang-rollout-record-cache-gb: every turn returns its route deltas and supports
+  keep      engines with it: they keep them, and each batch of final datums collects them once, as
+            forward_backward does
+  check     engines with it and SGLANG_ROLLOUT_RECORDS_ALSO_RETURN=1, which also returns every kept record: a
+            per-turn store records each response exactly as today, and every datum's collected routes and supports
+            must equal the per-turn ones on the same sampled tokens
 
-Reported per arm: engine-to-gateway response bytes per turn, turn latency, and per collection batch its latency
-and bytes. Engines need --sglang-rollout-record-cache-gb (launcher --rollout-record-cache-gb).
+per_turn and keep report, at each concurrency, engine-to-gateway response bytes per turn, turn latency, and per
+collection batch its latency and bytes.
 
---check compares the two paths on the same sampled tokens. Start the engines with
-SGLANG_ROLLOUT_RECORDS_ALSO_RETURN=1 so that every kept turn also returns its record: a per-turn store records
-that response exactly as today, and every datum's collected routes and supports must equal the per-turn ones.
-
-python examples/multi_lora/bench_rollout_records.py --router-url http://HOST:PORT --replay replay.json \\
+python examples/multi_lora/bench_rollout_records.py --mode keep --router-url http://HOST:PORT --replay replay.json \\
     --concurrency 64 128 256
 """
 
@@ -151,31 +151,28 @@ def _summary(values: list[float]) -> str:
 
 
 async def _bench(args, workload, client: httpx.AsyncClient) -> None:
+    keep = args.mode == "keep"
     for concurrency in args.concurrency:
-        for arm in ("per_turn", "keep"):
-            backend = _backend(args, client, keep=arm == "keep")
-            _bytes.clear()
-            datums, latencies = await _sample_arm(args, workload, [backend], f"{arm}-{concurrency}", concurrency)
-            turn_bytes = _bytes["generate"]
-            collect_latencies = await _collect(backend, datums, args.collect_batch) if arm == "keep" else []
-            routed, unsupported = _coverage(backend, datums)
-            records = backend.sampler_records
-            line = (
-                f"conc {concurrency} {arm}: {len(latencies)} turns, {turn_bytes / len(latencies) / 1e3:.1f} KB/turn "
-                f"engine->gateway, turn latency {_summary(latencies)}"
+        backend = _backend(args, client, keep=keep)
+        _bytes.clear()
+        datums, latencies = await _sample_arm(args, workload, [backend], f"{args.mode}-{concurrency}", concurrency)
+        turn_bytes = _bytes["generate"]
+        collect_latencies = await _collect(backend, datums, args.collect_batch) if keep else []
+        routed, unsupported = _coverage(backend, datums)
+        records = backend.sampler_records
+        line = (
+            f"conc {concurrency} {args.mode}: {len(latencies)} turns, {turn_bytes / len(latencies) / 1e3:.1f} KB/turn "
+            f"engine->gateway, turn latency {_summary(latencies)}"
+        )
+        if collect_latencies:
+            line += (
+                f"; collection {_bytes['collect_rollout_records'] / len(datums) / 1e6:.2f} MB/datum, "
+                f"{_bytes['collect_rollout_records'] / len(latencies) / 1e3:.1f} KB/turn, latency "
+                f"{_summary(collect_latencies)} per {args.collect_batch}-datum batch; records "
+                f"{records.num_collected} collected, {records.num_missing} missing, "
+                f"{records.num_recomputed} datums recomputed"
             )
-            if collect_latencies:
-                line += (
-                    f"; collection {_bytes['collect_rollout_records'] / len(datums) / 1e6:.2f} MB/datum, "
-                    f"{_bytes['collect_rollout_records'] / len(latencies) / 1e3:.1f} KB/turn, latency "
-                    f"{_summary(collect_latencies)} per {args.collect_batch}-datum batch; records "
-                    f"{records.num_collected} collected, {records.num_missing} missing, "
-                    f"{records.num_recomputed} datums recomputed"
-                )
-            print(
-                f"{line}; {routed}/{len(datums)} datums routed, {unsupported} sampled positions unsupported",
-                flush=True,
-            )
+        print(f"{line}; {routed}/{len(datums)} datums routed, {unsupported} sampled positions unsupported", flush=True)
 
 
 async def _check(args, workload, client: httpx.AsyncClient) -> None:
@@ -211,6 +208,7 @@ async def _check(args, workload, client: httpx.AsyncClient) -> None:
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--mode", choices=["per_turn", "keep", "check"], required=True)
     parser.add_argument("--router-url", required=True)
     parser.add_argument("--replay", required=True, help="JSON list of trajectories of {prompt, output_len} turns")
     parser.add_argument("--concurrency", type=int, nargs="+", default=[64, 128, 256])
@@ -221,12 +219,11 @@ async def main() -> None:
     parser.add_argument("--top-p", type=float, default=0.97)
     parser.add_argument("--top-k", type=int, default=1024)
     parser.add_argument("--lora-name", default=None)
-    parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     workload = json.load(open(args.replay))[: args.trajectories]
     async with httpx.AsyncClient(timeout=httpx.Timeout(None), limits=httpx.Limits(max_connections=1024)) as client:
         runtime.post = lambda url, payload, **_: _post(client, url, payload)
-        await (_check if args.check else _bench)(args, workload, client)
+        await (_check if args.mode == "check" else _bench)(args, workload, client)
 
 
 if __name__ == "__main__":
