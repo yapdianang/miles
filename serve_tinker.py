@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 from contextlib import suppress
 
@@ -10,6 +11,7 @@ from miles.ray.rollout.router_manager import resolve_router_addrs
 from miles.ray.specs.inference import compute_router_providers, create_inference_controller_handle
 from miles.ray.specs.train import ACTOR_ROLE, compute_trainer_configs
 from miles.ray.wiring import get_backend_capability
+from miles.rollout.inference_rollout.inference_rollout_train import get_worker_urls
 from miles.tinker.arguments import add_tinker_arguments, configure_tinker_args
 from miles.tinker.core.service import TinkerService
 from miles.tinker.core.types import GatewayConfig
@@ -75,6 +77,11 @@ async def serve(args, *, disposer: Disposer):
         args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     )
     route_deltas = args.use_rollout_routing_replay and args.tinker_routed_expert_deltas
+    # The engines keep routes and supports until a datum that uses them is trained (MiMo-V2.6 section 6.4).
+    collect = getattr(args, "sglang_rollout_record_cache_gb", 0.0) > 0
+    assert not (collect and args.use_rollout_routing_replay and not route_deltas), (
+        "--sglang-rollout-record-cache-gb keeps routes in the engine; collect them with --tinker-routed-expert-deltas"
+    )
     routed_experts = None
     if args.use_rollout_routing_replay and not route_deltas:
         routed_experts = RoutedExpertsCache(max_bytes=int(args.tinker_routed_experts_cache_gb * 2**30))
@@ -84,6 +91,7 @@ async def serve(args, *, disposer: Disposer):
             max_bytes=int(args.tinker_sampler_record_cache_gb * 2**30),
             supports=args.tinker_sampling_support_replay,
             routes=route_deltas,
+            collect=collect,
         )
     backend = MilesBackend(
         trainer,
@@ -95,6 +103,7 @@ async def serve(args, *, disposer: Disposer):
         sampler_records=sampler_records,
         moe_layers=moe_layers(args.moe_layer_freq, args.num_layers) if args.num_experts else None,
         num_experts=args.num_experts,
+        engine_urls=functools.partial(get_worker_urls, args),
     )
     service = TinkerService(backend, config)
 
