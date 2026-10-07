@@ -24,7 +24,7 @@ from pathlib import Path
 import httpx
 
 from examples.multi_lora.dflash_rl.data import turn_spans
-from examples.multi_lora.dflash_rl.engine import LORA_NAME, running_servers, server_argv
+from examples.multi_lora.dflash_rl.engine import LORA_NAME, MEM_FRACTION, running_servers, server_argv
 
 
 async def replay(url: str, rollouts: list[dict], args) -> dict:
@@ -81,6 +81,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--concurrency", type=int, default=64, help="trajectories in flight per engine")
     parser.add_argument("--num-engines", type=int, default=2)
     parser.add_argument("--port", type=int, default=30000)
+    parser.add_argument("--mem-fraction-static", type=float, default=MEM_FRACTION)
     parser.add_argument("--timeout", type=float, default=3600)
     args = parser.parse_args(argv)
 
@@ -99,6 +100,7 @@ def main(argv: list[str] | None = None) -> None:
                 drafter=path,
                 block_size=block_size,
                 port=port,
+                mem_fraction=args.mem_fraction_static,
                 draft_quantization="fp8" if precision == "fp8" else None,
                 lora_path=args.lora_path,
             )

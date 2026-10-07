@@ -22,7 +22,7 @@ import torch
 
 from examples.multi_lora.dflash_rl.data import assemble_shard, context_spans, save_shard
 from examples.multi_lora.dflash_rl.drafter import DrafterConfig
-from examples.multi_lora.dflash_rl.engine import LORA_NAME, running_servers, server_argv
+from examples.multi_lora.dflash_rl.engine import LORA_NAME, MEM_FRACTION, running_servers, server_argv
 
 
 def _hook_flags(capture_dir: Path) -> tuple[str, ...]:
@@ -88,6 +88,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--num-engines", type=int, default=2)
     parser.add_argument("--concurrency", type=int, default=4, help="requests in flight per engine")
     parser.add_argument("--port", type=int, default=30000)
+    parser.add_argument("--mem-fraction-static", type=float, default=MEM_FRACTION)
     parser.add_argument("--timeout", type=float, default=3600)
     args = parser.parse_args(argv)
 
@@ -108,6 +109,7 @@ def main(argv: list[str] | None = None) -> None:
             drafter=str(drafter),
             block_size=config.block_size,
             port=port,
+            mem_fraction=args.mem_fraction_static,
             lora_path=args.lora_path,
             extra=_hook_flags(args.capture_dir),
         )

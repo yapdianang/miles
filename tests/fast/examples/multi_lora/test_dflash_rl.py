@@ -302,8 +302,15 @@ def test_save_drafter_round_trips_checkpoint_names(tmp_path: Path) -> None:
 
 def test_server_argv_maps_engine_flags_to_sglang_server_flags() -> None:
     argv = server_argv(
-        hf_checkpoint="/ckpt", drafter="/rl", block_size=6, port=30001, draft_quantization="fp8", lora_path="/lora"
+        hf_checkpoint="/ckpt",
+        drafter="/rl",
+        block_size=6,
+        port=30001,
+        mem_fraction=0.4,
+        draft_quantization="fp8",
+        lora_path="/lora",
     )
+    assert argv[argv.index("--mem-fraction-static") + 1] == "0.4"
     assert argv[argv.index("--tp-size") + 1] == "4"
     assert argv[argv.index("--ep-size") + 1] == "4"
     assert argv[argv.index("--speculative-algorithm") + 1] == "DFLASH"

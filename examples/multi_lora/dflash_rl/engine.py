@@ -17,6 +17,8 @@ from examples.multi_lora import serve_mimo_v26_flash_tinker as launcher
 MILES_ROOT = Path(__file__).resolve().parents[3]
 LORA_NAME = "policy"
 ENGINE_GPUS = launcher._ENGINE_GPUS
+# The launcher's 0.6 leaves ~10 GB/GPU beside both KV pools, short of a 49K-token prefill's MoE workspace.
+MEM_FRACTION = 0.4
 # Miles' --target-modules attn adapters on MiMo-V2 (the engine's lora_target_modules).
 _LORA_TARGETS = [f"model.layers.*.self_attn.{proj}_proj" for proj in "qkvo"]
 
@@ -27,12 +29,18 @@ def server_argv(
     drafter: str,
     block_size: int,
     port: int,
+    mem_fraction: float,
     draft_quantization: str | None = None,
     lora_path: str | None = None,
     extra: tuple[str, ...] = (),
 ) -> list[str]:
-    """``sglang.launch_server`` argv: the Miles engine's --sglang-* flags with this drafter and block size."""
-    serve_args = launcher.ScriptArgs(hf_checkpoint=hf_checkpoint, dflash_drafter=drafter, dflash_block_size=block_size)
+    """``sglang.launch_server`` argv: the Miles engine's --sglang-* flags with this drafter, block size and memory."""
+    serve_args = launcher.ScriptArgs(
+        hf_checkpoint=hf_checkpoint,
+        dflash_drafter=drafter,
+        dflash_block_size=block_size,
+        sglang_mem_fraction_static=mem_fraction,
+    )
     argv = [sys.executable, "-m", "sglang.launch_server", "--model-path", hf_checkpoint, "--port", str(port)]
     argv += ["--trust-remote-code", "--skip-server-warmup"]
     for token in shlex.split(launcher._sglang_args(serve_args)):
