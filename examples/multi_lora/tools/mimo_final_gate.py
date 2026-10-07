@@ -16,7 +16,7 @@ per check and writes one JSON summary; exits 1 unless every selected blocking ch
     engine-load    GET /api/v1/engine_load reports the load of every engine
   collect: base plus the engine flags records-check needs, --rollout-record-cache-gb 64 and
   SGLANG_ROLLOUT_RECORDS_ALSO_RETURN=1
-    records-check  bench_rollout_records.py --check prints "mismatching datums: none"
+    records-check  bench_rollout_records.py --mode check prints "mismatching datums: none"
   muown: base plus --optimizer muown (DoRA adapters, SGLang --enable-lora-dora)
     muown-parity   run_dora_parity_check.py, 5 steps at lr 1e-4: engine/trainer k3 <= 2e-3 and trainer
                    movement k3 >= 2e-2
@@ -143,7 +143,16 @@ def _records_check(args) -> dict:
     _, log = _run(_pod_shell(args.pod, "grep", "-a", "Router ready at", SERVICE_LOG), args.check_timeout)
     router = router_url(log)
     bench = str(TOOLS_DIR.parent / "bench_rollout_records.py")
-    check = ["--router-url", router, "--replay", args.workload, "--check", "--concurrency", str(REPLAY_CONCURRENCY)]
+    check = [
+        "--mode",
+        "check",
+        "--router-url",
+        router,
+        "--replay",
+        args.workload,
+        "--concurrency",
+        str(REPLAY_CONCURRENCY),
+    ]
     _, stdout = _run(_dev("run", args.pod, bench, *check), args.check_timeout)
     lines = [line for line in stdout.splitlines() if line.startswith("check:")]
     return {"router_url": router, "check_line": lines[-1] if lines else None}
@@ -189,7 +198,7 @@ def _top_k_free_bar(result: dict) -> list[str]:
 def _records_bar(result: dict) -> list[str]:
     line = result["check_line"]
     if line is None:
-        return ["bench_rollout_records.py --check printed no check line"]
+        return ["bench_rollout_records.py --mode check printed no check line"]
     return [] if line.endswith("mismatching datums: none") else [line]
 
 
@@ -301,7 +310,7 @@ CHECKS = (
     Check(
         "records-check",
         "collect",
-        'bench_rollout_records.py --check prints "mismatching datums: none"',
+        'bench_rollout_records.py --mode check prints "mismatching datums: none"',
         _records_check,
         _records_bar,
         lambda result: result["check_line"] or "",

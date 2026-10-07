@@ -1,6 +1,11 @@
 """The final gate restarts the service once per phase, applies each check's bar and writes one summary."""
 
+import argparse
+import asyncio
+import importlib
+import inspect
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -35,6 +40,36 @@ PASSING = {
 PROBE = {"passed": True, "failures": [], "throughput": {"masks_on_over_off": 0.98}}
 DORA = {"tokens": 4096, "k3_engine_trainer_step_0": 8e-4, "k3_engine_trainer": 1.1e-3, "k3_trainer_movement": 0.05}
 RECORDS_LINE = "check: 64 datums, 513 records collected, 0 missing, 0 recomputed, 64 routed, 0 sampled positions unsupported; mismatching datums: none"
+
+
+# Each script the gate runs in the pod, and the function that parses its command line.
+SCRIPT_PARSERS = {
+    "dflash_support_check.py": "main",
+    "bench_rollout_records.py": "main",
+    "run_dora_parity_check.py": "_parse_args",
+}
+
+
+class _Parsed(Exception):
+    """Carries the namespace a script's own parser built, before the script does any work."""
+
+
+def parse_with_own_parser(script: Path, script_args: list[str]) -> argparse.Namespace:
+    module = importlib.import_module(
+        script.relative_to(final.TOOLS_DIR.parents[2]).with_suffix("").as_posix().replace("/", ".")
+    )
+    real_parse_args = argparse.ArgumentParser.parse_args
+
+    def parse_and_stop(parser, args=None, namespace=None):
+        raise _Parsed(real_parse_args(parser, args, namespace))
+
+    with pytest.MonkeyPatch.context() as patch, pytest.raises(_Parsed) as parsed:
+        patch.setattr(argparse.ArgumentParser, "parse_args", parse_and_stop)
+        patch.setattr(sys, "argv", [str(script), *script_args])
+        entry = getattr(module, SCRIPT_PARSERS[script.name])()
+        if inspect.iscoroutine(entry):
+            asyncio.run(entry)
+    return parsed.value.args[0]
 
 
 class FakePod:
@@ -132,37 +167,35 @@ def test_gate_commands_parse_with_the_bars_settings(monkeypatch, tmp_path):
     assert (parsed["parity"].top_p, parsed["parity"].top_k, parsed["parity"].max_k3) == (0.97, -1, 0.001)
     assert parsed["long-train"].context_tokens == 250_000
     assert (parsed["replay"].concurrency, str(parsed["replay"].engine_log)) == (64, final.SERVICE_LOG)
-    probe, top_k, top_k_free, bench, dora = (dev.build_parser().parse_args(argv[2:]) for argv in pod.commands("run"))
-    assert probe.script == final.TOOLS_DIR / "dflash_support_check.py" and probe.script.exists()
-    assert probe.script_args[:2] == ["--url", ENGINE["url"]]
-    for throughput, case in ((top_k, "a_support"), (top_k_free, "f_top_p")):
-        assert throughput.script_args[-4:] == ["--sweep-requests", "0", "--throughput-case", case]
-    assert bench.script == final.TOOLS_DIR.parent / "bench_rollout_records.py" and bench.script.exists()
-    assert bench.script_args == [
-        "--router-url",
+
+
+def test_scripts_run_in_the_pod_accept_the_gate_arguments(monkeypatch, tmp_path):
+    pod = FakePod()
+    run_final(monkeypatch, tmp_path, pod)
+
+    runs = [dev.build_parser().parse_args(argv[2:]) for argv in pod.commands("run")]
+    assert [run.script.name for run in runs] == [*["dflash_support_check.py"] * 3, *list(SCRIPT_PARSERS)[1:]]
+    probe, top_k, top_k_free, bench, dora = (parse_with_own_parser(run.script, run.script_args) for run in runs)
+    assert (probe.url, probe.tokenizer_path, probe.sweep_requests) == (
+        ENGINE["url"],
+        final.build_parser().get_default("tokenizer_path"),
+        1024,
+    )
+    throughput = [(args.sweep_requests, args.throughput_case) for args in (top_k, top_k_free)]
+    assert throughput == [(0, "a_support"), (0, "f_top_p")]
+    assert (bench.mode, bench.router_url, bench.replay, bench.concurrency) == (
+        "check",
         "http://10.42.9.87:20033",
-        "--replay",
         "/root/replay.json",
-        "--check",
-        "--concurrency",
-        "64",
-    ]
-    assert dora.script == final.TOOLS_DIR.parent / "run_dora_parity_check.py" and dora.script.exists()
-    # the flags the gate passes exist in the scripts it runs
-    for script, flags in ((probe, ("--sweep-requests", "--throughput-case")), (dora, dora.script_args[::2])):
-        assert all(f'"{flag}"' in script.script.read_text() for flag in flags), script.script
-    assert dora.script_args == [
-        "--base-url",
+        [64],
+    )
+    assert (dora.base_url, dora.steps, dora.learning_rate, dora.max_k3, dora.min_movement_k3) == (
         dev.GATEWAY_URL,
-        "--steps",
-        "5",
-        "--learning-rate",
-        "0.0001",
-        "--max-k3",
-        "0.002",
-        "--min-movement-k3",
-        "0.02",
-    ]
+        5,
+        1e-4,
+        2e-3,
+        2e-2,
+    )
 
 
 def test_a_check_below_its_bar_fails_the_gate_but_the_others_still_run(monkeypatch, tmp_path):
