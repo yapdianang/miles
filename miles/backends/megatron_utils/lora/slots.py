@@ -13,7 +13,10 @@ logger = logging.getLogger(__name__)
 def create_multi_lora_instance(args: Namespace, *, target_modules):
     from megatron.bridge.peft.multi_lora import MultiLoRA
 
-    return MultiLoRA(
+    from miles.backends.megatron_utils.lora.dora import MultiDoRA
+
+    lora_cls = MultiDoRA if args.lora_type == "dora" else MultiLoRA
+    return lora_cls(
         target_modules=target_modules,
         n_adapters=args.multi_lora_n_adapters,
         dim=args.lora_rank,

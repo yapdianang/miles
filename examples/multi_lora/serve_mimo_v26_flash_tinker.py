@@ -40,9 +40,10 @@ app = typer.Typer()
 
 # SGLang slices the official fused qkv_proj into 4 kv-head shards, so engine attention TP is 4.
 _ENGINE_GPUS = 4
-# MiMo-V2.6 section 5.1 Muon settings; extra scale 0.1 is the paper's 0.5 times Muown's Adam-matching 0.2.
+# Muown for LoRA (MiMo-V2.6 section 5.1): DoRA row magnitudes on Adam, Muon on the LoRA tangent space.
+# Extra scale 0.1 is the paper's 0.5 times Muown's Adam-matching 0.2.
 _MUOWN_ARGS = (
-    "--muon-momentum 0.95 --muon-nesterov --muon-num-ns-steps 10 --muon-coefficient-type simple "
+    "--lora-type dora --muon-momentum 0.95 --muon-nesterov --muon-num-ns-steps 10 --muon-coefficient-type simple "
     "--muon-extra-scale-factor 0.1 "
 )
 

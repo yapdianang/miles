@@ -15,6 +15,8 @@ from megatron.training.arguments import parse_args
 from tests.fast.dist_utils import init_gloo, run_multiprocess
 
 from miles.backends.megatron_utils import muown
+from miles.backends.megatron_utils.lora import dora
+from miles.backends.megatron_utils.lora.dora import MultiDoRALinear
 from miles.backends.megatron_utils.lora.optimizer import SlotOptimizer
 from miles.backends.megatron_utils.muown import TensorParallelMuownLoRA
 from miles.utils.arguments import get_miles_extra_args_provider
@@ -219,50 +221,114 @@ class _ReferenceMuown:
         return v, v_new
 
 
-def _dora(w0, g, b, a, scale):
-    v = w0 + scale * b @ a
-    return g * v / v.norm(dim=1, keepdim=True)
+class _Adapter(torch.nn.Module):
+    def __init__(self, a: torch.Tensor, b: torch.Tensor):
+        super().__init__()
+        self.linear_in, self.linear_out = torch.nn.Linear(1, 1, bias=False), torch.nn.Linear(1, 1, bias=False)
+        self.linear_in.weight, self.linear_out.weight = torch.nn.Parameter(a.clone()), torch.nn.Parameter(b.clone())
 
 
-def test_prop6_dora_gradients_are_muown_gradients_only_with_the_norm_attached(factors):
-    b, a, grad_w = (x.double() for x in factors)
-    w0 = torch.randn(M, N, dtype=torch.float64)
-    pa, pb = a.clone().requires_grad_(), b.clone().requires_grad_()
-    g = (w0 + 2.0 * b @ a).norm(dim=1, keepdim=True).requires_grad_()
-    (_dora(w0, g, pb, pa, 2.0) * grad_w).sum().backward()
+def _dora_layer(w0, factors, magnitudes=None, *, rank, input_is_parallel=False, sequence_parallel=False):
+    """A MultiDoRALinear around ``w0`` with one slot per ``(A, B)``, built without a Megatron linear; ``s = 2``."""
+    layer = MultiDoRALinear.__new__(MultiDoRALinear)
+    torch.nn.Module.__init__(layer)
+    layer.to_wrap = torch.nn.Linear(1, 1, bias=False)
+    layer.to_wrap.weight = torch.nn.Parameter(w0.clone(), requires_grad=False)
+    layer.adapters = torch.nn.ModuleList(_Adapter(torch.zeros_like(a), torch.zeros_like(b)) for a, b in factors)
+    layer.max_rank, layer.n_adapters, layer.base_linear_name = rank, len(factors), "linear"
+    layer.alpha_values, layer.rank_values = torch.zeros(len(factors)), torch.full((len(factors),), float(rank))
+    layer.replicate_adapter = layer._external_output_reduce = False
+    layer.base_linear_is_parallel = layer._adapter_enabled = True
+    layer.input_is_parallel, layer.disable_sequence_parallel_comm = input_is_parallel, not sequence_parallel
+    layer.init_dora()
+    for i, (a, b) in enumerate(factors):
+        layer.init_adapter_slot(i, rank, 2.0 * rank)
+        with torch.no_grad():
+            layer.adapters[i].linear_in.weight.copy_(a)
+            layer.adapters[i].linear_out.weight.copy_(b)
+            if magnitudes is not None:
+                layer.adapters[i].weight_magnitude.copy_(magnitudes[i])
+    return layer
 
-    reference = _ReferenceMuown(w0 + 2.0 * b @ a)
-    grad_g, grad_v = reference.gradients(grad_w)
-    torch.testing.assert_close(g.grad, grad_g)
-    torch.testing.assert_close(pa.grad, 2.0 * b.T @ grad_v)
-    torch.testing.assert_close(pb.grad, 2.0 * grad_v @ a.T)
 
-    # Megatron-Bridge's DoRA detaches the norm, which leaves the radial component in dL/dV
-    pa.grad = None
-    v = w0 + 2.0 * pb @ pa
-    (g.detach() * v / v.norm(dim=1, keepdim=True).detach() * grad_w).sum().backward()
-    assert not torch.allclose(pa.grad, 2.0 * b.T @ grad_v)
+@pytest.fixture
+def tp1(monkeypatch):
+    monkeypatch.setattr(dora, "parallel_state", SimpleNamespace(get_tensor_model_parallel_world_size=lambda: 1))
 
 
-def test_thm3_full_rank_muown_lora_is_kcc_lion_muown():
+def _dora_forward(layer, slot, grad_w):
+    """``<W, grad_w>`` through the layer, with the identity as tokens so the output rows are ``V^T``."""
+    adapter = layer.adapters[slot]
+    v_t = layer.to_wrap.weight.T + 2.0 * adapter.linear_in.weight.T @ adapter.linear_out.weight.T
+    layer.tokens_per_adapter_splits = tuple(v_t.shape[0] if i == slot else 0 for i in range(len(layer.adapters)))
+    return (layer.scale_rows(v_t) * grad_w.T).sum()
+
+
+def test_dora_starts_at_the_lora_weight_and_its_norm_is_the_dense_row_norm(tp1, factors):
+    b, a, _ = factors
+    w0 = torch.randn(M, N)
+    layer = _dora_layer(w0, [(a, torch.zeros_like(b))], rank=R)
+    torch.testing.assert_close(layer.adapters[0].weight_magnitude, w0.norm(dim=1))
+    output = torch.randn(5, M)
+    layer.tokens_per_adapter_splits = (5,)
+    assert torch.equal(layer.scale_rows(output), output)
+
+    with torch.no_grad():
+        layer.adapters[0].linear_out.weight.copy_(b)
+    torch.testing.assert_close(layer.row_norm(0), (w0 + 2.0 * b @ a).norm(dim=1))
+
+
+def test_prop6_dora_gradients_are_muown_gradients(tp1, factors):
+    b, a, grad_w = factors
+    w0 = torch.randn(M, N)
+    g = torch.rand(M) + 0.5
+    layer = _dora_layer(w0, [(a, b)], [g], rank=R)
+    _dora_forward(layer, 0, grad_w).backward()
+
+    # Muown with direction v = V and magnitudes g
+    v = (w0 + 2.0 * b @ a).double()
+    reference = _ReferenceMuown(g.double()[:, None] * v / v.norm(dim=1, keepdim=True))
+    reference.v_norm = v.norm(dim=1, keepdim=True)
+    grad_g, grad_v = reference.gradients(grad_w.double())
+    adapter = layer.adapters[0]
+    torch.testing.assert_close(adapter.weight_magnitude.grad.double(), grad_g[:, 0], rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(
+        adapter.linear_in.weight.grad.double(), 2.0 * b.double().T @ grad_v, rtol=1e-4, atol=1e-5
+    )
+    torch.testing.assert_close(
+        adapter.linear_out.weight.grad.double(), 2.0 * grad_v @ a.double().T, rtol=1e-4, atol=1e-5
+    )
+
+
+def test_thm3_full_rank_muown_dora_is_kcc_lion_muown(tp1):
     torch.manual_seed(2)
-    n, scale = 16, 2.0
-    b, a, w0, grad_w = (torch.randn(n, n, dtype=torch.float64) for _ in range(4))
-    w0 = w0 - scale * b @ a + 3 * torch.eye(n, dtype=torch.float64)
-    reference = _ReferenceMuown(w0 + scale * b @ a)
-    v, v_new = reference.step(grad_w)
+    n = 16
+    b, a, w0, grad_w = (torch.randn(n, n) for _ in range(4))
+    w0 = w0 - 2.0 * b @ a + 3 * torch.eye(n)
+    layer = _dora_layer(w0, [(a, b)], rank=n)
+    with torch.no_grad():
+        layer.adapters[0].weight_magnitude.copy_(layer.row_norm(0))
+    reference = _ReferenceMuown(w0 + 2.0 * b @ a)
+    v, v_new = reference.step(grad_w.double())
 
-    # DoRA forward with g = ||V|| at init, so W = V and the reference sees the same weight
-    pa, pb = torch.nn.Parameter(a.clone()), torch.nn.Parameter(b.clone())
-    g = torch.nn.Parameter((w0 + scale * b @ a).norm(dim=1, keepdim=True))
-    (_dora(w0, g, pb, pa, scale) * grad_w).sum().backward()
-    torch.optim.Adam([g], lr=LR, betas=(0.95, 0.95), eps=1e-8).step()
-    _optimizer(pa, pb, scale=scale, rank=n, float64=True, damping=0.0).step()
+    _dora_forward(layer, 0, grad_w).backward()
+    adapter = layer.adapters[0]
+    torch.optim.Adam([adapter.weight_magnitude], lr=LR, betas=(0.95, 0.95), eps=1e-8).step()
+    _optimizer(adapter.linear_in.weight, adapter.linear_out.weight, scale=2.0, rank=n, damping=0.0).step()
 
-    torch.testing.assert_close(g.detach(), reference.g)
-    dv = _first_order_dv(b, a, pb.detach(), pa.detach(), scale)
-    # Newton-Schulz's 1e-7 eps sees differently scaled inputs (EMA vs heavy-ball momentum, P^-1 whitening)
-    torch.testing.assert_close(dv, v_new - v, rtol=1e-4, atol=1e-8)
+    torch.testing.assert_close(adapter.weight_magnitude.detach().double(), reference.g[:, 0], rtol=1e-5, atol=1e-6)
+    dv = _first_order_dv(b, a, adapter.linear_out.weight.detach(), adapter.linear_in.weight.detach(), 2.0)
+    torch.testing.assert_close(dv.double(), v_new - v, rtol=1e-4, atol=1e-6)
+
+
+def test_exported_dora_delta_is_d_minus_one_in_column_zero_of_lora_b(tp1, factors):
+    b, a, _ = factors
+    layer = _dora_layer(torch.randn(M, N), [(a, b), (a, b)], [torch.rand(M) + 0.5] * 2, rank=R)
+    expected = (layer.adapters[1].weight_magnitude / layer.row_norm(1) - 1).detach()
+    with dora.dora_deltas_as_lora_b([layer], 1):
+        exported = layer.adapters[1].linear_out.weight.detach().clone()
+    assert torch.equal(exported[:, 0], expected) and not exported[:, 1:].any()
+    assert torch.equal(layer.adapters[1].linear_out.weight, b)
 
 
 def test_prop5_zero_b_takes_no_a_step_and_a_well_defined_b_step(factors):
@@ -320,6 +386,136 @@ def _split_worker(rank: int, world_size: int, port: int) -> None:
 
 def test_tensor_parallel_shards_match_the_whole_factors():
     run_multiprocess(_split_worker, world_size=2)
+
+
+class _GatherRows(torch.autograd.Function):
+    """Megatron's ``gather_from_sequence_parallel_region`` on gloo: reduce-scatter or split backward."""
+
+    @staticmethod
+    def forward(ctx, x, tensor_parallel_output_grad):
+        ctx.reduce = tensor_parallel_output_grad
+        shards = [torch.empty_like(x) for _ in range(dist.get_world_size())]
+        dist.all_gather(shards, x.contiguous())
+        return torch.cat(shards)
+
+    @staticmethod
+    def backward(ctx, grad):
+        if ctx.reduce:
+            grad = grad.clone()
+            dist.all_reduce(grad)
+        return grad.chunk(dist.get_world_size())[dist.get_rank()], None
+
+
+class _ReduceFrom(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        x = x.clone()
+        dist.all_reduce(x)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad
+
+
+class _CopyTo(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        grad = grad.clone()
+        dist.all_reduce(grad)
+        return grad
+
+
+def _set_tp(size: int, rank: int) -> None:
+    dora.parallel_state = SimpleNamespace(
+        get_tensor_model_parallel_world_size=lambda: size,
+        get_tensor_model_parallel_rank=lambda: rank,
+        get_tensor_model_parallel_group=lambda: dist.group.WORLD,
+    )
+
+
+def _dora_grads(layer, output, upstream, token_splits):
+    output = output.clone().requires_grad_()
+    layer.tokens_per_adapter_splits = token_splits
+    y = layer.scale_rows(output)
+    (y * upstream).sum().backward()
+    grads = [(ad.linear_in.weight.grad, ad.linear_out.weight.grad, ad.weight_magnitude.grad) for ad in layer.adapters]
+    return y.detach(), output.grad, grads
+
+
+def _dora_split_worker(rank: int, world_size: int, port: int) -> None:
+    init_gloo(rank, world_size, port=port)
+    dora.gather_from_sequence_parallel_region = _GatherRows.apply
+    dora.reduce_from_tensor_model_parallel_region = _ReduceFrom.apply
+    dora.copy_to_tensor_model_parallel_region = _CopyTo.apply
+    torch.manual_seed(5)
+    m, n, r, tokens = 8, 12, 4, 6
+    # Slot 1's two tokens sit in rank 1's sequence-parallel window only
+    token_splits = (4, 2)
+    w0 = torch.randn(m, n)
+    factors = [(torch.randn(r, n), torch.randn(m, r)) for _ in range(2)]
+    magnitudes = [torch.rand(m) + 0.5 for _ in range(2)]
+    output, upstream = torch.randn(tokens, m), torch.randn(tokens, m)
+
+    _set_tp(1, 0)
+    y, grad_out, grads = _dora_grads(_dora_layer(w0, factors, magnitudes, rank=r), output, upstream, token_splits)
+
+    _set_tp(world_size, rank)
+    rows, cols, toks = (torch.arange(size).chunk(world_size)[rank] for size in (m, n, tokens))
+    layouts = {
+        # column-parallel: W0, B and g split output rows, A splits rank rows; every rank has every token
+        "column": (
+            False,
+            False,
+            w0[rows],
+            [(a.chunk(world_size)[rank], b[rows]) for a, b in factors],
+            [g[rows] for g in magnitudes],
+            (slice(None), rows),
+        ),
+        # row-parallel: W0 and A split input columns, B output rows, g is replicated
+        "row_sequence_parallel": (
+            True,
+            True,
+            w0[:, cols],
+            [(a[:, cols], b[rows]) for a, b in factors],
+            magnitudes,
+            (toks, slice(None)),
+        ),
+        "row": (
+            True,
+            False,
+            w0[:, cols],
+            [(a[:, cols], b[rows]) for a, b in factors],
+            magnitudes,
+            (slice(None), slice(None)),
+        ),
+    }
+    for name, (input_is_parallel, sequence_parallel, w0_k, factors_k, magnitudes_k, view) in layouts.items():
+        layer = _dora_layer(
+            w0_k,
+            factors_k,
+            magnitudes_k,
+            rank=r,
+            input_is_parallel=input_is_parallel,
+            sequence_parallel=sequence_parallel,
+        )
+        y_k, grad_out_k, grads_k = _dora_grads(layer, output[view], upstream[view], token_splits)
+        torch.testing.assert_close(y_k, y[view], msg=name)
+        torch.testing.assert_close(grad_out_k, grad_out[view], msg=name)
+        for (ga, gb, gg), (ga_k, gb_k, gg_k) in zip(grads, grads_k, strict=True):
+            a_view = ga.chunk(world_size)[rank] if name == "column" else ga[:, cols]
+            torch.testing.assert_close(ga_k, a_view, msg=name)
+            torch.testing.assert_close(gb_k, gb[rows], msg=name)
+            torch.testing.assert_close(gg_k, gg[rows] if name == "column" else gg, msg=name)
+    dist.destroy_process_group()
+
+
+def test_dora_tensor_parallel_shards_match_the_whole_layer():
+    run_multiprocess(_dora_split_worker, world_size=2)
 
 
 def test_rejects_unpaired_params_and_weight_decay(factors):
