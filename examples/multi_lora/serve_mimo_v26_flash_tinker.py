@@ -81,6 +81,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     recompute: str = "full"
     # DFlash speculative decoding with the drafter shipped in the checkpoint's dflash/ directory.
     dflash: bool = True
+    # A drafter directory to use instead, e.g. one fine-tuned on RL rollouts by examples/multi_lora/dflash_rl.
+    dflash_drafter: str = ""
+    # --speculative-num-draft-tokens; MiMo-V2.6 (section 6.4) runs RL rollouts with block 6.
+    dflash_block_size: int = 8
     # flashinfer_mxfp4 (TRT-LLM on SM100) runs the MXFP4 experts on BF16 activations without an all-to-all;
     # the cookbook's deep_gemm + deepep quantizes expert activations to FP8. A BF16 checkpoint needs triton.
     moe_a2a_backend: str = "none"
@@ -142,6 +146,37 @@ def _prepare(args: ScriptArgs) -> None:
         )
 
 
+def _sglang_args(args: ScriptArgs) -> str:
+    # Xiaomi's verified B300 Flash launch from the SGLang MiMo-V2.6 cookbook (sglang 983e6438, PR #40448),
+    # except the MoE runner and all-to-all above. SGLang itself turns FA4 page size 1 into 128 and drops
+    # the DP LM head at dp 1. Miles adds LoRA, routed-expert capture (R3), and its own host/port/seed arguments.
+    sglang_args = (
+        f"--rollout-num-gpus-per-engine {_ENGINE_GPUS} --sglang-ep-size {_ENGINE_GPUS} "
+        "--sglang-dp-size 1 --sglang-pp-size 1 "
+        f"--sglang-moe-runner-backend {args.moe_runner_backend} --sglang-moe-a2a-backend {args.moe_a2a_backend} "
+        "--sglang-deepep-mode auto "
+        "--sglang-moe-dense-tp-size 1 --sglang-enable-dp-lm-head "
+        "--sglang-log-level-http warning --sglang-enable-cache-report "
+        "--sglang-page-size 1 --sglang-cuda-graph-max-bs-decode 64 --sglang-max-running-requests 64 "
+        f"--sglang-mem-fraction-static {args.sglang_mem_fraction_static} --sglang-swa-full-tokens-ratio 0.03 "
+        "--sglang-chunked-prefill-size 49152 --sglang-max-prefill-tokens 65536 "
+        "--sglang-reasoning-parser mimo --sglang-tool-call-parser mimo "
+        "--sglang-attention-backend fa4 --sglang-context-length 1048576 "
+        "--sglang-cuda-graph-backend-prefill disabled "
+        "--sglang-mm-enable-dp-encoder --sglang-mm-attention-backend fa4 "
+        "--sglang-lora-backend triton "
+    )
+    if args.moe_runner_backend == "flashinfer_mxfp4":
+        sglang_args += f"--sglang-flashinfer-mxfp4-moe-precision {args.flashinfer_mxfp4_moe_precision} "
+    if args.dflash:
+        sglang_args += (
+            "--sglang-speculative-algorithm DFLASH "
+            f"--sglang-speculative-draft-model-path {args.dflash_drafter or f'{args.hf_checkpoint}/dflash'} "
+            f"--sglang-speculative-num-draft-tokens {args.dflash_block_size} "
+        )
+    return sglang_args
+
+
 def _serve(args: ScriptArgs) -> None:
     os.makedirs(f"{args.save_dir}/nccl_trace", exist_ok=True)
     trainer_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
@@ -178,33 +213,7 @@ def _serve(args: ScriptArgs) -> None:
         f"--max-tokens-per-gpu {args.max_tokens_per_gpu} --micro-batch-size 1 --use-dynamic-batch-size "
         "--qkv-format thd "
     )
-    # Xiaomi's verified B300 Flash launch from the SGLang MiMo-V2.6 cookbook (sglang 983e6438, PR #40448),
-    # except the MoE runner and all-to-all above. SGLang itself turns FA4 page size 1 into 128 and drops
-    # the DP LM head at dp 1. Miles adds LoRA, routed-expert capture (R3), and its own host/port/seed arguments.
-    sglang_args = (
-        f"--rollout-num-gpus-per-engine {_ENGINE_GPUS} --sglang-ep-size {_ENGINE_GPUS} "
-        "--sglang-dp-size 1 --sglang-pp-size 1 "
-        f"--sglang-moe-runner-backend {args.moe_runner_backend} --sglang-moe-a2a-backend {args.moe_a2a_backend} "
-        "--sglang-deepep-mode auto "
-        "--sglang-moe-dense-tp-size 1 --sglang-enable-dp-lm-head "
-        "--sglang-log-level-http warning --sglang-enable-cache-report "
-        "--sglang-page-size 1 --sglang-cuda-graph-max-bs-decode 64 --sglang-max-running-requests 64 "
-        f"--sglang-mem-fraction-static {args.sglang_mem_fraction_static} --sglang-swa-full-tokens-ratio 0.03 "
-        "--sglang-chunked-prefill-size 49152 --sglang-max-prefill-tokens 65536 "
-        "--sglang-reasoning-parser mimo --sglang-tool-call-parser mimo "
-        "--sglang-attention-backend fa4 --sglang-context-length 1048576 "
-        "--sglang-cuda-graph-backend-prefill disabled "
-        "--sglang-mm-enable-dp-encoder --sglang-mm-attention-backend fa4 "
-        "--sglang-lora-backend triton "
-    )
-    if args.moe_runner_backend == "flashinfer_mxfp4":
-        sglang_args += f"--sglang-flashinfer-mxfp4-moe-precision {args.flashinfer_mxfp4_moe_precision} "
-    if args.dflash:
-        sglang_args += (
-            "--sglang-speculative-algorithm DFLASH "
-            f"--sglang-speculative-draft-model-path {args.hf_checkpoint}/dflash "
-            "--sglang-speculative-num-draft-tokens 8 "
-        )
+    sglang_args = _sglang_args(args)
     model_args = (
         "--attention-dropout 0.0 --hidden-dropout 0.0 --attention-softmax-in-fp32 --attention-backend fused "
         "--accumulate-allreduce-grads-in-fp32 --optimizer adam --lr 1e-6 "
